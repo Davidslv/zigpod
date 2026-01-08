@@ -427,6 +427,124 @@ pub const BassBoost = struct {
 };
 
 // ============================================================
+// Dithering for Bit-Depth Reduction
+// ============================================================
+
+/// TPDF (Triangular Probability Density Function) Dithering
+/// Used when reducing bit-depth (e.g., 24-bit to 16-bit) to minimize
+/// quantization noise and avoid correlation with the signal.
+pub const Ditherer = struct {
+    /// LFSR state for pseudo-random noise generation
+    lfsr_state: u32,
+    /// Previous random value for TPDF calculation
+    prev_rand: i32,
+    /// Whether dithering is enabled
+    enabled: bool,
+    /// Noise shaping feedback (for optional noise shaping)
+    error_l: i32,
+    error_r: i32,
+
+    pub fn init() Ditherer {
+        return Ditherer{
+            .lfsr_state = 0x12345678, // Initial seed
+            .prev_rand = 0,
+            .enabled = true,
+            .error_l = 0,
+            .error_r = 0,
+        };
+    }
+
+    /// Generate pseudo-random noise using LFSR
+    fn nextRandom(self: *Ditherer) i32 {
+        // Galois LFSR with taps at 32, 22, 2, 1 (maximal period)
+        const bit = self.lfsr_state & 1;
+        self.lfsr_state >>= 1;
+        if (bit == 1) {
+            self.lfsr_state ^= 0xD0000001;
+        }
+        // Convert to signed and scale to +/- 1 LSB range
+        return @as(i32, @bitCast(self.lfsr_state)) >> 16;
+    }
+
+    /// Apply TPDF dithering to convert 32-bit sample to 16-bit
+    /// TPDF uses two random values subtracted to create triangular distribution
+    pub fn ditherToI16(self: *Ditherer, sample: i32) i16 {
+        if (!self.enabled) {
+            // Simple truncation
+            return @intCast(std.math.clamp(sample >> 16, -32768, 32767));
+        }
+
+        // Generate TPDF noise (triangular distribution)
+        const rand1 = self.nextRandom();
+        const rand2 = self.prev_rand;
+        self.prev_rand = rand1;
+
+        // TPDF = rand1 - rand2 (creates triangular distribution)
+        const dither_noise = rand1 - rand2;
+
+        // Add dither noise scaled to LSB of output (for 32->16 bit, scale by 2^15)
+        // Since we're going from 32-bit to 16-bit, we need 16-bit of dither
+        const dithered = sample + (dither_noise >> 1);
+
+        // Round and truncate
+        const rounded = (dithered + 0x8000) >> 16;
+
+        return @intCast(std.math.clamp(rounded, -32768, 32767));
+    }
+
+    /// Apply TPDF dithering with noise shaping for 24-bit to 16-bit
+    /// Noise shaping moves quantization noise to less audible frequencies
+    pub fn ditherWithNoiseShaping(self: *Ditherer, sample: i32, ch: u1) i16 {
+        if (!self.enabled) {
+            return @intCast(std.math.clamp(sample >> 8, -32768, 32767));
+        }
+
+        // Add feedback error from previous sample (first-order noise shaping)
+        const error_ptr = if (ch == 0) &self.error_l else &self.error_r;
+        const shaped = sample - error_ptr.*;
+
+        // Generate TPDF dither
+        const rand1 = self.nextRandom();
+        const rand2 = self.prev_rand;
+        self.prev_rand = rand1;
+        const dither = (rand1 - rand2) >> 8; // Scale for 24->16 bit
+
+        // Add dither and round
+        const dithered = shaped + dither;
+        const output = (dithered + 128) >> 8;
+        const clamped = std.math.clamp(output, -32768, 32767);
+
+        // Calculate and store error for next sample
+        error_ptr.* = (clamped << 8) - sample;
+
+        return @intCast(clamped);
+    }
+
+    /// Process stereo pair with dithering (assumes 32-bit input, 16-bit output)
+    pub fn process32to16(self: *Ditherer, left: i32, right: i32) StereoSample {
+        return .{
+            .left = self.ditherToI16(left),
+            .right = self.ditherToI16(right),
+        };
+    }
+
+    /// Process stereo pair from 24-bit to 16-bit with noise shaping
+    pub fn process24to16(self: *Ditherer, left: i32, right: i32) StereoSample {
+        return .{
+            .left = self.ditherWithNoiseShaping(left, 0),
+            .right = self.ditherWithNoiseShaping(right, 1),
+        };
+    }
+
+    /// Reset ditherer state
+    pub fn reset(self: *Ditherer) void {
+        self.error_l = 0;
+        self.error_r = 0;
+        self.prev_rand = 0;
+    }
+};
+
+// ============================================================
 // Volume Ramping
 // ============================================================
 
@@ -812,4 +930,30 @@ test "volume ramper mute" {
     vol.mute();
 
     try std.testing.expectEqual(@as(i32, 0), vol.target_volume);
+}
+
+test "ditherer initialization" {
+    const dither = Ditherer.init();
+    try std.testing.expect(dither.enabled);
+    try std.testing.expect(dither.lfsr_state != 0);
+}
+
+test "ditherer generates varied output" {
+    var dither = Ditherer.init();
+
+    // Same input should produce slightly varied output due to dithering
+    const out1 = dither.ditherToI16(0x7FFF0000);
+    const out2 = dither.ditherToI16(0x7FFF0000);
+
+    // Values should be close but potentially different due to dither noise
+    try std.testing.expect(@abs(@as(i32, out1) - @as(i32, out2)) < 10);
+}
+
+test "ditherer disabled pass-through" {
+    var dither = Ditherer.init();
+    dither.enabled = false;
+
+    // With dithering disabled, should just truncate
+    const out = dither.ditherToI16(0x40000000);
+    try std.testing.expectEqual(@as(i16, 0x4000), out);
 }

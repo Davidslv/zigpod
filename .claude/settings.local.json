@@ -6,7 +6,13 @@
       "WebFetch(domain:theapplewiki.com)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:wiki.rockbox.org)",
-      "WebFetch(domain:www.freemyipod.org)"
+      "WebFetch(domain:www.freemyipod.org)",
+      "Bash(git -C /Users/davidslv/projects/zigpod status --short)",
+      "Bash(git -C /Users/davidslv/projects/zigpod diff)",
+      "Bash(grep:*)",
+      "Bash(zig build:*)",
+      "Bash(echo:*)",
+      "Bash(ls:*)"
     ]
   }
 }
