@@ -14,6 +14,15 @@ const hal = @import("../hal/hal.zig");
 // Export terminal UI module
 pub const terminal_ui = @import("terminal_ui.zig");
 
+// Export CPU emulation modules
+pub const cpu = struct {
+    pub const registers = @import("cpu/registers.zig");
+    pub const decoder = @import("cpu/decoder.zig");
+    pub const executor = @import("cpu/executor.zig");
+    pub const exceptions = @import("cpu/exceptions.zig");
+    pub const arm7tdmi = @import("cpu/arm7tdmi.zig");
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -659,4 +668,9 @@ test "simulator I2C" {
 
     // Non-existent device should NACK
     try std.testing.expectError(hal.HalError.Nack, simI2cWrite(0x50, &[_]u8{0x00}));
+}
+
+test {
+    // Reference CPU emulation modules to include their tests
+    std.testing.refAllDecls(cpu);
 }
