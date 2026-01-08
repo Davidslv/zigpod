@@ -4,12 +4,30 @@
 //! - Vector table setup
 //! - Stack initialization
 //! - BSS clearing
+//! - Clock/PLL initialization
+//! - SDRAM controller initialization
+//! - Cache configuration
 //! - Hardware initialization
 //! - Jump to main application
+//!
+//! Boot Sequence (PP5021C):
+//! 1. Reset vector -> _start
+//! 2. Disable interrupts, set initial stack
+//! 3. Clear BSS
+//! 4. Initialize PLL for 80MHz operation
+//! 5. Initialize SDRAM controller
+//! 6. Enable caches (I-cache, D-cache)
+//! 7. Copy IRAM sections
+//! 8. Initialize mode-specific stacks
+//! 9. Initialize HAL and peripherals
+//! 10. Jump to main application
 
 const std = @import("std");
 const builtin = @import("builtin");
 const hal = @import("../hal/hal.zig");
+const clock = @import("clock.zig");
+const sdram = @import("sdram.zig");
+const cache = @import("cache.zig");
 
 // ============================================================
 // Architecture Detection
@@ -42,6 +60,9 @@ const extern_symbols = if (is_arm) struct {
 pub const BootState = enum {
     uninitialized,
     bss_cleared,
+    clocks_initialized,
+    sdram_initialized,
+    cache_initialized,
     stacks_initialized,
     hardware_initialized,
     running,
@@ -179,16 +200,48 @@ export fn handleFiq() void {
 
 /// Kernel initialization - called from _start after stack setup
 export fn kernelInit() noreturn {
-    // Clear BSS
+    // Step 1: Clear BSS section
     if (is_arm) {
         clearBss();
     }
     boot_state = .bss_cleared;
 
-    // Initialize HAL
+    // Step 2: Initialize clock system (PLL for 80MHz)
+    // This must happen early because all timing depends on it
+    if (is_arm) {
+        clock.init();
+    }
+    boot_state = .clocks_initialized;
+
+    // Step 3: Initialize SDRAM controller
+    // Required before any DRAM access
+    if (is_arm) {
+        sdram.init();
+    }
+    boot_state = .sdram_initialized;
+
+    // Step 4: Initialize cache controller
+    // Enables I-cache and D-cache for performance
+    if (is_arm) {
+        cache.init();
+    }
+    boot_state = .cache_initialized;
+
+    // Step 5: Copy IRAM sections (if any)
+    if (is_arm) {
+        copyIram();
+    }
+
+    // Step 6: Initialize mode-specific stacks (IRQ, FIQ)
+    if (is_arm) {
+        initStacks();
+    }
+    boot_state = .stacks_initialized;
+
+    // Step 7: Initialize HAL
     hal.init();
 
-    // Initialize hardware through HAL
+    // Step 8: Initialize hardware through HAL
     hal.current_hal.system_init() catch {
         // Hardware init failed - halt
         haltLoop();

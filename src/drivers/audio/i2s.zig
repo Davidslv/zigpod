@@ -1,9 +1,15 @@
 //! I2S Audio Interface Driver
 //!
 //! This module handles the I2S (Inter-IC Sound) interface for audio output.
+//! The I2S interface connects to the WM8758 audio codec via:
+//! - MCLK: Master clock (256 × sample rate)
+//! - BCLK: Bit clock (32 × sample rate for 16-bit stereo)
+//! - LRCLK: Left/Right clock (sample rate)
+//! - SDATA: Serial data
 
 const std = @import("std");
 const hal = @import("../../hal/hal.zig");
+const clock = @import("../../kernel/clock.zig");
 
 // ============================================================
 // I2S Configuration
@@ -25,6 +31,11 @@ var enabled: bool = false;
 
 /// Initialize I2S with given configuration
 pub fn init(config: Config) hal.HalError!void {
+    // Configure MCLK for the requested sample rate
+    // MCLK = 256 × sample_rate (required by WM8758)
+    clock.configureI2sClock(config.sample_rate);
+
+    // Initialize I2S peripheral
     try hal.current_hal.i2s_init(config.sample_rate, config.format, config.sample_size);
     current_config = config;
     initialized = true;
@@ -88,10 +99,18 @@ pub fn setSampleRate(rate: u32) hal.HalError!void {
     const was_enabled = enabled;
     if (was_enabled) disable();
 
+    // Reconfigure MCLK for new sample rate
+    clock.configureI2sClock(rate);
+
     current_config.sample_rate = rate;
     try hal.current_hal.i2s_init(rate, current_config.format, current_config.sample_size);
 
     if (was_enabled) enable();
+}
+
+/// Get MCLK frequency for current sample rate
+pub fn getMclkFrequency() u32 {
+    return current_config.sample_rate * 256;
 }
 
 // ============================================================
