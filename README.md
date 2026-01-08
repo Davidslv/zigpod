@@ -2,6 +2,12 @@
 
 A custom operating system for the Apple iPod Video (5th Generation), written entirely in Zig.
 
+<p align="center">
+  <img src="docs/assets/zigpod-simulator.png" alt="ZigPod Simulator - RetroFlow Design" width="500">
+  <br>
+  <em>ZigPod Simulator with RetroFlow design - featuring animated waveform visualizer</em>
+</p>
+
 ## Features
 
 - **Native Audio Playback**: WAV, AIFF, FLAC, and MP3 support
