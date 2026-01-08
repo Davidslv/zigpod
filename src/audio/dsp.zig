@@ -427,6 +427,118 @@ pub const BassBoost = struct {
 };
 
 // ============================================================
+// Volume Ramping
+// ============================================================
+
+/// Volume control with smooth ramping to avoid audible clicks
+/// Uses exponential ramping for natural-sounding transitions
+pub const VolumeRamper = struct {
+    /// Target volume (0x0000 = silence, 0x10000 = unity, max 0x20000 = +6dB)
+    target_volume: i32,
+    /// Current volume (ramping towards target)
+    current_volume: i32,
+    /// Ramp rate per sample (higher = faster transition)
+    ramp_rate: i32,
+    /// Whether ramping is enabled
+    enabled: bool,
+
+    /// Default ramp time in samples (~10ms at 44.1kHz = 441 samples)
+    pub const DEFAULT_RAMP_SAMPLES: i32 = 441;
+
+    pub fn init() VolumeRamper {
+        return VolumeRamper{
+            .target_volume = 0x10000, // Unity gain
+            .current_volume = 0x10000,
+            .ramp_rate = 0x10000 / DEFAULT_RAMP_SAMPLES,
+            .enabled = true,
+        };
+    }
+
+    /// Set target volume (0-100%, can exceed 100% for gain)
+    pub fn setVolume(self: *VolumeRamper, percent: u8) void {
+        // Map 0-100 to 0x0000-0x10000
+        self.target_volume = @divTrunc(@as(i32, percent) << 16, 100);
+    }
+
+    /// Set volume in fixed-point directly (for precise control)
+    pub fn setVolumeFixed(self: *VolumeRamper, volume_fp: i32) void {
+        self.target_volume = std.math.clamp(volume_fp, 0, 0x20000);
+    }
+
+    /// Set ramp time in milliseconds
+    pub fn setRampTimeMs(self: *VolumeRamper, ms: u16) void {
+        const samples = @divTrunc(@as(i32, ms) * SAMPLE_RATE, 1000);
+        if (samples > 0) {
+            self.ramp_rate = @divTrunc(0x10000, samples);
+        }
+    }
+
+    /// Immediately jump to target (no ramping)
+    pub fn jumpToTarget(self: *VolumeRamper) void {
+        self.current_volume = self.target_volume;
+    }
+
+    /// Check if currently ramping
+    pub fn isRamping(self: *const VolumeRamper) bool {
+        return self.current_volume != self.target_volume;
+    }
+
+    /// Get current volume as percentage
+    pub fn getVolumePercent(self: *const VolumeRamper) u8 {
+        return @intCast(@divTrunc(self.current_volume * 100, 0x10000));
+    }
+
+    /// Process a stereo sample with volume ramping
+    pub fn process(self: *VolumeRamper, left: i16, right: i16) StereoSample {
+        if (!self.enabled) {
+            return .{ .left = left, .right = right };
+        }
+
+        // Ramp current volume towards target
+        if (self.current_volume < self.target_volume) {
+            self.current_volume += self.ramp_rate;
+            if (self.current_volume > self.target_volume) {
+                self.current_volume = self.target_volume;
+            }
+        } else if (self.current_volume > self.target_volume) {
+            self.current_volume -= self.ramp_rate;
+            if (self.current_volume < self.target_volume) {
+                self.current_volume = self.target_volume;
+            }
+        }
+
+        // Apply volume
+        const l: i32 = @divTrunc(@as(i32, left) * self.current_volume, 0x10000);
+        const r: i32 = @divTrunc(@as(i32, right) * self.current_volume, 0x10000);
+
+        return .{
+            .left = @intCast(std.math.clamp(l, -32768, 32767)),
+            .right = @intCast(std.math.clamp(r, -32768, 32767)),
+        };
+    }
+
+    /// Process a buffer of stereo samples
+    pub fn processBuffer(self: *VolumeRamper, samples: []i16) void {
+        var i: usize = 0;
+        while (i + 1 < samples.len) : (i += 2) {
+            const result = self.process(samples[i], samples[i + 1]);
+            samples[i] = result.left;
+            samples[i + 1] = result.right;
+        }
+    }
+
+    /// Mute with ramping (fade out)
+    pub fn mute(self: *VolumeRamper) void {
+        self.target_volume = 0;
+    }
+
+    /// Unmute with ramping (fade in to previous level)
+    pub fn unmute(self: *VolumeRamper, percent: u8) void {
+        self.setVolume(percent);
+    }
+};
+
+// ============================================================
 // Complete DSP Chain
 // ============================================================
 
@@ -434,6 +546,7 @@ pub const DspChain = struct {
     equalizer: Equalizer,
     stereo_widener: StereoWidener,
     bass_boost: BassBoost,
+    volume: VolumeRamper,
     enabled: bool,
 
     pub fn init() DspChain {
@@ -441,8 +554,24 @@ pub const DspChain = struct {
             .equalizer = Equalizer.init(),
             .stereo_widener = StereoWidener.init(),
             .bass_boost = BassBoost.init(),
+            .volume = VolumeRamper.init(),
             .enabled = true,
         };
+    }
+
+    /// Set volume with smooth ramping (0-100%)
+    pub fn setVolume(self: *DspChain, percent: u8) void {
+        self.volume.setVolume(percent);
+    }
+
+    /// Get current volume percentage
+    pub fn getVolume(self: *const DspChain) u8 {
+        return self.volume.getVolumePercent();
+    }
+
+    /// Check if volume is currently ramping
+    pub fn isVolumeRamping(self: *const DspChain) bool {
+        return self.volume.isRamping();
     }
 
     /// Process a stereo sample through the entire DSP chain
@@ -451,8 +580,10 @@ pub const DspChain = struct {
             return .{ .left = left, .right = right };
         }
 
-        // Order: Bass Boost -> Equalizer -> Stereo Widener
-        var result = self.bass_boost.process(left, right);
+        // Order: Volume -> Bass Boost -> Equalizer -> Stereo Widener
+        // Volume first to avoid clipping in subsequent stages
+        var result = self.volume.process(left, right);
+        result = self.bass_boost.process(result.left, result.right);
         result = self.equalizer.process(result.left, result.right);
         result = self.stereo_widener.process(result.left, result.right);
 
@@ -478,6 +609,16 @@ pub const DspChain = struct {
             self.equalizer.setAllBands(preset.gains);
             self.equalizer.setPreamp(preset.preamp);
         }
+    }
+
+    /// Mute audio with smooth fade out
+    pub fn mute(self: *DspChain) void {
+        self.volume.mute();
+    }
+
+    /// Unmute audio with smooth fade in
+    pub fn unmute(self: *DspChain, percent: u8) void {
+        self.volume.unmute(percent);
     }
 };
 
@@ -630,4 +771,45 @@ test "preset application" {
 
     dsp.applyPreset(1); // Rock preset
     try std.testing.expectEqual(@as(i8, 4), dsp.equalizer.getBandGain(0));
+}
+
+test "volume ramper initialization" {
+    const vol = VolumeRamper.init();
+    try std.testing.expectEqual(@as(i32, 0x10000), vol.target_volume);
+    try std.testing.expectEqual(@as(i32, 0x10000), vol.current_volume);
+    try std.testing.expect(vol.enabled);
+}
+
+test "volume ramper set volume" {
+    var vol = VolumeRamper.init();
+
+    vol.setVolume(50);
+    try std.testing.expectEqual(@as(i32, 0x8000), vol.target_volume);
+
+    vol.setVolume(100);
+    try std.testing.expectEqual(@as(i32, 0x10000), vol.target_volume);
+}
+
+test "volume ramper ramping" {
+    var vol = VolumeRamper.init();
+    vol.jumpToTarget(); // Ensure current == target
+
+    // Set lower volume
+    vol.setVolume(0);
+    try std.testing.expect(vol.isRamping());
+
+    // Process samples - should ramp down
+    for (0..1000) |_| {
+        _ = vol.process(1000, 1000);
+    }
+
+    // Should have ramped down significantly
+    try std.testing.expect(vol.current_volume < 0x10000);
+}
+
+test "volume ramper mute" {
+    var vol = VolumeRamper.init();
+    vol.mute();
+
+    try std.testing.expectEqual(@as(i32, 0), vol.target_volume);
 }
