@@ -47,6 +47,11 @@ pub const audio = struct {
     pub const wav_writer = @import("audio/wav_writer.zig");
 };
 
+// Export profiling modules
+pub const profiler_mod = struct {
+    pub const profiler = @import("profiler/profiler.zig");
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -848,4 +853,6 @@ test {
     std.testing.refAllDecls(i2c);
     // Reference audio modules to include their tests
     std.testing.refAllDecls(audio);
+    // Reference profiler modules to include their tests
+    std.testing.refAllDecls(profiler_mod);
 }

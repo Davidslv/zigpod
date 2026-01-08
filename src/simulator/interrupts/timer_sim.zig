@@ -162,33 +162,41 @@ pub const TimerSystem = struct {
 
         if (timer_ticks == 0) return;
 
-        // Decrement counter
-        const ticks_u32: u32 = @intCast(@min(timer_ticks, 0xFFFFFFFF));
-        if (timer.value <= ticks_u32) {
-            // Timer expired
-            timer.value = 0;
+        // Process ticks, potentially multiple expirations
+        var remaining_ticks: u64 = timer_ticks;
 
-            // Invoke callback
-            if (timer.callback) |cb| {
-                cb(timer_id, timer.context);
-            }
+        while (remaining_ticks > 0 and timer.isEnabled()) {
+            if (timer.value <= remaining_ticks) {
+                // Timer expired
+                remaining_ticks -= timer.value;
+                timer.value = 0;
 
-            // Raise interrupt if enabled
-            if (timer.irqEnabled()) {
-                if (self.interrupt_controller) |ic| {
-                    const src: InterruptSource = if (timer_id == 0) .timer1 else .timer2;
-                    ic.raiseInterrupt(src);
+                // Invoke callback
+                if (timer.callback) |cb| {
+                    cb(timer_id, timer.context);
                 }
-            }
 
-            // Reload if repeat mode
-            if (timer.isRepeat()) {
-                timer.value = timer.reload;
+                // Raise interrupt if enabled
+                if (timer.irqEnabled()) {
+                    if (self.interrupt_controller) |ic| {
+                        const src: InterruptSource = if (timer_id == 0) .timer1 else .timer2;
+                        ic.raiseInterrupt(src);
+                    }
+                }
+
+                // Reload if repeat mode
+                if (timer.isRepeat()) {
+                    timer.value = timer.reload;
+                    // If reload is 0, avoid infinite loop
+                    if (timer.reload == 0) break;
+                } else {
+                    timer.stop();
+                    break;
+                }
             } else {
-                timer.stop();
+                timer.value -= @intCast(remaining_ticks);
+                break;
             }
-        } else {
-            timer.value -= ticks_u32;
         }
     }
 
