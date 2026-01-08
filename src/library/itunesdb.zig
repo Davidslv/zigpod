@@ -323,7 +323,27 @@ pub const PlaylistItemHeader = extern struct {
 // High-Level Track Structure
 // ============================================================
 
-/// Parsed track with all string data
+/// Represents a parsed audio track with all its metadata.
+///
+/// Track objects are created during database parsing and contain both
+/// numeric metadata (duration, play count, etc.) and string data (title,
+/// artist, album). String fields are optional since they may not be present
+/// in all tracks.
+///
+/// ## Memory Management
+/// String fields are allocated and owned by the ITunesDB instance.
+/// Do not free them manually - they will be freed when ITunesDB.deinit() is called.
+///
+/// ## Star Ratings
+/// The `rating` field uses a 0-100 scale where:
+/// - 0 = no rating
+/// - 20 = 1 star
+/// - 40 = 2 stars
+/// - 60 = 3 stars
+/// - 80 = 4 stars
+/// - 100 = 5 stars
+///
+/// Use `starRating()` to convert to 1-5 stars.
 pub const Track = struct {
     id: u32,
     title: ?[]const u8 = null,
@@ -367,7 +387,20 @@ pub const Track = struct {
     }
 };
 
-/// Parsed playlist
+/// Represents a parsed playlist with its track references.
+///
+/// Playlists contain a name, a unique ID, and an array of track IDs
+/// that reference tracks in the database. The master playlist (`is_master = true`)
+/// contains all tracks in the library.
+///
+/// ## Track IDs
+/// The `track_ids` array contains track IDs that can be looked up using
+/// `ITunesDB.getTrack(id)`. Note that not all track IDs may be valid
+/// if the database is inconsistent.
+///
+/// ## On-The-Go Playlists
+/// The iPod supports "On-The-Go" playlists that can be created directly
+/// on the device. These can be accessed via `ITunesDB.getOnTheGoPlaylist()`.
 pub const Playlist = struct {
     id: u64,
     name: ?[]const u8 = null,
@@ -395,7 +428,34 @@ pub const ITunesDB = struct {
 
     const Self = @This();
 
-    /// Open and parse iTunesDB from file
+    /// Opens and parses an iTunesDB file from disk.
+    ///
+    /// The iTunesDB is typically located at `/iPod_Control/iTunes/iTunesDB` on the device.
+    /// The file is read entirely into memory and parsed. After opening, track and playlist
+    /// data can be queried through the various getter methods.
+    ///
+    /// ## Parameters
+    /// - `allocator`: Memory allocator for all internal allocations
+    /// - `path`: Path to the iTunesDB file
+    ///
+    /// ## Returns
+    /// A parsed ITunesDB instance, or an error if the file cannot be read or parsed.
+    ///
+    /// ## Errors
+    /// - `error.InvalidDatabase`: File is too small or corrupted
+    /// - `error.InvalidMagic`: File doesn't start with "mhbd" magic
+    /// - `error.IncompleteRead`: File read was truncated
+    /// - Other std filesystem errors
+    ///
+    /// ## Example
+    /// ```zig
+    /// var db = try ITunesDB.open(allocator, "/Volumes/IPOD/iPod_Control/iTunes/iTunesDB");
+    /// defer db.deinit();
+    ///
+    /// for (db.getAllTracks()) |track| {
+    ///     std.debug.print("{s} - {s}\n", .{ track.artist orelse "Unknown", track.title orelse "Unknown" });
+    /// }
+    /// ```
     pub fn open(allocator: Allocator, path: []const u8) !Self {
         const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
         defer file.close();
@@ -418,7 +478,19 @@ pub const ITunesDB = struct {
         return db;
     }
 
-    /// Open from raw data (for testing or memory-mapped files)
+    /// Opens and parses an iTunesDB from raw bytes in memory.
+    ///
+    /// This is useful for testing or when working with memory-mapped files.
+    /// The caller transfers ownership of `data` to this instance - it will be
+    /// freed when `deinit()` is called.
+    ///
+    /// ## Parameters
+    /// - `allocator`: Memory allocator (must be same allocator used for `data`)
+    /// - `data`: 4-byte aligned buffer containing the iTunesDB binary data
+    ///
+    /// ## Note
+    /// The `data` buffer must remain valid until `deinit()` is called.
+    /// Do NOT free `data` separately - `deinit()` handles cleanup.
     pub fn openFromData(allocator: Allocator, data: []align(4) u8) !Self {
         var db = Self{
             .allocator = allocator,
@@ -429,6 +501,10 @@ pub const ITunesDB = struct {
         return db;
     }
 
+    /// Releases all resources associated with this iTunesDB instance.
+    ///
+    /// This frees all allocated track strings, playlist data, and the raw data buffer.
+    /// After calling `deinit()`, the instance must not be used.
     pub fn deinit(self: *Self) void {
         // Free track strings
         for (self.tracks.items) |*track| {
@@ -742,40 +818,51 @@ pub const ITunesDB = struct {
     // Public API - Read
     // ============================================================
 
-    /// Get total track count
+    /// Returns the total number of tracks in the database.
     pub fn getTrackCount(self: *const Self) usize {
         return self.tracks.items.len;
     }
 
-    /// Get track by ID
+    /// Retrieves a track by its unique ID.
+    ///
+    /// Track IDs are assigned by iTunes and persist across syncs.
+    /// Returns `null` if no track with the given ID exists.
     pub fn getTrack(self: *const Self, id: u32) ?*const Track {
         const idx = self.track_index.get(id) orelse return null;
         return &self.tracks.items[idx];
     }
 
-    /// Get track by index
+    /// Retrieves a track by its index in the track list.
+    ///
+    /// Returns `null` if `index` is out of bounds.
     pub fn getTrackByIndex(self: *const Self, index: usize) ?*const Track {
         if (index >= self.tracks.items.len) return null;
         return &self.tracks.items[index];
     }
 
-    /// Get all tracks
+    /// Returns a slice containing all tracks in the database.
+    ///
+    /// The returned slice is valid until `deinit()` is called.
     pub fn getAllTracks(self: *const Self) []const Track {
         return self.tracks.items;
     }
 
-    /// Get playlist count
+    /// Returns the total number of playlists in the database.
     pub fn getPlaylistCount(self: *const Self) usize {
         return self.playlists.items.len;
     }
 
-    /// Get playlist by index
+    /// Retrieves a playlist by its index.
+    ///
+    /// Returns `null` if `index` is out of bounds.
     pub fn getPlaylist(self: *const Self, index: usize) ?*const Playlist {
         if (index >= self.playlists.items.len) return null;
         return &self.playlists.items[index];
     }
 
-    /// Get master playlist
+    /// Returns the master playlist (Library), if it exists.
+    ///
+    /// The master playlist contains references to all tracks in the library.
     pub fn getMasterPlaylist(self: *const Self) ?*const Playlist {
         for (self.playlists.items) |*pl| {
             if (pl.is_master) return pl;
@@ -783,7 +870,15 @@ pub const ITunesDB = struct {
         return null;
     }
 
-    /// Iterator for tracks
+    /// Creates an iterator for iterating over all tracks.
+    ///
+    /// ## Example
+    /// ```zig
+    /// var iter = db.iterateTracks();
+    /// while (iter.next()) |track| {
+    ///     // Process track
+    /// }
+    /// ```
     pub fn iterateTracks(self: *const Self) TrackIterator {
         return .{ .tracks = self.tracks.items, .index = 0 };
     }
@@ -802,9 +897,19 @@ pub const ITunesDB = struct {
 
     // ============================================================
     // Public API - Write-back
+    //
+    // These methods modify both the in-memory track data AND the raw
+    // binary data, allowing changes to be saved back to the file.
+    // After making changes, call save() to persist them.
     // ============================================================
 
-    /// Update play count for a track
+    /// Sets the play count for a track.
+    ///
+    /// This updates both the in-memory track and the raw binary data.
+    /// Changes are not persisted until `save()` is called.
+    ///
+    /// ## Errors
+    /// - `error.TrackNotFound`: No track with the given ID exists
     pub fn setPlayCount(self: *Self, track_id: u32, count: u32) !void {
         const idx = self.track_index.get(track_id) orelse return error.TrackNotFound;
         const track = &self.tracks.items[idx];
