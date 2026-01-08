@@ -30,6 +30,12 @@ pub const storage = struct {
     pub const ata_controller = @import("storage/ata_controller.zig");
 };
 
+// Export interrupt simulation modules
+pub const interrupts = struct {
+    pub const interrupt_controller = @import("interrupts/interrupt_controller.zig");
+    pub const timer_sim = @import("interrupts/timer_sim.zig");
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -95,6 +101,10 @@ pub const SimulatorState = struct {
     disk_image: ?storage.disk_image.DiskImage = null,
     ata_controller: ?storage.ata_controller.AtaController = null,
 
+    // Interrupt/Timer state
+    interrupt_controller: interrupts.interrupt_controller.InterruptController = interrupts.interrupt_controller.InterruptController.init(),
+    timer_system: interrupts.timer_sim.TimerSystem = interrupts.timer_sim.TimerSystem.init(),
+
     // Allocator
     allocator: std.mem.Allocator = undefined,
 
@@ -143,6 +153,9 @@ pub const SimulatorState = struct {
         if (self.disk_image) |*disk| {
             self.ata_controller = storage.ata_controller.AtaController.init(disk);
         }
+
+        // Connect timer system to interrupt controller
+        self.timer_system.connectInterruptController(&self.interrupt_controller);
 
         // Clear memory
         @memset(&self.iram, 0);
@@ -818,4 +831,6 @@ test {
     std.testing.refAllDecls(cpu);
     // Reference storage modules to include their tests
     std.testing.refAllDecls(storage);
+    // Reference interrupt modules to include their tests
+    std.testing.refAllDecls(interrupts);
 }
