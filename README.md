@@ -1,21 +1,13 @@
 # ZigPod OS
 
-A custom operating system for the Apple iPod Video 5th Generation (2005), written entirely in Zig.
+A custom operating system for the Apple iPod Video (5th Generation), written entirely in Zig.
 
-## Project Status
+## Features
 
-**Phase**: Integration & Polish (Phase 10)
-
-The project has implemented all core OS components including hardware abstraction, kernel, drivers, audio engine, UI framework, and complete audio codec support. All 283 unit tests pass.
-
-### Supported Audio Formats
-
-| Format | Bit Depths | Features |
-|--------|------------|----------|
-| **WAV** | 8/16/24/32-bit PCM, 32-bit float | WAVE_FORMAT_EXTENSIBLE support |
-| **AIFF** | 8/16/24/32-bit | AIFF-C support |
-| **FLAC** | 8-32 bit | Lossless, all subframe types |
-| **MP3** | VBR/CBR 32-320 kbps | MPEG 1/2/2.5 Layer III |
+- **Native Audio Playback**: WAV, AIFF, FLAC, and MP3 support
+- **Full Hardware Support**: LCD, click wheel, audio codec, storage
+- **Complete Simulator**: Test without hardware using the PP5021C emulator
+- **Modern Codebase**: Clean Zig implementation with 458+ unit tests
 
 ## Quick Start
 
@@ -23,8 +15,9 @@ The project has implemented all core OS components including hardware abstractio
 
 - [Zig 0.15.2](https://ziglang.org/download/) or later
 - Git
+- SDL2 (optional, for GUI simulator)
 
-### Building
+### Build and Test
 
 ```bash
 # Clone the repository
@@ -34,265 +27,179 @@ cd zigpod
 # Run all tests
 zig build test
 
-# Build for ARM target (when ready for hardware)
-zig build -Dtarget=arm-freestanding-eabi
+# Run the simulator
+zig build sim
+
+# Run simulator with GUI (requires SDL2)
+zig build sim -Dsdl2=true
 ```
 
-### Running Tests
+## Using the Simulator
+
+The simulator provides a complete PP5021C iPod emulation environment:
 
 ```bash
-# Run all unit tests
-zig build test
+# Basic simulator with demo program
+zig build sim
 
-# Check code formatting
-zig build fmt-check
+# With SDL2 graphical interface
+zig build sim -Dsdl2=true
 
-# Auto-format code
-zig build fmt
+# Load custom firmware
+zig build sim -- --rom firmware.bin
+
+# Play audio file
+zig build sim -Dsdl2=true -- --audio music.wav
+
+# Full options
+zig build sim -- --help
 ```
 
-## Architecture
+**Simulator Controls:**
 
-### Project Structure
+| Input | Action |
+|-------|--------|
+| Arrow keys | Navigate menu |
+| Enter/Space | Select / Play-Pause |
+| Escape | Menu |
+| Q | Quit |
+
+See [Simulator Guide](docs/008-simulator-guide.md) for complete documentation.
+
+## Installing on Hardware
+
+> **Warning**: Installing custom firmware carries risk. Always have a backup and test device.
+
+### Prerequisites
+
+1. iPod Video 5th/5.5th Generation
+2. JTAG adapter (FT2232H recommended)
+3. Working Disk Mode
+
+### Installation Steps
+
+1. **Test in simulator first** - Verify your build works
+2. **Create backup** - Use Disk Mode to backup your device
+3. **Follow safety protocol** - See [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md)
+
+```bash
+# Build for ARM target
+zig build -Dtarget=arm-freestanding-eabi
+
+# Flash using JTAG tools (see hardware testing protocol)
+zigpod-flasher install --image zig-out/bin/zigpod.bin
+```
+
+See [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md) for safe deployment procedures.
+
+## Supported Audio Formats
+
+| Format | Bit Depths | Sample Rates | Notes |
+|--------|------------|--------------|-------|
+| **WAV** | 8/16/24/32-bit, float | Up to 192kHz | PCM and WAVE_FORMAT_EXTENSIBLE |
+| **AIFF** | 8/16/24/32-bit | Up to 192kHz | AIFF and AIFF-C |
+| **FLAC** | 8-24 bit | Up to 192kHz | All compression levels |
+| **MP3** | N/A | 32-48kHz | VBR/CBR 32-320 kbps |
+
+## Project Structure
 
 ```
 zigpod/
-├── build.zig           # Build configuration
-├── build.zig.zon       # Package manifest
-├── linker/
-│   └── pp5021c.ld      # Linker script for PP5021C
 ├── src/
-│   ├── main.zig        # Main entry point
-│   ├── root.zig        # Root module (imports all modules for testing)
-│   ├── hal/            # Hardware Abstraction Layer
-│   │   ├── hal.zig     # HAL interface
-│   │   ├── mock/       # Mock implementation for testing
-│   │   └── pp5021c/    # PP5021C hardware implementation
-│   ├── kernel/         # Kernel components
-│   │   ├── boot.zig    # Boot sequence and exception handlers
-│   │   ├── memory.zig  # Memory allocator
-│   │   ├── interrupts.zig # Interrupt management
-│   │   └── timer.zig   # Timer and delay functions
-│   ├── drivers/        # Device drivers
-│   │   ├── audio/      # Audio drivers (codec, I2S)
-│   │   ├── display/    # LCD driver
-│   │   ├── input/      # Click wheel driver
-│   │   ├── storage/    # ATA and FAT32 drivers
-│   │   ├── gpio.zig    # GPIO driver
-│   │   ├── i2c.zig     # I2C driver
-│   │   └── pmu.zig     # Power management driver
-│   ├── audio/          # Audio playback engine
-│   ├── ui/             # User interface framework
-│   └── lib/            # Utility libraries
-│       ├── ring_buffer.zig  # Ring buffer for streaming
-│       ├── fixed_point.zig  # Fixed-point math for DSP
-│       └── crc.zig          # CRC calculations
-└── docs/               # Documentation
+│   ├── main.zig           # Entry point
+│   ├── hal/               # Hardware Abstraction Layer
+│   ├── kernel/            # Kernel (memory, interrupts, timer)
+│   ├── drivers/           # Device drivers
+│   ├── audio/             # Audio engine and decoders
+│   ├── ui/                # User interface
+│   ├── library/           # Music library (iTunesDB)
+│   ├── simulator/         # PP5021C simulator
+│   └── tools/             # JTAG, flasher, recovery tools
+├── docs/                  # Documentation
+├── linker/                # Linker scripts
+└── build.zig              # Build configuration
 ```
 
-### Hardware Abstraction Layer (HAL)
+## Documentation
 
-The HAL provides a clean interface between hardware and software, enabling:
-- **Mock HAL**: Run and test code on development machine
-- **PP5021C HAL**: Run on actual iPod hardware
+### User Documentation
 
-```zig
-const hal = @import("hal/hal.zig");
+| Document | Description |
+|----------|-------------|
+| [User Guide](docs/007-user-guide.md) | Using ZigPod on your device |
+| [Simulator Guide](docs/008-simulator-guide.md) | Running and using the simulator |
 
-// Use the current HAL (mock for testing, PP5021C on hardware)
-hal.current_hal.delay_ms(100);
-hal.current_hal.gpio_write(port, pin, true);
-```
+### Developer Documentation
 
-### Memory Management
+| Document | Description |
+|----------|-------------|
+| [Project Vision](docs/001-zigpod.md) | Project goals and guidelines |
+| [Implementation Plan](docs/003-implementation-plan.md) | Development phases |
+| [Hardware Reference](docs/004-hardware-reference.md) | PP5021C registers and memory map |
+| [iTunesDB Format](docs/005-itunesdb-format.md) | Music database format specification |
 
-The OS uses a fixed-block allocator suitable for embedded systems:
+### Hardware Documentation
 
-```zig
-const memory = @import("kernel/memory.zig");
-
-// Initialize the memory subsystem
-memory.init();
-
-// Allocate memory (automatically chooses appropriate block size)
-const ptr = memory.alloc(128);
-
-// Get memory statistics
-const stats = memory.getStats();
-```
-
-Block sizes:
-- Small: 64 bytes (256 blocks)
-- Medium: 256 bytes (128 blocks)
-- Large: 1024 bytes (64 blocks)
-
-### Audio Playback
-
-The audio engine handles codec control, I2S output, and buffering:
-
-```zig
-const audio = @import("audio/audio.zig");
-
-// Initialize audio subsystem
-try audio.init();
-
-// Play audio with a decode callback
-try audio.play(decodeCallback, trackInfo);
-
-// Control playback
-audio.pause();
-audio.resumePlayback();
-audio.togglePause();
-
-// Volume control (-89 to +6 dB)
-try audio.setVolumeMono(-10);
-```
-
-### UI Framework
-
-The UI framework provides iPod-style menu navigation:
-
-```zig
-const ui = @import("ui/ui.zig");
-
-// Initialize UI
-try ui.init();
-
-// Create and display menus
-var menu = ui.createMenu("Main Menu");
-_ = menu.addItem("Music", &musicCallback);
-_ = menu.addItem("Settings", &settingsCallback);
-ui.drawMenu(&menu);
-```
-
-### Click Wheel Input
-
-The click wheel driver handles button presses and wheel gestures:
-
-```zig
-const clickwheel = @import("drivers/input/clickwheel.zig");
-
-// Poll for input events
-const event = try clickwheel.poll();
-
-// Check button states
-if (event.buttonPressed(clickwheel.Button.PLAY)) {
-    // Handle play button
-}
-
-// Check wheel movement
-const wheel_event = event.wheelEvent();
-if (wheel_event == .clockwise) {
-    // Handle scroll
-}
-```
-
-### Storage and Filesystem
-
-FAT32 filesystem support for reading music files:
-
-```zig
-const fat32 = @import("drivers/storage/fat32.zig");
-
-// Mount the filesystem
-try fat32.mount();
-
-// Open and read files
-const file = try fat32.openFile("/MUSIC/track.wav");
-defer fat32.closeFile(file);
-
-const bytes_read = try fat32.readFile(file, buffer);
-```
+| Document | Description |
+|----------|-------------|
+| [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md) | Safe hardware validation procedures |
+| [Safe Init Sequences](docs/005-safe-init-sequences.md) | Verified initialization sequences |
+| [Recovery Guide](docs/006-recovery-guide.md) | Device recovery procedures |
 
 ## Target Hardware
 
 | Component | Specification |
 |-----------|---------------|
-| Model | iPod Video 5th Generation (A1136) |
-| SoC | PortalPlayer PP5021C |
-| CPU | Dual ARM7TDMI @ 80 MHz |
-| RAM | 32MB / 64MB SDRAM |
-| Display | 320x240 QVGA LCD (BCM2722) |
-| Audio | Wolfson WM8758 codec |
-| Storage | 30-80GB HDD or iFlash SD adapter |
-| PMU | Philips PCF50605 |
-| Input | Capacitive click wheel (96 positions) |
+| **Model** | iPod Video 5th Gen (A1136) |
+| **SoC** | PortalPlayer PP5021C |
+| **CPU** | Dual ARM7TDMI @ 80 MHz |
+| **RAM** | 32MB / 64MB SDRAM |
+| **Display** | 320x240 QVGA LCD |
+| **Audio** | Wolfson WM8758 codec |
+| **Storage** | 30-80GB HDD or iFlash adapter |
 
-## Memory Map
+## Development
 
-| Region | Start | End | Size | Description |
-|--------|-------|-----|------|-------------|
-| IRAM | 0x40000000 | 0x40020000 | 128KB | Internal RAM |
-| SDRAM | 0x10000000 | 0x12000000 | 32MB | Main memory |
-| Peripherals | 0x60000000 | 0x70000000 | - | I/O registers |
-| ATA | 0xC0000000 | - | - | IDE interface |
+### Running Tests
 
-## Troubleshooting
+```bash
+# Run all tests (458+ tests)
+zig build test
 
-### Build Errors
+# Run with verbose output
+zig build test 2>&1 | less
+```
 
-**"unable to load 'X.zig': FileNotFound"**
-- Ensure all source files are present
-- Run `git status` to check for missing files
+### Code Quality
 
-**"type has no member 'X'"**
-- The API may have changed; check the module documentation
-- Run `zig build test` to identify specific issues
+```bash
+# Check formatting
+zig build fmt-check
 
-### Test Failures
+# Auto-format
+zig build fmt
+```
 
-**"test 'X' failed"**
-- Run with verbose output: `zig build test 2>&1 | less`
-- Check test assertions match current implementation
+### Development Workflow
 
-### Hardware Issues (Future)
-
-**Device not responding**
-- Ensure Disk Mode works (hold SELECT+PLAY during boot)
-- Check USB connection
-- Verify device is detected by host OS
-
-## Development Workflow
-
-1. **Write tests first** - Create tests for new functionality
-2. **Implement with mock HAL** - Use mock HAL for initial development
-3. **Run tests** - `zig build test` must pass
-4. **Format code** - `zig build fmt`
-5. **Test on simulator** - (When available) Test in PP5021C simulator
-6. **Test on hardware** - (When ready) Flash to iPod and test
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [001-zigpod.md](docs/001-zigpod.md) | Project vision and guidelines |
-| [002-plan.md](docs/002-plan.md) | High-level project plan |
-| [003-implementation-plan.md](docs/003-implementation-plan.md) | Detailed implementation phases |
-| [004-hardware-reference.md](docs/004-hardware-reference.md) | Hardware reference (registers, memory map) |
-| [005-safe-init-sequences.md](docs/005-safe-init-sequences.md) | Verified safe initialization sequences |
-| [006-recovery-guide.md](docs/006-recovery-guide.md) | Recovery procedures and safety guide |
+1. Write tests first
+2. Implement with mock HAL
+3. Test in simulator
+4. Deploy to hardware (with backup!)
 
 ## Safety Guidelines
 
-**Before developing for real hardware:**
+Before deploying to real hardware:
 
-1. Read the [Safe Initialization Sequences](docs/005-safe-init-sequences.md)
-2. Read the [Recovery Guide](docs/006-recovery-guide.md)
-3. **ALWAYS** test in emulator/simulator first
-4. **ALWAYS** verify Disk Mode works before testing
-5. **ALWAYS** have a backup iPod for development
-6. **NEVER** flash the boot ROM
-
-## Research Sources
-
-- [Rockbox Source Code](https://github.com/Rockbox/rockbox) - Primary hardware reference
-- [iPodLoader2](https://github.com/crozone/ipodloader2) - Bootloader reference
-- [WM8758 Datasheet](https://www.alldatasheet.com/view.jsp?Searchword=WM8758) - Audio codec
-- [freemyipod.org](https://freemyipod.org) - Community resources and recovery
+1. **Always test in simulator first**
+2. **Create and verify backups**
+3. **Follow the [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md)**
+4. **Never flash the boot ROM**
+5. **Keep a recovery device available**
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch
@@ -300,12 +207,18 @@ Contributions are welcome! Please:
 4. Ensure all tests pass (`zig build test`)
 5. Submit a pull request
 
+## Research Sources
+
+- [Rockbox](https://github.com/Rockbox/rockbox) - Primary hardware reference
+- [iPodLoader2](https://github.com/crozone/ipodloader2) - Bootloader reference
+- [freemyipod.org](https://freemyipod.org) - Community resources
+
 ## License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- The [Rockbox](https://www.rockbox.org/) project for extensive hardware documentation
-- The iPod Linux and freemyipod.org communities
-- Contributors to PortalPlayer reverse engineering efforts
+- The [Rockbox](https://www.rockbox.org/) project for hardware documentation
+- iPod Linux and freemyipod.org communities
+- PortalPlayer reverse engineering contributors
