@@ -142,6 +142,7 @@ pub const AiffDecoder = struct {
                     8 => .u8_pcm,
                     16 => .s16_be,
                     24 => .s24_le, // We convert to LE during decode
+                    32 => .s16_le, // 32-bit converted to 16-bit LE
                     else => .s16_be,
                 },
             },
@@ -177,26 +178,36 @@ pub const AiffDecoder = struct {
     }
 
     /// Decode a single sample based on bit depth (AIFF is big-endian)
+    /// Uses proper rounding for bit-depth reduction to maintain audiophile quality
     fn decodeSample(self: *AiffDecoder, data: []const u8) i16 {
         return switch (self.format.bits_per_sample) {
             8 => {
                 // 8-bit signed (AIFF uses signed, unlike WAV)
                 const signed: i8 = @bitCast(data[0]);
-                return @as(i16, signed) * 256;
+                return @as(i16, signed) << 8;
             },
             16 => {
-                // 16-bit signed big-endian
+                // 16-bit signed big-endian - bit-perfect
                 return std.mem.readInt(i16, data[0..2], .big);
             },
             24 => {
-                // 24-bit signed big-endian, scale to 16-bit
+                // 24-bit signed big-endian, scale to 16-bit with rounding
                 const high = data[0];
                 const mid = data[1];
                 const low = data[2];
                 const value: i32 = (@as(i32, @as(i8, @bitCast(high))) << 16) |
                     (@as(i32, mid) << 8) |
                     @as(i32, low);
-                return @intCast(value >> 8);
+                // Add half LSB for proper rounding before truncation
+                const rounded = value + 128; // 0x80 = half of 256 (8 bits being discarded)
+                return @intCast(std.math.clamp(rounded >> 8, -32768, 32767));
+            },
+            32 => {
+                // 32-bit signed big-endian, scale to 16-bit with rounding
+                const value = std.mem.readInt(i32, data[0..4], .big);
+                // Add half LSB for proper rounding
+                const rounded: i64 = @as(i64, value) + 32768; // half of 65536
+                return @intCast(std.math.clamp(rounded >> 16, -32768, 32767));
             },
             else => 0,
         };

@@ -297,13 +297,26 @@ pub const FlacDecoder = struct {
     }
 
     /// Scale sample to 16-bit based on bits per sample
+    /// Uses proper rounding for bit-depth reduction to maintain audiophile quality
     fn scaleToI16(self: *FlacDecoder, sample: i32) i16 {
         return switch (self.stream_info.bits_per_sample) {
-            8 => @intCast((sample << 8)),
+            8 => @intCast(sample << 8),
             16 => @intCast(sample),
-            20 => @intCast(sample >> 4),
-            24 => @intCast(sample >> 8),
-            32 => @intCast(sample >> 16),
+            20 => {
+                // 20-bit to 16-bit with rounding
+                const rounded = sample + 8; // half of 16 (4 bits being discarded)
+                return @intCast(std.math.clamp(rounded >> 4, -32768, 32767));
+            },
+            24 => {
+                // 24-bit to 16-bit with rounding
+                const rounded = sample + 128; // half of 256 (8 bits being discarded)
+                return @intCast(std.math.clamp(rounded >> 8, -32768, 32767));
+            },
+            32 => {
+                // 32-bit to 16-bit with rounding
+                const rounded: i64 = @as(i64, sample) + 32768; // half of 65536
+                return @intCast(std.math.clamp(rounded >> 16, -32768, 32767));
+            },
             else => @intCast(sample),
         };
     }
@@ -498,10 +511,17 @@ pub const FlacDecoder = struct {
         const precision = (try reader.readBits(u4, 4)) + 1;
         const shift = try reader.readBits(i5, 5);
 
-        // Read LPC coefficients
+        // Read LPC coefficients (signed, need proper sign extension)
         var coefficients: [32]i32 = undefined;
         for (0..order) |i| {
-            coefficients[i] = try reader.readBits(i32, precision);
+            const unsigned = try reader.readBits(u32, precision);
+            // Sign extend from precision bits to 32 bits
+            const sign_bit: u32 = @as(u32, 1) << @intCast(precision - 1);
+            if (unsigned & sign_bit != 0) {
+                coefficients[i] = @bitCast(unsigned | ~((sign_bit << 1) - 1));
+            } else {
+                coefficients[i] = @intCast(unsigned);
+            }
         }
 
         // Decode residuals

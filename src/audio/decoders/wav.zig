@@ -43,6 +43,8 @@ pub const WavDecoder = struct {
         byte_rate: u32,
         block_align: u16,
         bits_per_sample: u16,
+        valid_bits_per_sample: u16, // For EXTENSIBLE format
+        is_float: bool,
     };
 
     pub const Error = error{
@@ -75,17 +77,37 @@ pub const WavDecoder = struct {
                 if (chunk_size < 16) return Error.InvalidChunk;
 
                 const fmt_data = data[offset + 8 ..];
+                const audio_fmt = std.mem.readInt(u16, fmt_data[0..2], .little);
+                const bits = std.mem.readInt(u16, fmt_data[14..16], .little);
+
+                var is_float = false;
+                var valid_bits = bits;
+                var actual_format = audio_fmt;
+
+                // Handle EXTENSIBLE format
+                if (audio_fmt == FORMAT_EXTENSIBLE and chunk_size >= 40) {
+                    valid_bits = std.mem.readInt(u16, fmt_data[18..20], .little);
+                    // SubFormat GUID - first 2 bytes indicate actual format
+                    const sub_format = std.mem.readInt(u16, fmt_data[24..26], .little);
+                    actual_format = sub_format;
+                    is_float = (sub_format == FORMAT_IEEE_FLOAT);
+                } else if (audio_fmt == FORMAT_IEEE_FLOAT) {
+                    is_float = true;
+                }
+
                 format = Format{
-                    .audio_format = std.mem.readInt(u16, fmt_data[0..2], .little),
+                    .audio_format = actual_format,
                     .channels = std.mem.readInt(u16, fmt_data[2..4], .little),
                     .sample_rate = std.mem.readInt(u32, fmt_data[4..8], .little),
                     .byte_rate = std.mem.readInt(u32, fmt_data[8..12], .little),
                     .block_align = std.mem.readInt(u16, fmt_data[12..14], .little),
-                    .bits_per_sample = std.mem.readInt(u16, fmt_data[14..16], .little),
+                    .bits_per_sample = bits,
+                    .valid_bits_per_sample = valid_bits,
+                    .is_float = is_float,
                 };
 
-                // Validate format
-                if (format.?.audio_format != FORMAT_PCM) {
+                // Validate format - support PCM and IEEE float
+                if (actual_format != FORMAT_PCM and actual_format != FORMAT_IEEE_FLOAT) {
                     return Error.UnsupportedFormat;
                 }
             } else if (std.mem.eql(u8, chunk_id, DATA_ID)) {
@@ -117,10 +139,11 @@ pub const WavDecoder = struct {
                 .bits_per_sample = @intCast(fmt.bits_per_sample),
                 .total_samples = total_samples,
                 .duration_ms = (@as(u64, total_samples) * 1000) / fmt.sample_rate,
-                .format = switch (fmt.bits_per_sample) {
+                .format = if (fmt.is_float) .s16_le else switch (fmt.bits_per_sample) {
                     8 => .u8_pcm,
                     16 => .s16_le,
                     24 => .s24_le,
+                    32 => .s16_le, // 32-bit PCM converted to 16-bit
                     else => .s16_le,
                 },
             },
@@ -157,29 +180,57 @@ pub const WavDecoder = struct {
     }
 
     /// Decode a single sample based on bit depth
+    /// Uses proper rounding for bit-depth reduction to maintain quality
     fn decodeSample(self: *WavDecoder, data: []const u8) i16 {
+        if (self.format.is_float) {
+            return self.decodeFloatSample(data);
+        }
+
         return switch (self.format.bits_per_sample) {
             8 => {
                 // 8-bit unsigned to 16-bit signed
                 const unsigned: i32 = data[0];
-                return @intCast((unsigned - 128) * 256);
+                return @intCast((unsigned - 128) << 8);
             },
             16 => {
-                // 16-bit signed little-endian
+                // 16-bit signed little-endian - bit-perfect
                 return std.mem.readInt(i16, data[0..2], .little);
             },
             24 => {
-                // 24-bit signed little-endian, scale to 16-bit
+                // 24-bit signed little-endian, scale to 16-bit with rounding
                 const low = data[0];
                 const mid = data[1];
                 const high = data[2];
                 const value: i32 = (@as(i32, @as(i8, @bitCast(high))) << 16) |
                     (@as(i32, mid) << 8) |
                     @as(i32, low);
-                return @intCast(value >> 8); // Scale to 16-bit
+                // Add half LSB for proper rounding before truncation
+                const rounded = value + 128; // 0x80 = half of 256 (8 bits being discarded)
+                return @intCast(std.math.clamp(rounded >> 8, -32768, 32767));
+            },
+            32 => {
+                // 32-bit signed little-endian, scale to 16-bit with rounding
+                const value = std.mem.readInt(i32, data[0..4], .little);
+                // Add half LSB for proper rounding
+                const rounded: i64 = @as(i64, value) + 32768; // half of 65536
+                return @intCast(std.math.clamp(rounded >> 16, -32768, 32767));
             },
             else => 0,
         };
+    }
+
+    /// Decode IEEE 754 floating-point sample to 16-bit
+    fn decodeFloatSample(self: *WavDecoder, data: []const u8) i16 {
+        _ = self;
+        // 32-bit IEEE 754 float
+        const bits = std.mem.readInt(u32, data[0..4], .little);
+        const float_val: f32 = @bitCast(bits);
+
+        // Convert float (-1.0 to 1.0) to i16 with proper clipping
+        // Multiply by 32767 (not 32768) to avoid overflow on positive full-scale
+        const scaled = float_val * 32767.0;
+        const clamped = std.math.clamp(scaled, -32768.0, 32767.0);
+        return @intFromFloat(clamped);
     }
 
     /// Seek to sample position
