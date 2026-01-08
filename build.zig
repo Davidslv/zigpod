@@ -10,6 +10,61 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ============================================================
+    // Build Options
+    // ============================================================
+
+    const enable_sdl2 = b.option(bool, "sdl2", "Enable SDL2 GUI (requires SDL2 installed)") orelse false;
+
+    // ============================================================
+    // Simulator Executable
+    // ============================================================
+
+    // Create root module that the simulator main will import from
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = default_target,
+        .optimize = optimize,
+    });
+
+    const sim_module = b.createModule(.{
+        .root_source_file = b.path("src/simulator/main.zig"),
+        .target = default_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zigpod", .module = root_module },
+        },
+    });
+
+    // Add SDL2 build option
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_sdl2", enable_sdl2);
+    sim_module.addOptions("build_options", build_options);
+
+    const sim_exe = b.addExecutable(.{
+        .name = "zigpod-sim",
+        .root_module = sim_module,
+    });
+
+    // Link SDL2 if enabled
+    if (enable_sdl2) {
+        sim_exe.linkSystemLibrary("SDL2");
+        sim_exe.linkLibC();
+    }
+
+    b.installArtifact(sim_exe);
+
+    const run_sim = b.addRunArtifact(sim_exe);
+    run_sim.step.dependOn(b.getInstallStep());
+
+    // Pass command line args to simulator
+    if (b.args) |args| {
+        run_sim.addArgs(args);
+    }
+
+    const sim_step = b.step("sim", "Run the PP5021C simulator");
+    sim_step.dependOn(&run_sim.step);
+
+    // ============================================================
     // Unit Tests
     // ============================================================
 

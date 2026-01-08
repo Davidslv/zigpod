@@ -23,6 +23,9 @@ pub const cpu = struct {
     pub const arm7tdmi = @import("cpu/arm7tdmi.zig");
 };
 
+// Export memory bus
+pub const memory_bus = @import("memory_bus.zig");
+
 // Export storage simulation modules
 pub const storage = struct {
     pub const disk_image = @import("storage/disk_image.zig");
@@ -52,12 +55,9 @@ pub const profiler_mod = struct {
     pub const profiler = @import("profiler/profiler.zig");
 };
 
-// Export GUI modules (NullBackend always available, SDL2 optional)
-pub const gui_mod = struct {
-    pub const gui = @import("gui/gui.zig");
-    // SDL2 backend is only compiled when SDL2 is available
-    // Use: zig build -Dgui=sdl2
-};
+// Note: GUI modules (gui/gui.zig, gui/sdl_backend.zig) are imported directly
+// by the simulator executable (main.zig) to avoid module conflicts.
+// They are not re-exported here.
 
 // ============================================================
 // Simulator Configuration
@@ -128,6 +128,11 @@ pub const SimulatorState = struct {
     interrupt_controller: interrupts.interrupt_controller.InterruptController = interrupts.interrupt_controller.InterruptController.init(),
     timer_system: interrupts.timer_sim.TimerSystem = interrupts.timer_sim.TimerSystem.init(),
 
+    // CPU emulation
+    arm_cpu: ?cpu.arm7tdmi.Arm7Tdmi = null,
+    bus: ?memory_bus.MemoryBus = null,
+    cpu_memory_interface: ?memory_bus.CpuMemoryBus = null,
+
     // Allocator
     allocator: std.mem.Allocator = undefined,
 
@@ -184,6 +189,34 @@ pub const SimulatorState = struct {
         @memset(&self.iram, 0);
         @memset(&self.sdram, 0);
 
+        // Initialize memory bus with simulator's memory
+        self.bus = try memory_bus.MemoryBus.initWithMemory(
+            allocator,
+            &self.iram,
+            &self.sdram,
+        );
+
+        // Connect peripherals to memory bus
+        if (self.bus) |*bus| {
+            bus.connectInterruptController(&self.interrupt_controller);
+            bus.connectTimers(&self.timer_system);
+            if (self.ata_controller) |*ata| {
+                bus.connectAta(ata);
+            }
+            bus.connectLcd(&self.lcd_framebuffer);
+
+            // Create CPU memory interface
+            self.cpu_memory_interface = bus.getCpuInterface();
+        }
+
+        // Initialize ARM7TDMI CPU
+        self.arm_cpu = cpu.arm7tdmi.Arm7Tdmi.init();
+        if (self.arm_cpu) |*arm| {
+            if (self.cpu_memory_interface) |*mem_iface| {
+                arm.setMemory(mem_iface);
+            }
+        }
+
         return self;
     }
 
@@ -191,6 +224,16 @@ pub const SimulatorState = struct {
     pub fn deinit(self: *SimulatorState) void {
         self.i2c_devices.deinit();
         self.audio_buffer.deinit(self.allocator);
+
+        // Clean up CPU
+        self.arm_cpu = null;
+        self.cpu_memory_interface = null;
+
+        // Clean up memory bus
+        if (self.bus) |*bus| {
+            bus.deinit();
+            self.bus = null;
+        }
 
         // Clean up ATA/storage
         self.ata_controller = null;
@@ -248,39 +291,47 @@ pub const SimulatorState = struct {
     pub fn renderLcdToTerminal(self: *SimulatorState) void {
         if (!self.config.lcd_visualization) return;
 
-        const writer = std.io.getStdOut().writer();
+        const stdout = std.fs.File.stdout();
 
         // Clear screen and move cursor to top
-        writer.writeAll("\x1B[2J\x1B[H") catch {};
+        _ = stdout.write("\x1B[2J\x1B[H") catch {};
 
         // Draw top border
-        writer.writeAll("+" ++ ("-" ** 80) ++ "+\n") catch {};
+        _ = stdout.write("+" ++ ("-" ** 80) ++ "+\n") catch {};
 
         // Draw scaled framebuffer (320x240 -> 80x24)
         const x_scale = 4;
         const y_scale = 10;
 
+        // Build line buffer for efficient output
+        var line_buf: [82]u8 = undefined;
+        line_buf[0] = '|';
+        line_buf[81] = '\n';
+
         var y: usize = 0;
         while (y < 240) : (y += y_scale) {
-            writer.writeAll("|") catch {};
             var x: usize = 0;
+            var buf_idx: usize = 1;
             while (x < 320) : (x += x_scale) {
                 const pixel = self.lcd_framebuffer[y * 320 + x];
-                const char = colorToChar(pixel);
-                writer.writeByte(char) catch {};
+                line_buf[buf_idx] = colorToChar(pixel);
+                buf_idx += 1;
             }
-            writer.writeAll("|\n") catch {};
+            line_buf[buf_idx] = '|';
+            _ = stdout.write(line_buf[0 .. buf_idx + 2]) catch {};
         }
 
         // Draw bottom border
-        writer.writeAll("+" ++ ("-" ** 80) ++ "+\n") catch {};
+        _ = stdout.write("+" ++ ("-" ** 80) ++ "+\n") catch {};
 
         // Status line
-        writer.print("Backlight: {} | Wheel: {} | Buttons: 0x{X:0>2}\n", .{
+        var status_buf: [128]u8 = undefined;
+        const status = std.fmt.bufPrint(&status_buf, "Backlight: {s} | Wheel: {d} | Buttons: 0x{X:0>2}\n", .{
             if (self.lcd_backlight) "ON " else "OFF",
             self.wheel_position,
             self.button_state,
-        }) catch {};
+        }) catch return;
+        _ = stdout.write(status) catch {};
     }
 
     /// Convert RGB565 color to ASCII character
@@ -330,6 +381,205 @@ pub const SimulatorState = struct {
 
         const bytes = std.mem.sliceAsBytes(self.audio_buffer.items);
         try file.writeAll(bytes);
+    }
+
+    // ============================================================
+    // CPU Emulation Run Loop
+    // ============================================================
+
+    /// Result of running the simulator
+    pub const RunResult = struct {
+        cycles: u64,
+        instructions: u64,
+        stop_reason: StopReason,
+    };
+
+    pub const StopReason = enum {
+        cycle_limit,
+        breakpoint,
+        halted,
+        error_no_cpu,
+        error_execution,
+    };
+
+    /// Load binary code into ROM for execution
+    pub fn loadRom(self: *SimulatorState, data: []const u8) void {
+        if (self.bus) |*bus| {
+            bus.loadRom(data);
+        }
+    }
+
+    /// Load binary code into IRAM at offset
+    pub fn loadIram(self: *SimulatorState, offset: u32, data: []const u8) void {
+        if (self.bus) |*bus| {
+            bus.loadIram(offset, data);
+        }
+    }
+
+    /// Load binary code into SDRAM at offset
+    pub fn loadSdram(self: *SimulatorState, offset: u32, data: []const u8) void {
+        if (self.bus) |*bus| {
+            bus.loadSdram(offset, data);
+        }
+    }
+
+    /// Reset the CPU
+    pub fn resetCpu(self: *SimulatorState) void {
+        if (self.arm_cpu) |*arm| {
+            arm.reset();
+        }
+    }
+
+    /// Set CPU program counter
+    pub fn setCpuPc(self: *SimulatorState, pc: u32) void {
+        if (self.arm_cpu) |*arm| {
+            arm.setPC(pc);
+        }
+    }
+
+    /// Get CPU program counter
+    pub fn getCpuPc(self: *SimulatorState) u32 {
+        if (self.arm_cpu) |*arm| {
+            return arm.getPC();
+        }
+        return 0;
+    }
+
+    /// Get CPU register
+    pub fn getCpuReg(self: *SimulatorState, reg: u4) u32 {
+        if (self.arm_cpu) |*arm| {
+            return arm.getReg(reg);
+        }
+        return 0;
+    }
+
+    /// Set CPU register
+    pub fn setCpuReg(self: *SimulatorState, reg: u4, value: u32) void {
+        if (self.arm_cpu) |*arm| {
+            arm.setReg(reg, value);
+        }
+    }
+
+    /// Step CPU one instruction
+    pub fn stepCpu(self: *SimulatorState) ?cpu.arm7tdmi.StepResult {
+        // Check for pending interrupts and update CPU IRQ line
+        self.updateCpuInterrupts();
+
+        if (self.arm_cpu) |*arm| {
+            return arm.step();
+        }
+        return null;
+    }
+
+    /// Run CPU for specified number of cycles
+    pub fn run(self: *SimulatorState, max_cycles: u64) RunResult {
+        if (self.arm_cpu == null) {
+            return .{
+                .cycles = 0,
+                .instructions = 0,
+                .stop_reason = .error_no_cpu,
+            };
+        }
+
+        var arm = &self.arm_cpu.?;
+        var cycles_run: u64 = 0;
+        var instructions_run: u64 = 0;
+
+        while (cycles_run < max_cycles) {
+            // Update timers based on elapsed time (simplified - 1 cycle = 1us)
+            self.timer_system.tick(1);
+
+            // Check for pending interrupts
+            self.updateCpuInterrupts();
+
+            const result = arm.step();
+            cycles_run += result.cycles;
+
+            switch (result.status) {
+                .ok, .interrupt_taken => {
+                    instructions_run += 1;
+                },
+                .halted => {
+                    return .{
+                        .cycles = cycles_run,
+                        .instructions = instructions_run,
+                        .stop_reason = .halted,
+                    };
+                },
+                .breakpoint => {
+                    return .{
+                        .cycles = cycles_run,
+                        .instructions = instructions_run,
+                        .stop_reason = .breakpoint,
+                    };
+                },
+                else => {
+                    return .{
+                        .cycles = cycles_run,
+                        .instructions = instructions_run,
+                        .stop_reason = .error_execution,
+                    };
+                },
+            }
+        }
+
+        return .{
+            .cycles = cycles_run,
+            .instructions = instructions_run,
+            .stop_reason = .cycle_limit,
+        };
+    }
+
+    /// Update CPU interrupt lines from interrupt controller
+    fn updateCpuInterrupts(self: *SimulatorState) void {
+        if (self.arm_cpu) |*arm| {
+            // Check if any enabled interrupts are pending
+            const irq_pending = self.interrupt_controller.hasPendingIrq();
+            arm.assertIrq(irq_pending);
+
+            const fiq_pending = self.interrupt_controller.hasPendingFiq();
+            arm.assertFiq(fiq_pending);
+        }
+    }
+
+    /// Add a breakpoint
+    pub fn addBreakpoint(self: *SimulatorState, addr: u32) bool {
+        if (self.arm_cpu) |*arm| {
+            return arm.addBreakpoint(addr);
+        }
+        return false;
+    }
+
+    /// Remove a breakpoint
+    pub fn removeBreakpoint(self: *SimulatorState, addr: u32) bool {
+        if (self.arm_cpu) |*arm| {
+            return arm.removeBreakpoint(addr);
+        }
+        return false;
+    }
+
+    /// Get CPU cycle count
+    pub fn getCpuCycles(self: *SimulatorState) u64 {
+        if (self.arm_cpu) |*arm| {
+            return arm.cycles;
+        }
+        return 0;
+    }
+
+    /// Get CPU instruction count
+    pub fn getCpuInstructions(self: *SimulatorState) u64 {
+        if (self.arm_cpu) |*arm| {
+            return arm.instructions;
+        }
+        return 0;
+    }
+
+    /// Check if CPU is running
+    pub fn isCpuRunning(self: *SimulatorState) bool {
+        if (self.arm_cpu) |*arm| {
+            return arm.state == .running;
+        }
+        return false;
     }
 };
 
@@ -849,9 +1099,155 @@ test "simulator ATA" {
     try simAtaStandby();
 }
 
+test "simulator CPU initialization" {
+    const allocator = std.testing.allocator;
+
+    try initSimulator(allocator, .{});
+    defer shutdownSimulator();
+
+    const state = sim_state.?;
+
+    // CPU should be initialized
+    try std.testing.expect(state.arm_cpu != null);
+    try std.testing.expect(state.bus != null);
+    try std.testing.expect(state.cpu_memory_interface != null);
+}
+
+test "simulator CPU simple execution" {
+    const allocator = std.testing.allocator;
+
+    try initSimulator(allocator, .{});
+    defer shutdownSimulator();
+
+    const state = sim_state.?;
+
+    // Load a simple program: MOV R0, #42; MOV R1, #100; ADD R2, R0, R1
+    // MOV R0, #42  = E3A0002A
+    // MOV R1, #100 = E3A01064
+    // ADD R2, R0, R1 = E0802001
+    // MOV R3, #0 (infinite loop back to this) = E3A03000
+    const program = [_]u8{
+        0x2A, 0x00, 0xA0, 0xE3, // MOV R0, #42
+        0x64, 0x10, 0xA0, 0xE3, // MOV R1, #100
+        0x01, 0x20, 0x80, 0xE0, // ADD R2, R0, R1
+        0x00, 0x30, 0xA0, 0xE3, // MOV R3, #0
+    };
+
+    // Load into ROM (at address 0)
+    state.loadRom(&program);
+
+    // Set PC to ROM start
+    state.setCpuPc(0);
+
+    // Run a few instructions
+    const result = state.run(10);
+
+    // Should have executed some instructions
+    try std.testing.expect(result.instructions >= 3);
+
+    // Check register values
+    try std.testing.expectEqual(@as(u32, 42), state.getCpuReg(0));
+    try std.testing.expectEqual(@as(u32, 100), state.getCpuReg(1));
+    try std.testing.expectEqual(@as(u32, 142), state.getCpuReg(2));
+}
+
+test "simulator CPU memory access" {
+    const allocator = std.testing.allocator;
+
+    try initSimulator(allocator, .{});
+    defer shutdownSimulator();
+
+    const state = sim_state.?;
+
+    // Program to store R0 to IRAM and load it back to R1
+    // MOV R0, #0x5A     = E3A0005A
+    // LDR R2, =0x40000000 (IRAM base) - use MOV to build address
+    // MOV R2, #0x40000000 (need to use multiple instructions due to immediate encoding)
+    // Actually: MOV R2, #0x40, ROR #6 = MOV R2, #0x40000000 = E3A02101
+    // STR R0, [R2]      = E5820000
+    // LDR R1, [R2]      = E5921000
+    const program = [_]u8{
+        0x5A, 0x00, 0xA0, 0xE3, // MOV R0, #0x5A
+        0x01, 0x21, 0xA0, 0xE3, // MOV R2, #0x40000000 (1 rotated left by 2*1 = 0x40000000)
+        0x00, 0x00, 0x82, 0xE5, // STR R0, [R2]
+        0x00, 0x10, 0x92, 0xE5, // LDR R1, [R2]
+    };
+
+    state.loadRom(&program);
+    state.setCpuPc(0);
+
+    const result = state.run(10);
+    try std.testing.expect(result.instructions >= 4);
+
+    // R1 should have the value from R0
+    try std.testing.expectEqual(@as(u32, 0x5A), state.getCpuReg(1));
+}
+
+test "simulator CPU step execution" {
+    const allocator = std.testing.allocator;
+
+    try initSimulator(allocator, .{});
+    defer shutdownSimulator();
+
+    const state = sim_state.?;
+
+    // Load MOV R0, #1 at address 0
+    const program = [_]u8{
+        0x01, 0x00, 0xA0, 0xE3, // MOV R0, #1
+        0x02, 0x00, 0xA0, 0xE3, // MOV R0, #2
+    };
+
+    state.loadRom(&program);
+    state.setCpuPc(0);
+
+    // Step once
+    _ = state.stepCpu();
+    try std.testing.expectEqual(@as(u32, 1), state.getCpuReg(0));
+    try std.testing.expectEqual(@as(u32, 4), state.getCpuPc());
+
+    // Step again
+    _ = state.stepCpu();
+    try std.testing.expectEqual(@as(u32, 2), state.getCpuReg(0));
+}
+
+test "simulator CPU breakpoint" {
+    const allocator = std.testing.allocator;
+
+    try initSimulator(allocator, .{});
+    defer shutdownSimulator();
+
+    const state = sim_state.?;
+
+    // Load program
+    const program = [_]u8{
+        0x01, 0x00, 0xA0, 0xE3, // 0x00: MOV R0, #1
+        0x02, 0x00, 0xA0, 0xE3, // 0x04: MOV R0, #2
+        0x03, 0x00, 0xA0, 0xE3, // 0x08: MOV R0, #3
+        0x04, 0x00, 0xA0, 0xE3, // 0x0C: MOV R0, #4
+    };
+
+    state.loadRom(&program);
+    state.setCpuPc(0);
+
+    // Set breakpoint at address 0x08
+    try std.testing.expect(state.addBreakpoint(0x08));
+
+    // Run until breakpoint
+    const result = state.run(100);
+
+    // Should stop at breakpoint
+    try std.testing.expectEqual(SimulatorState.StopReason.breakpoint, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0x08), state.getCpuPc());
+
+    // R0 should be 2 (from instructions before breakpoint)
+    try std.testing.expectEqual(@as(u32, 2), state.getCpuReg(0));
+}
+
 test {
     // Reference CPU emulation modules to include their tests
     std.testing.refAllDecls(cpu);
+    // Reference memory bus to include its tests
+    std.testing.refAllDecls(memory_bus);
     // Reference storage modules to include their tests
     std.testing.refAllDecls(storage);
     // Reference interrupt modules to include their tests
@@ -862,6 +1258,5 @@ test {
     std.testing.refAllDecls(audio);
     // Reference profiler modules to include their tests
     std.testing.refAllDecls(profiler_mod);
-    // Reference GUI modules to include their tests
-    std.testing.refAllDecls(gui_mod);
+    // Note: GUI module tests are run separately via the gui/gui.zig test target
 }
