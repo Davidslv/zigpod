@@ -32,12 +32,6 @@ This document outlines what's needed to run ZigPod on real iPod Classic (6th/7th
 | Audio decoders | `src/audio/decoders/` | WAV, MP3, FLAC, AIFF |
 | UI framework | `src/ui/` | Screens, menus, file browser |
 
-### Partially Complete (Need Hardware Implementation)
-
-| Component | Location | What's Done | What's Missing |
-|-----------|----------|-------------|----------------|
-| Power mgmt | `src/drivers/power.zig` | Framework | Battery monitoring |
-
 ### Recently Completed
 
 | Component | Location | Notes |
@@ -50,6 +44,13 @@ This document outlines what's needed to run ZigPod on real iPod Classic (6th/7th
 | DMA controller | `src/hal/pp5021c/` | 4-channel transfers, burst modes |
 | Watchdog timer | `src/hal/pp5021c/` | Timeout, refresh, reset detection |
 | RTC | `src/hal/pp5021c/` | Time read/write, alarm support |
+| Power mgmt (PMU) | `src/hal/pp5021c/` | PCF50605 battery, charging, voltage control |
+
+### Known Issues (To Be Addressed)
+
+| Issue | Location | Priority |
+|-------|----------|----------|
+| Audio static at higher volumes | `src/simulator/audio/` | High |
 
 ---
 

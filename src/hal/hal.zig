@@ -165,6 +165,33 @@ pub const DmaChannelState = enum {
     @"error",
 };
 
+/// Battery charging state
+pub const ChargingState = enum {
+    not_charging,
+    pre_charge,
+    fast_charge,
+    trickle_charge,
+    charge_complete,
+    charge_error,
+};
+
+/// Power source
+pub const PowerSource = enum {
+    battery,
+    usb,
+    adapter,
+};
+
+/// Battery status information
+pub const BatteryStatus = struct {
+    voltage_mv: u16, // Battery voltage in millivolts
+    percentage: u8, // Estimated charge percentage (0-100)
+    charging: ChargingState, // Current charging state
+    power_source: PowerSource, // Current power source
+    present: bool, // Battery detected
+    temperature_ok: bool, // Temperature within limits
+};
+
 // ============================================================
 // HAL Interface Structure
 // ============================================================
@@ -465,6 +492,37 @@ pub const Hal = struct {
 
     /// Check if alarm has triggered
     rtc_alarm_triggered: *const fn () bool,
+
+    // --------------------------------------------------------
+    // Power Management (PMU) Operations
+    // --------------------------------------------------------
+
+    /// Initialize PMU
+    pmu_init: *const fn () HalError!void,
+
+    /// Get battery status
+    pmu_get_battery_status: *const fn () BatteryStatus,
+
+    /// Get battery voltage in millivolts
+    pmu_get_battery_voltage: *const fn () u16,
+
+    /// Get estimated battery percentage (0-100)
+    pmu_get_battery_percent: *const fn () u8,
+
+    /// Check if charging
+    pmu_is_charging: *const fn () bool,
+
+    /// Enable/disable charging
+    pmu_set_charging: *const fn (enable: bool) void,
+
+    /// Check if external power is connected
+    pmu_external_power_present: *const fn () bool,
+
+    /// Request system shutdown
+    pmu_shutdown: *const fn () void,
+
+    /// Set CPU voltage (for power saving)
+    pmu_set_cpu_voltage: *const fn (mv: u16) HalError!void,
 };
 
 // ============================================================

@@ -24,6 +24,9 @@ const DmaDirection = hal_types.DmaDirection;
 const DmaBurstSize = hal_types.DmaBurstSize;
 const DmaRequest = hal_types.DmaRequest;
 const DmaChannelState = hal_types.DmaChannelState;
+const ChargingState = hal_types.ChargingState;
+const PowerSource = hal_types.PowerSource;
+const BatteryStatus = hal_types.BatteryStatus;
 
 // ============================================================
 // Internal State
@@ -42,6 +45,7 @@ var wdt_initialized: bool = false;
 var wdt_timeout_ms: u32 = 0;
 var wdt_caused_last_reset: bool = false;
 var rtc_initialized: bool = false;
+var pmu_initialized: bool = false;
 
 // ============================================================
 // System Functions
@@ -1525,6 +1529,204 @@ fn hwRtcAlarmTriggered() bool {
 }
 
 // ============================================================
+// PMU Functions - PCF50605 Power Management
+// ============================================================
+
+/// Read a register from the PCF50605 via I2C
+fn pcfReadReg(register: u8) HalError!u8 {
+    // Write register address, then read value
+    var read_buf: [1]u8 = undefined;
+    _ = try hwI2cWriteRead(reg.PCF50605_I2C_ADDR, &[_]u8{register}, &read_buf);
+    return read_buf[0];
+}
+
+/// Write a register to the PCF50605 via I2C
+fn pcfWriteReg(register: u8, value: u8) HalError!void {
+    try hwI2cWrite(reg.PCF50605_I2C_ADDR, &[_]u8{ register, value });
+}
+
+/// Read ADC value from PCF50605
+fn pcfReadAdc(channel: u8) HalError!u16 {
+    // Configure ADC channel and start conversion
+    try pcfWriteReg(reg.PCF_ADCC2, channel);
+    try pcfWriteReg(reg.PCF_ADCC1, reg.PCF_ADCC1_ADCSTART | reg.PCF_ADCC1_RES_10BIT | reg.PCF_ADCC1_AVERAGE);
+
+    // Wait for conversion (typically ~100us)
+    hwDelayUs(200);
+
+    // Read result (10-bit value split across two registers)
+    const high = try pcfReadReg(reg.PCF_ADCS1);
+    const low = try pcfReadReg(reg.PCF_ADCS2);
+
+    return (@as(u16, high) << 2) | (@as(u16, low) & 0x03);
+}
+
+/// Convert ADC value to millivolts
+fn adcToMillivolts(adc_value: u16) u16 {
+    // 10-bit ADC with ~6V full scale range
+    // mV = adc * 5860 / 1000 (approximately)
+    return @truncate((@as(u32, adc_value) * reg.PCF_ADC_TO_MV_NUM) / reg.PCF_ADC_TO_MV_DEN);
+}
+
+/// Convert battery voltage to percentage
+fn voltageToPercent(voltage_mv: u16) u8 {
+    // Simple linear approximation between empty and full
+    if (voltage_mv >= reg.PCF_BATTERY_FULL_MV) return 100;
+    if (voltage_mv <= reg.PCF_BATTERY_EMPTY_MV) return 0;
+
+    const range = reg.PCF_BATTERY_FULL_MV - reg.PCF_BATTERY_EMPTY_MV;
+    const offset = voltage_mv - reg.PCF_BATTERY_EMPTY_MV;
+    return @truncate((@as(u32, offset) * 100) / range);
+}
+
+fn hwPmuInit() HalError!void {
+    // Ensure I2C is initialized first
+    if (!i2c_initialized) {
+        try hwI2cInit();
+    }
+
+    // Read chip ID to verify communication
+    const id = pcfReadReg(reg.PCF_ID) catch |err| {
+        // PMU not responding - might be different chip or not present
+        _ = err;
+        pmu_initialized = false;
+        return HalError.DeviceNotReady;
+    };
+
+    // PCF50605 ID should be non-zero
+    if (id == 0 or id == 0xFF) {
+        return HalError.DeviceNotReady;
+    }
+
+    // Clear pending interrupts by reading interrupt registers
+    _ = pcfReadReg(reg.PCF_INT1) catch {};
+    _ = pcfReadReg(reg.PCF_INT2) catch {};
+    _ = pcfReadReg(reg.PCF_INT3) catch {};
+
+    // Configure charger for automatic operation
+    pcfWriteReg(reg.PCF_MBCC1, reg.PCF_MBCC1_CHGENA | reg.PCF_MBCC1_AUTOFST | reg.PCF_MBCC1_AUTORES) catch {};
+
+    pmu_initialized = true;
+}
+
+fn hwPmuGetBatteryStatus() BatteryStatus {
+    var status = BatteryStatus{
+        .voltage_mv = 0,
+        .percentage = 0,
+        .charging = .not_charging,
+        .power_source = .battery,
+        .present = false,
+        .temperature_ok = true,
+    };
+
+    if (!pmu_initialized) return status;
+
+    // Read battery voltage via ADC
+    if (pcfReadAdc(reg.PCF_ADCC2_VBAT)) |adc| {
+        status.voltage_mv = adcToMillivolts(adc);
+        status.percentage = voltageToPercent(status.voltage_mv);
+    } else |_| {}
+
+    // Read charger status
+    if (pcfReadReg(reg.PCF_MBCS1)) |mbcs1| {
+        status.present = (mbcs1 & reg.PCF_MBCS1_BAT) != 0;
+
+        // Determine power source
+        if ((mbcs1 & reg.PCF_MBCS1_USB) != 0) {
+            status.power_source = .usb;
+        } else if ((mbcs1 & reg.PCF_MBCS1_ADP) != 0) {
+            status.power_source = .adapter;
+        }
+
+        // Determine charging state
+        if ((mbcs1 & reg.PCF_MBCS1_BATFUL) != 0) {
+            status.charging = .charge_complete;
+        } else if ((mbcs1 & reg.PCF_MBCS1_PREG) != 0) {
+            status.charging = .pre_charge;
+        } else if ((mbcs1 & reg.PCF_MBCS1_CCCV) != 0) {
+            status.charging = .fast_charge;
+        } else if ((mbcs1 & reg.PCF_MBCS1_CHGEND) != 0) {
+            status.charging = .trickle_charge;
+        }
+    } else |_| {}
+
+    return status;
+}
+
+fn hwPmuGetBatteryVoltage() u16 {
+    if (!pmu_initialized) return 0;
+
+    if (pcfReadAdc(reg.PCF_ADCC2_VBAT)) |adc| {
+        return adcToMillivolts(adc);
+    } else |_| {
+        return 0;
+    }
+}
+
+fn hwPmuGetBatteryPercent() u8 {
+    const voltage = hwPmuGetBatteryVoltage();
+    return voltageToPercent(voltage);
+}
+
+fn hwPmuIsCharging() bool {
+    if (!pmu_initialized) return false;
+
+    if (pcfReadReg(reg.PCF_MBCS1)) |mbcs1| {
+        // Charging if in pre-charge or CC/CV phase
+        return (mbcs1 & (reg.PCF_MBCS1_PREG | reg.PCF_MBCS1_CCCV)) != 0;
+    } else |_| {
+        return false;
+    }
+}
+
+fn hwPmuSetCharging(enable: bool) void {
+    if (!pmu_initialized) return;
+
+    if (pcfReadReg(reg.PCF_MBCC1)) |current| {
+        var new_val = current;
+        if (enable) {
+            new_val |= reg.PCF_MBCC1_CHGENA;
+        } else {
+            new_val &= ~reg.PCF_MBCC1_CHGENA;
+        }
+        pcfWriteReg(reg.PCF_MBCC1, new_val) catch {};
+    } else |_| {}
+}
+
+fn hwPmuExternalPowerPresent() bool {
+    if (!pmu_initialized) return false;
+
+    if (pcfReadReg(reg.PCF_OOCS)) |oocs| {
+        return (oocs & (reg.PCF_OOCS_USB | reg.PCF_OOCS_CHG)) != 0;
+    } else |_| {
+        return false;
+    }
+}
+
+fn hwPmuShutdown() void {
+    if (!pmu_initialized) return;
+
+    // Write to OOCC1 to request power down
+    // This depends on specific PCF50605 configuration
+    pcfWriteReg(reg.PCF_OOCC1, 0x01) catch {};
+
+    // If shutdown doesn't work, at least disable regulators
+    pcfWriteReg(reg.PCF_DCDC1, 0x00) catch {};
+}
+
+fn hwPmuSetCpuVoltage(mv: u16) HalError!void {
+    if (!pmu_initialized) return HalError.DeviceNotReady;
+
+    // DCDC1 controls CPU core voltage
+    // Voltage = 0.9V + (reg_value * 25mV)
+    // reg_value = (mv - 900) / 25
+    if (mv < 900 or mv > 1800) return HalError.InvalidParameter;
+
+    const reg_value: u8 = @truncate((mv - 900) / 25);
+    try pcfWriteReg(reg.PCF_DCDC1, reg_value | 0x80); // 0x80 = enable bit
+}
+
+// ============================================================
 // Cache Functions
 // ============================================================
 
@@ -1683,4 +1885,14 @@ pub const hal = Hal{
     .rtc_set_alarm = hwRtcSetAlarm,
     .rtc_clear_alarm = hwRtcClearAlarm,
     .rtc_alarm_triggered = hwRtcAlarmTriggered,
+
+    .pmu_init = hwPmuInit,
+    .pmu_get_battery_status = hwPmuGetBatteryStatus,
+    .pmu_get_battery_voltage = hwPmuGetBatteryVoltage,
+    .pmu_get_battery_percent = hwPmuGetBatteryPercent,
+    .pmu_is_charging = hwPmuIsCharging,
+    .pmu_set_charging = hwPmuSetCharging,
+    .pmu_external_power_present = hwPmuExternalPowerPresent,
+    .pmu_shutdown = hwPmuShutdown,
+    .pmu_set_cpu_voltage = hwPmuSetCpuVoltage,
 };

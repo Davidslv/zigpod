@@ -21,6 +21,9 @@ const DmaDirection = hal_types.DmaDirection;
 const DmaBurstSize = hal_types.DmaBurstSize;
 const DmaRequest = hal_types.DmaRequest;
 const DmaChannelState = hal_types.DmaChannelState;
+const ChargingState = hal_types.ChargingState;
+const PowerSource = hal_types.PowerSource;
+const BatteryStatus = hal_types.BatteryStatus;
 
 // ============================================================
 // Mock State
@@ -88,6 +91,12 @@ pub const MockState = struct {
     rtc_alarm: u32 = 0,
     rtc_alarm_enabled: bool = false,
     rtc_alarm_triggered: bool = false,
+
+    // PMU state
+    pmu_initialized: bool = false,
+    pmu_battery_mv: u16 = 3800, // Mock: ~70% charge
+    pmu_charging: bool = false,
+    pmu_external_power: bool = false,
 
     // Allocator for dynamic allocations
     allocator: std.mem.Allocator = undefined,
@@ -730,6 +739,64 @@ fn mockRtcAlarmTriggered() bool {
     return state.rtc_alarm_triggered;
 }
 
+// PMU functions
+fn mockPmuInit() HalError!void {
+    const state = getState();
+    state.pmu_initialized = true;
+}
+
+fn mockPmuGetBatteryStatus() BatteryStatus {
+    const state = getState();
+    const percent = mockPmuGetBatteryPercent();
+    return BatteryStatus{
+        .voltage_mv = state.pmu_battery_mv,
+        .percentage = percent,
+        .charging = if (state.pmu_charging) .fast_charge else .not_charging,
+        .power_source = if (state.pmu_external_power) .usb else .battery,
+        .present = true,
+        .temperature_ok = true,
+    };
+}
+
+fn mockPmuGetBatteryVoltage() u16 {
+    const state = getState();
+    return state.pmu_battery_mv;
+}
+
+fn mockPmuGetBatteryPercent() u8 {
+    const state = getState();
+    // Simple linear approximation
+    const full: u16 = 4100;
+    const empty: u16 = 3000;
+    if (state.pmu_battery_mv >= full) return 100;
+    if (state.pmu_battery_mv <= empty) return 0;
+    return @truncate((@as(u32, state.pmu_battery_mv - empty) * 100) / (full - empty));
+}
+
+fn mockPmuIsCharging() bool {
+    const state = getState();
+    return state.pmu_charging;
+}
+
+fn mockPmuSetCharging(enable: bool) void {
+    const state = getState();
+    state.pmu_charging = enable;
+}
+
+fn mockPmuExternalPowerPresent() bool {
+    const state = getState();
+    return state.pmu_external_power;
+}
+
+fn mockPmuShutdown() void {
+    // Mock: no-op
+}
+
+fn mockPmuSetCpuVoltage(mv: u16) HalError!void {
+    if (mv < 900 or mv > 1800) return HalError.InvalidParameter;
+    // Mock: just accept the value
+}
+
 // ============================================================
 // HAL Instance
 // ============================================================
@@ -828,6 +895,16 @@ pub const hal = Hal{
     .rtc_set_alarm = mockRtcSetAlarm,
     .rtc_clear_alarm = mockRtcClearAlarm,
     .rtc_alarm_triggered = mockRtcAlarmTriggered,
+
+    .pmu_init = mockPmuInit,
+    .pmu_get_battery_status = mockPmuGetBatteryStatus,
+    .pmu_get_battery_voltage = mockPmuGetBatteryVoltage,
+    .pmu_get_battery_percent = mockPmuGetBatteryPercent,
+    .pmu_is_charging = mockPmuIsCharging,
+    .pmu_set_charging = mockPmuSetCharging,
+    .pmu_external_power_present = mockPmuExternalPowerPresent,
+    .pmu_shutdown = mockPmuShutdown,
+    .pmu_set_cpu_voltage = mockPmuSetCpuVoltage,
 };
 
 // ============================================================

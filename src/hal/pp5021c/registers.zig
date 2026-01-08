@@ -766,6 +766,157 @@ pub const RTC_CTRL_TICK_EN: u32 = 0x08000000;     // Enable 1Hz tick interrupt
 pub const RTC_UNIX_EPOCH: u32 = 0;
 
 // ============================================================
+// PCF50605 Power Management Unit (PMU)
+// ============================================================
+//
+// The PCF50605 is an I2C-based PMU that handles:
+// - Battery charging and monitoring
+// - Multiple voltage regulators (LDOs, DC-DCs)
+// - Power sequencing
+// - GPIO expander
+// - ADC for battery/temperature monitoring
+//
+// I2C Address: 0x08 (7-bit)
+// Based on Rockbox firmware/drivers/pcf50605.c
+
+pub const PCF50605_I2C_ADDR: u7 = 0x08;
+
+// PCF50605 Register Addresses
+pub const PCF_ID: u8 = 0x00;           // Chip ID
+pub const PCF_OOCS: u8 = 0x01;         // On/Off Control Status
+pub const PCF_INT1: u8 = 0x02;         // Interrupt Status 1
+pub const PCF_INT2: u8 = 0x03;         // Interrupt Status 2
+pub const PCF_INT3: u8 = 0x04;         // Interrupt Status 3
+pub const PCF_INT1M: u8 = 0x05;        // Interrupt Mask 1
+pub const PCF_INT2M: u8 = 0x06;        // Interrupt Mask 2
+pub const PCF_INT3M: u8 = 0x07;        // Interrupt Mask 3
+pub const PCF_OOCC1: u8 = 0x08;        // On/Off Control Config 1
+pub const PCF_OOCC2: u8 = 0x09;        // On/Off Control Config 2
+pub const PCF_RTCSC: u8 = 0x0A;        // RTC Seconds
+pub const PCF_RTCMN: u8 = 0x0B;        // RTC Minutes
+pub const PCF_RTCHR: u8 = 0x0C;        // RTC Hours
+pub const PCF_RTCWD: u8 = 0x0D;        // RTC Weekday
+pub const PCF_RTCDT: u8 = 0x0E;        // RTC Day
+pub const PCF_RTCMT: u8 = 0x0F;        // RTC Month
+pub const PCF_RTCYR: u8 = 0x10;        // RTC Year
+pub const PCF_RTCSCA: u8 = 0x11;       // RTC Alarm Seconds
+pub const PCF_RTCMNA: u8 = 0x12;       // RTC Alarm Minutes
+pub const PCF_RTCHRA: u8 = 0x13;       // RTC Alarm Hours
+pub const PCF_RTCWDA: u8 = 0x14;       // RTC Alarm Weekday
+pub const PCF_RTCDTA: u8 = 0x15;       // RTC Alarm Day
+pub const PCF_RTCMTA: u8 = 0x16;       // RTC Alarm Month
+pub const PCF_RTCYRA: u8 = 0x17;       // RTC Alarm Year
+pub const PCF_PSSC: u8 = 0x18;         // Power Sequencer Control
+pub const PCF_PWROKM: u8 = 0x19;       // PWROK Mask
+pub const PCF_PWROKS: u8 = 0x1A;       // PWROK Status
+
+// Voltage Regulators
+pub const PCF_DCDC1: u8 = 0x1B;        // DC-DC1 Control (core voltage)
+pub const PCF_DCDC2: u8 = 0x1C;        // DC-DC2 Control
+pub const PCF_DCDC3: u8 = 0x1D;        // DC-DC3 Control
+pub const PCF_DCDC4: u8 = 0x1E;        // DC-DC4 Control
+pub const PCF_DCDEC1: u8 = 0x1F;       // DC-DC Extended Control 1
+pub const PCF_DCDEC2: u8 = 0x20;       // DC-DC Extended Control 2
+pub const PCF_DCUDC1: u8 = 0x21;       // DC-DC User Defined Control 1
+pub const PCF_DCUDC2: u8 = 0x22;       // DC-DC User Defined Control 2
+pub const PCF_IOREGC: u8 = 0x23;       // I/O Regulator Control
+pub const PCF_D1REGC1: u8 = 0x24;      // D1 Regulator Control 1
+pub const PCF_D2REGC1: u8 = 0x25;      // D2 Regulator Control 1
+pub const PCF_D3REGC1: u8 = 0x26;      // D3 Regulator Control 1
+pub const PCF_LPREGC1: u8 = 0x27;      // LP Regulator Control 1
+pub const PCF_LPREGC2: u8 = 0x28;      // LP Regulator Control 2
+
+// GPIO Control
+pub const PCF_GPIOCTL: u8 = 0x29;      // GPIO Control
+pub const PCF_GPIO1C1: u8 = 0x2A;      // GPIO1 Config 1
+pub const PCF_GPIO1C2: u8 = 0x2B;      // GPIO1 Config 2
+pub const PCF_GPIO2C1: u8 = 0x2C;      // GPIO2 Config 1
+pub const PCF_GPIOS: u8 = 0x2D;        // GPIO Status
+
+// Charger Control
+pub const PCF_MBCC1: u8 = 0x2E;        // Main Battery Charger Control 1
+pub const PCF_MBCC2: u8 = 0x2F;        // Main Battery Charger Control 2
+pub const PCF_MBCC3: u8 = 0x30;        // Main Battery Charger Control 3
+pub const PCF_MBCS1: u8 = 0x31;        // Main Battery Charger Status 1
+pub const PCF_MBCS2: u8 = 0x32;        // Main Battery Charger Status 2
+pub const PCF_MBCS3: u8 = 0x33;        // Main Battery Charger Status 3
+
+// ADC Control
+pub const PCF_ADCC1: u8 = 0x34;        // ADC Control 1
+pub const PCF_ADCC2: u8 = 0x35;        // ADC Control 2
+pub const PCF_ADCS1: u8 = 0x36;        // ADC Status 1 (high byte)
+pub const PCF_ADCS2: u8 = 0x37;        // ADC Status 2 (low byte)
+pub const PCF_ADCS3: u8 = 0x38;        // ADC Status 3
+
+// Backup Battery
+pub const PCF_BBCC: u8 = 0x39;         // Backup Battery Charger Control
+
+// OOCS (On/Off Control Status) bits
+pub const PCF_OOCS_ONKEY: u8 = 0x01;   // On key pressed
+pub const PCF_OOCS_USB: u8 = 0x04;     // USB connected
+pub const PCF_OOCS_CHG: u8 = 0x08;     // Charger connected
+pub const PCF_OOCS_BATOK: u8 = 0x10;   // Battery OK
+pub const PCF_OOCS_RECKEY: u8 = 0x20;  // Recording key
+
+// INT1 (Interrupt 1) bits
+pub const PCF_INT1_ONKEY: u8 = 0x01;   // On key change
+pub const PCF_INT1_EXTONR: u8 = 0x02;  // External power on rising
+pub const PCF_INT1_EXTONF: u8 = 0x04;  // External power on falling
+pub const PCF_INT1_EXTON2R: u8 = 0x08; // External power 2 on rising
+pub const PCF_INT1_EXTON2F: u8 = 0x10; // External power 2 on falling
+pub const PCF_INT1_ALARM: u8 = 0x40;   // RTC alarm
+pub const PCF_INT1_SECOND: u8 = 0x80;  // RTC second tick
+
+// INT2 (Interrupt 2) bits
+pub const PCF_INT2_CHGWD: u8 = 0x01;   // Charger watchdog
+pub const PCF_INT2_CHGEVT: u8 = 0x02;  // Charger event
+pub const PCF_INT2_VMAX: u8 = 0x04;    // Voltage max reached
+pub const PCF_INT2_CHGERR: u8 = 0x08;  // Charger error
+pub const PCF_INT2_CHGRES: u8 = 0x10;  // Charger resume
+pub const PCF_INT2_THLIMON: u8 = 0x20; // Thermal limit on
+pub const PCF_INT2_THLIMOFF: u8 = 0x40;// Thermal limit off
+pub const PCF_INT2_BATFUL: u8 = 0x80;  // Battery full
+
+// MBCC1 (Main Battery Charger Control 1) bits
+pub const PCF_MBCC1_CHGENA: u8 = 0x01; // Charger enable
+pub const PCF_MBCC1_AUTOFST: u8 = 0x02;// Auto fast charge
+pub const PCF_MBCC1_AUTORES: u8 = 0x04;// Auto resume
+
+// MBCS1 (Main Battery Charger Status 1) bits
+pub const PCF_MBCS1_PREG: u8 = 0x01;   // Pre-charge phase
+pub const PCF_MBCS1_CCCV: u8 = 0x02;   // CC/CV phase
+pub const PCF_MBCS1_VBAT: u8 = 0x04;   // VBAT comparator
+pub const PCF_MBCS1_BAT: u8 = 0x08;    // Battery present
+pub const PCF_MBCS1_USB: u8 = 0x10;    // USB power present
+pub const PCF_MBCS1_ADP: u8 = 0x20;    // Adapter power present
+pub const PCF_MBCS1_CHGEND: u8 = 0x40; // Charge end
+pub const PCF_MBCS1_BATFUL: u8 = 0x80; // Battery full
+
+// ADCC1 (ADC Control 1) bits
+pub const PCF_ADCC1_ADCSTART: u8 = 0x01;// Start conversion
+pub const PCF_ADCC1_RES_10BIT: u8 = 0x02;// 10-bit resolution
+pub const PCF_ADCC1_AVERAGE: u8 = 0x04; // Average 4 samples
+
+// ADC Channel selection (in ADCC2)
+pub const PCF_ADCC2_VBAT: u8 = 0x00;   // Battery voltage
+pub const PCF_ADCC2_VBATREF: u8 = 0x01;// Battery reference
+pub const PCF_ADCC2_ADCIN1: u8 = 0x02; // ADC input 1
+pub const PCF_ADCC2_ADCIN2: u8 = 0x03; // ADC input 2
+pub const PCF_ADCC2_BATTEMP: u8 = 0x04;// Battery temperature
+pub const PCF_ADCC2_SUBTR: u8 = 0x08;  // Subtract mode
+
+// Battery voltage thresholds (in mV)
+pub const PCF_BATTERY_FULL_MV: u16 = 4100;
+pub const PCF_BATTERY_LOW_MV: u16 = 3400;
+pub const PCF_BATTERY_CRITICAL_MV: u16 = 3200;
+pub const PCF_BATTERY_EMPTY_MV: u16 = 3000;
+
+// ADC conversion factor: 10-bit ADC, VBAT = ADC * 6 / 1024 * 1000 mV
+// Simplified: mV = ADC * 5860 / 1000 (approximately)
+pub const PCF_ADC_TO_MV_NUM: u32 = 5860;
+pub const PCF_ADC_TO_MV_DEN: u32 = 1000;
+
+// ============================================================
 // Cache Controller
 // ============================================================
 
