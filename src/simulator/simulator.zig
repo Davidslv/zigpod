@@ -52,6 +52,13 @@ pub const profiler_mod = struct {
     pub const profiler = @import("profiler/profiler.zig");
 };
 
+// Export GUI modules (NullBackend always available, SDL2 optional)
+pub const gui_mod = struct {
+    pub const gui = @import("gui/gui.zig");
+    // SDL2 backend is only compiled when SDL2 is available
+    // Use: zig build -Dgui=sdl2
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -855,4 +862,6 @@ test {
     std.testing.refAllDecls(audio);
     // Reference profiler modules to include their tests
     std.testing.refAllDecls(profiler_mod);
+    // Reference GUI modules to include their tests
+    std.testing.refAllDecls(gui_mod);
 }
