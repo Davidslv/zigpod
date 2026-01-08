@@ -62,6 +62,9 @@ pub const clickwheel = @import("drivers/input/clickwheel.zig");
 /// Power management driver
 pub const power = @import("drivers/power.zig");
 
+/// USB driver
+pub const usb = @import("drivers/usb.zig");
+
 // ============================================================
 // Filesystem
 // ============================================================

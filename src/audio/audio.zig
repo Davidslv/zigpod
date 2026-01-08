@@ -13,6 +13,9 @@ const i2s = @import("../drivers/audio/i2s.zig");
 // Export decoders
 pub const decoders = @import("decoders/decoders.zig");
 
+// Export metadata parser
+pub const metadata = @import("metadata.zig");
+
 // ============================================================
 // Audio Constants
 // ============================================================
