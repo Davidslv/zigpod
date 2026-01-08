@@ -123,34 +123,21 @@ pub const FileBrowser = struct {
             self.entry_count = 1;
         }
 
-        // Read directory using FAT32
-        const path = self.getPath();
-        const dir = fat32.openDir(path) catch {
-            self.error_message = "Cannot open directory";
-            self.is_loading = false;
-            return;
-        };
+        // TODO: Implement actual FAT32 directory reading
+        // For now, add placeholder entries for testing
+        if (self.path_len == 1) { // Root directory
+            var music_entry = FileEntry{};
+            music_entry.setName("MUSIC");
+            music_entry.is_directory = true;
+            self.entries[self.entry_count] = music_entry;
+            self.entry_count += 1;
 
-        // Read entries
-        while (self.entry_count < self.entries.len) {
-            if (fat32.readDirEntry(dir)) |de| {
-                var entry = FileEntry{};
-                entry.setName(de.name);
-                entry.is_directory = de.is_directory;
-                entry.size = de.size;
-
-                if (!entry.is_directory) {
-                    entry.checkAudioExtension();
-                }
-
-                self.entries[self.entry_count] = entry;
-                self.entry_count += 1;
-            } else {
-                break;
-            }
+            var podcasts_entry = FileEntry{};
+            podcasts_entry.setName("PODCASTS");
+            podcasts_entry.is_directory = true;
+            self.entries[self.entry_count] = podcasts_entry;
+            self.entry_count += 1;
         }
-
-        fat32.closeDir(dir);
 
         // Sort entries: directories first, then files alphabetically
         self.sortEntries();

@@ -41,13 +41,16 @@ pub const Settings = struct {
     // Apply audio settings to codec
     pub fn applyAudioSettings(self: *const Settings) void {
         audio.setVolumeMono(self.volume) catch {};
-        codec.setBass(self.bass, self.bass_cutoff) catch {};
-        codec.setTreble(self.treble, self.treble_cutoff) catch {};
+        codec.setBass(self.bass) catch {};
+        codec.setTreble(self.treble) catch {};
+        _ = self.bass_cutoff; // TODO: Implement cutoff frequency setting
+        _ = self.treble_cutoff;
     }
 
     // Apply display settings
     pub fn applyDisplaySettings(self: *const Settings) void {
-        lcd.setBrightness(self.brightness);
+        // TODO: Implement LCD brightness control when hardware supports it
+        _ = self.brightness;
         switch (self.theme) {
             .light => ui.setTheme(ui.default_theme),
             .dark => ui.setTheme(ui.dark_theme),

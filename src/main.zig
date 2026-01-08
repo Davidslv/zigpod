@@ -11,7 +11,8 @@ const ui = @import("ui/ui.zig");
 const lcd = @import("drivers/display/lcd.zig");
 const clickwheel = @import("drivers/input/clickwheel.zig");
 const storage = @import("drivers/storage/ata.zig");
-const fat32 = @import("drivers/storage/fat32.zig");
+const power = @import("drivers/power.zig");
+const app = @import("app/app.zig");
 
 // ============================================================
 // System State
@@ -59,8 +60,25 @@ pub fn main() void {
         return;
     };
 
+    // Initialize power management
+    power.init() catch |err| {
+        handleFatalError("Power init failed", err);
+        return;
+    };
+
+    // Initialize application controller
+    app.init();
+
     // Show boot screen
     showBootScreen();
+
+    // Check battery level before continuing
+    const battery = power.getBatteryInfo();
+    if (battery.is_critical) {
+        showLowBatteryWarning();
+        shutdown();
+        return;
+    }
 
     // Enter main loop
     system_state = .running;
@@ -104,23 +122,35 @@ fn initDrivers() !void {
 }
 
 fn showBootScreen() void {
-    lcd.clear(lcd.Colors.BLACK);
+    const theme = ui.getTheme();
+    lcd.clear(theme.background);
 
     // Draw ZigPod logo (centered text)
-    const title = "ZigPod OS";
-    const subtitle = "v0.1.0";
+    lcd.drawStringCentered(80, "ZigPod OS", theme.foreground, null);
+    lcd.drawStringCentered(100, "v0.1.0 \"Genesis\"", theme.disabled, null);
 
-    // Center the title
-    const title_x = (lcd.WIDTH - @as(u16, @intCast(title.len * 8))) / 2;
-    const subtitle_x = (lcd.WIDTH - @as(u16, @intCast(subtitle.len * 8))) / 2;
-
-    lcd.drawString(title_x, 100, title, lcd.Colors.WHITE, lcd.Colors.BLACK);
-    lcd.drawString(subtitle_x, 120, subtitle, lcd.Colors.GRAY, lcd.Colors.BLACK);
-
+    // Draw loading bar
+    lcd.drawProgressBar(60, 140, 200, 12, 0, theme.accent, theme.disabled);
     lcd.update() catch {};
 
-    // Brief delay for splash screen
-    kernel.timer.delayMs(1000);
+    // Simulate loading with progress
+    var progress: u8 = 0;
+    while (progress < 100) : (progress += 5) {
+        lcd.drawProgressBar(60, 140, 200, 12, progress, theme.accent, theme.disabled);
+        lcd.update() catch {};
+        kernel.timer.delayMs(30);
+    }
+
+    // Brief pause on complete
+    kernel.timer.delayMs(200);
+}
+
+fn showLowBatteryWarning() void {
+    lcd.clear(lcd.Colors.RED);
+    lcd.drawStringCentered(100, "LOW BATTERY", lcd.Colors.WHITE, lcd.Colors.RED);
+    lcd.drawStringCentered(120, "Please charge", lcd.Colors.WHITE, lcd.Colors.RED);
+    lcd.update() catch {};
+    kernel.timer.delayMs(3000);
 }
 
 // ============================================================
@@ -128,38 +158,25 @@ fn showBootScreen() void {
 // ============================================================
 
 fn mainLoop() void {
-    const ui_state = ui.getState();
+    while (system_state == .running) {
+        // Update application
+        app.update();
 
-    while (true) {
-        // Poll input
-        const event = clickwheel.poll() catch {
-            kernel.timer.delayMs(10);
-            continue;
-        };
-
-        // Handle button presses
-        if (event.anyButtonPressed()) {
-            if (event.buttonPressed(clickwheel.Button.PLAY)) {
-                audio.togglePause();
-            }
-            // Pass input to current menu if active
-            if (ui_state.current_menu) |menu| {
-                _ = ui.handleMenuInput(menu, event);
-            }
+        // Check for shutdown request
+        if (shouldShutdown()) {
+            break;
         }
-
-        // Process audio
-        audio.process() catch {};
-
-        // Draw UI (basic refresh)
-        if (ui_state.current_menu) |menu| {
-            ui.drawMenu(menu);
-        }
-        lcd.update() catch {};
 
         // Yield to other tasks
-        kernel.timer.delayMs(10);
+        kernel.timer.delayMs(16); // ~60 FPS
     }
+}
+
+fn shouldShutdown() bool {
+    // Check for hold switch + menu for shutdown
+    // Or critical battery
+    const battery = power.getBatteryInfo();
+    return battery.is_critical;
 }
 
 // ============================================================
@@ -170,6 +187,9 @@ fn shutdown() void {
     // Stop audio
     audio.shutdown();
 
+    // Save settings
+    // TODO: Persist settings to storage
+
     // Turn off backlight
     lcd.setBacklight(false);
 
@@ -179,6 +199,9 @@ fn shutdown() void {
 
     // Disable interrupts
     kernel.interrupts.disableGlobal();
+
+    // Power off
+    power.setState(.off) catch {};
 }
 
 // ============================================================
@@ -200,10 +223,19 @@ fn handleFatalError(message: []const u8, err: anyerror) void {
     const error_name = @errorName(err);
     lcd.drawString(10, 50, error_name, lcd.Colors.YELLOW, lcd.Colors.RED);
 
+    lcd.drawString(10, 80, "Press any button to reboot", lcd.Colors.WHITE, lcd.Colors.RED);
+
     lcd.update() catch {};
 
-    // Halt
+    // Wait for button press
     while (true) {
+        if (clickwheel.poll()) |event| {
+            if (event.anyButtonPressed()) {
+                // Reboot (would require watchdog or reset vector)
+                break;
+            }
+        } else |_| {}
+
         hal.current_hal.sleep();
     }
 }

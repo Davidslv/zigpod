@@ -148,6 +148,66 @@ pub const WakeupSource = enum {
 };
 
 // ============================================================
+// ADC Functions
+// ============================================================
+
+/// ADC channels
+pub const AdcChannel = enum(u8) {
+    battery = 0,
+    temperature = 1,
+    charger_current = 2,
+};
+
+/// ADC register (PCF50605)
+const ADC_REG: u8 = 0x30;
+const ADC_RESULT_H: u8 = 0x31;
+const ADC_RESULT_L: u8 = 0x32;
+
+/// Read ADC value from specified channel
+pub fn readAdc(channel: AdcChannel) hal.HalError!u16 {
+    if (!initialized) return hal.HalError.DeviceNotReady;
+
+    // Select channel and start conversion
+    try device.writeReg8(ADC_REG, @intFromEnum(channel) | 0x80);
+
+    // Wait for conversion (typically 50-100us)
+    hal.delayMs(1);
+
+    // Read result (10-bit)
+    const high = try device.readReg8(ADC_RESULT_H);
+    const low = try device.readReg8(ADC_RESULT_L);
+
+    return (@as(u16, high) << 2) | (@as(u16, low) >> 6);
+}
+
+/// Read PMU status
+pub fn readStatus() hal.HalError!PmuStatus {
+    if (!initialized) return hal.HalError.DeviceNotReady;
+
+    const int1 = try device.readReg8(Reg.INT1);
+
+    return PmuStatus{
+        .charging = (int1 & 0x04) != 0,
+        .charge_complete = (int1 & 0x08) != 0,
+        .usb_connected = (int1 & 0x10) != 0,
+    };
+}
+
+pub const PmuStatus = struct {
+    charging: bool = false,
+    charge_complete: bool = false,
+    usb_connected: bool = false,
+};
+
+/// Power off the device
+pub fn powerOff() hal.HalError!void {
+    if (!initialized) return hal.HalError.DeviceNotReady;
+
+    // Enter standby mode - this will power off the device
+    try standby();
+}
+
+// ============================================================
 // Tests
 // ============================================================
 

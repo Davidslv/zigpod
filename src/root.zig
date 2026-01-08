@@ -59,6 +59,9 @@ pub const lcd = @import("drivers/display/lcd.zig");
 /// Click wheel input driver
 pub const clickwheel = @import("drivers/input/clickwheel.zig");
 
+/// Power management driver
+pub const power = @import("drivers/power.zig");
+
 // ============================================================
 // Filesystem
 // ============================================================
@@ -79,6 +82,13 @@ pub const audio = @import("audio/audio.zig");
 
 /// UI framework
 pub const ui = @import("ui/ui.zig");
+
+// ============================================================
+// Application
+// ============================================================
+
+/// Application controller
+pub const app = @import("app/app.zig");
 
 // ============================================================
 // Utility Library
