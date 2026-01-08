@@ -17,6 +17,10 @@ const UsbEndpointType = hal_types.UsbEndpointType;
 const UsbDirection = hal_types.UsbDirection;
 const UsbDeviceState = hal_types.UsbDeviceState;
 const UsbSetupPacket = hal_types.UsbSetupPacket;
+const DmaDirection = hal_types.DmaDirection;
+const DmaBurstSize = hal_types.DmaBurstSize;
+const DmaRequest = hal_types.DmaRequest;
+const DmaChannelState = hal_types.DmaChannelState;
 
 // ============================================================
 // Mock State
@@ -68,6 +72,22 @@ pub const MockState = struct {
     usb_address: u7 = 0,
     usb_pending_setup: ?UsbSetupPacket = null,
     usb_ep_data: [3]std.ArrayList(u8) = undefined,
+
+    // DMA state
+    dma_initialized: bool = false,
+    dma_channel_state: [4]DmaChannelState = [_]DmaChannelState{.idle} ** 4,
+
+    // Watchdog state
+    wdt_initialized: bool = false,
+    wdt_enabled: bool = false,
+    wdt_timeout_ms: u32 = 0,
+
+    // RTC state
+    rtc_initialized: bool = false,
+    rtc_time: u32 = 0,
+    rtc_alarm: u32 = 0,
+    rtc_alarm_enabled: bool = false,
+    rtc_alarm_triggered: bool = false,
 
     // Allocator for dynamic allocations
     allocator: std.mem.Allocator = undefined,
@@ -605,6 +625,111 @@ fn mockUsbSendZlp(ep: u8) HalError!void {
     // Mock: no-op
 }
 
+// DMA functions
+fn mockDmaInit() HalError!void {
+    const state = getState();
+    state.dma_initialized = true;
+    for (&state.dma_channel_state) |*ch| {
+        ch.* = .idle;
+    }
+}
+
+fn mockDmaStart(channel: u2, ram_addr: usize, periph_addr: usize, length: u16, direction: DmaDirection, request: DmaRequest, burst: DmaBurstSize) HalError!void {
+    _ = ram_addr;
+    _ = periph_addr;
+    _ = length;
+    _ = direction;
+    _ = request;
+    _ = burst;
+    const state = getState();
+    if (!state.dma_initialized) return HalError.DeviceNotReady;
+    // Mock: immediately complete the transfer
+    state.dma_channel_state[channel] = .done;
+}
+
+fn mockDmaWait(channel: u2) HalError!void {
+    const state = getState();
+    if (!state.dma_initialized) return HalError.DeviceNotReady;
+    // Mock: already complete
+    _ = channel;
+}
+
+fn mockDmaIsBusy(channel: u2) bool {
+    const state = getState();
+    return state.dma_channel_state[channel] == .running;
+}
+
+fn mockDmaGetState(channel: u2) DmaChannelState {
+    const state = getState();
+    return state.dma_channel_state[channel];
+}
+
+fn mockDmaAbort(channel: u2) void {
+    const state = getState();
+    state.dma_channel_state[channel] = .idle;
+}
+
+// Watchdog functions
+fn mockWdtInit(timeout_ms: u32) HalError!void {
+    const state = getState();
+    state.wdt_initialized = true;
+    state.wdt_timeout_ms = timeout_ms;
+    state.wdt_enabled = false;
+}
+
+fn mockWdtStart() void {
+    const state = getState();
+    state.wdt_enabled = true;
+}
+
+fn mockWdtStop() void {
+    const state = getState();
+    state.wdt_enabled = false;
+}
+
+fn mockWdtRefresh() void {
+    // Mock: no-op (just pretend we refreshed)
+}
+
+fn mockWdtCausedReset() bool {
+    return false; // Mock: never caused reset
+}
+
+// RTC functions
+fn mockRtcInit() HalError!void {
+    const state = getState();
+    state.rtc_initialized = true;
+    // Set to current Unix time
+    state.rtc_time = @truncate(@as(u64, @intCast(@divFloor(std.time.timestamp(), 1))));
+}
+
+fn mockRtcGetTime() u32 {
+    const state = getState();
+    return state.rtc_time;
+}
+
+fn mockRtcSetTime(seconds: u32) void {
+    const state = getState();
+    state.rtc_time = seconds;
+}
+
+fn mockRtcSetAlarm(seconds: u32) void {
+    const state = getState();
+    state.rtc_alarm = seconds;
+    state.rtc_alarm_enabled = true;
+}
+
+fn mockRtcClearAlarm() void {
+    const state = getState();
+    state.rtc_alarm_enabled = false;
+    state.rtc_alarm_triggered = false;
+}
+
+fn mockRtcAlarmTriggered() bool {
+    const state = getState();
+    return state.rtc_alarm_triggered;
+}
+
 // ============================================================
 // HAL Instance
 // ============================================================
@@ -683,6 +808,26 @@ pub const hal = Hal{
     .usb_clear_interrupts = mockUsbClearInterrupts,
     .usb_read_setup = mockUsbReadSetup,
     .usb_send_zlp = mockUsbSendZlp,
+
+    .dma_init = mockDmaInit,
+    .dma_start = mockDmaStart,
+    .dma_wait = mockDmaWait,
+    .dma_is_busy = mockDmaIsBusy,
+    .dma_get_state = mockDmaGetState,
+    .dma_abort = mockDmaAbort,
+
+    .wdt_init = mockWdtInit,
+    .wdt_start = mockWdtStart,
+    .wdt_stop = mockWdtStop,
+    .wdt_refresh = mockWdtRefresh,
+    .wdt_caused_reset = mockWdtCausedReset,
+
+    .rtc_init = mockRtcInit,
+    .rtc_get_time = mockRtcGetTime,
+    .rtc_set_time = mockRtcSetTime,
+    .rtc_set_alarm = mockRtcSetAlarm,
+    .rtc_clear_alarm = mockRtcClearAlarm,
+    .rtc_alarm_triggered = mockRtcAlarmTriggered,
 };
 
 // ============================================================

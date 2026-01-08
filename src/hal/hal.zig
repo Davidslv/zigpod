@@ -136,6 +136,35 @@ pub const UsbSetupPacket = struct {
     }
 };
 
+/// DMA transfer direction
+pub const DmaDirection = enum {
+    peripheral_to_ram,
+    ram_to_peripheral,
+};
+
+/// DMA burst size
+pub const DmaBurstSize = enum {
+    burst_1,
+    burst_4,
+    burst_8,
+    burst_16,
+};
+
+/// DMA peripheral request ID
+pub const DmaRequest = enum(u8) {
+    i2s = 2,
+    ide = 7,
+    sdhc = 13,
+};
+
+/// DMA channel state
+pub const DmaChannelState = enum {
+    idle,
+    running,
+    done,
+    @"error",
+};
+
 // ============================================================
 // HAL Interface Structure
 // ============================================================
@@ -373,6 +402,69 @@ pub const Hal = struct {
 
     /// Send ZLP (zero-length packet) on endpoint
     usb_send_zlp: *const fn (ep: u8) HalError!void,
+
+    // --------------------------------------------------------
+    // DMA Operations
+    // --------------------------------------------------------
+
+    /// Initialize DMA controller
+    dma_init: *const fn () HalError!void,
+
+    /// Start a DMA transfer
+    dma_start: *const fn (channel: u2, ram_addr: usize, periph_addr: usize, length: u16, direction: DmaDirection, request: DmaRequest, burst: DmaBurstSize) HalError!void,
+
+    /// Wait for DMA transfer to complete
+    dma_wait: *const fn (channel: u2) HalError!void,
+
+    /// Check if DMA channel is busy
+    dma_is_busy: *const fn (channel: u2) bool,
+
+    /// Get DMA channel state
+    dma_get_state: *const fn (channel: u2) DmaChannelState,
+
+    /// Abort a DMA transfer
+    dma_abort: *const fn (channel: u2) void,
+
+    // --------------------------------------------------------
+    // Watchdog Timer Operations
+    // --------------------------------------------------------
+
+    /// Initialize watchdog timer
+    wdt_init: *const fn (timeout_ms: u32) HalError!void,
+
+    /// Start watchdog timer
+    wdt_start: *const fn () void,
+
+    /// Stop watchdog timer
+    wdt_stop: *const fn () void,
+
+    /// Refresh watchdog (prevent reset)
+    wdt_refresh: *const fn () void,
+
+    /// Check if last reset was from watchdog
+    wdt_caused_reset: *const fn () bool,
+
+    // --------------------------------------------------------
+    // RTC Operations
+    // --------------------------------------------------------
+
+    /// Initialize RTC
+    rtc_init: *const fn () HalError!void,
+
+    /// Get current time (seconds since Unix epoch)
+    rtc_get_time: *const fn () u32,
+
+    /// Set current time (seconds since Unix epoch)
+    rtc_set_time: *const fn (seconds: u32) void,
+
+    /// Set alarm time (seconds since Unix epoch)
+    rtc_set_alarm: *const fn (seconds: u32) void,
+
+    /// Clear alarm
+    rtc_clear_alarm: *const fn () void,
+
+    /// Check if alarm has triggered
+    rtc_alarm_triggered: *const fn () bool,
 };
 
 // ============================================================

@@ -20,6 +20,10 @@ const UsbEndpointType = hal_types.UsbEndpointType;
 const UsbDirection = hal_types.UsbDirection;
 const UsbDeviceState = hal_types.UsbDeviceState;
 const UsbSetupPacket = hal_types.UsbSetupPacket;
+const DmaDirection = hal_types.DmaDirection;
+const DmaBurstSize = hal_types.DmaBurstSize;
+const DmaRequest = hal_types.DmaRequest;
+const DmaChannelState = hal_types.DmaChannelState;
 
 // ============================================================
 // Internal State
@@ -33,6 +37,11 @@ var lcd_initialized: bool = false;
 var usb_initialized: bool = false;
 var usb_device_state: UsbDeviceState = .disconnected;
 var usb_device_address: u7 = 0;
+var dma_initialized: bool = false;
+var wdt_initialized: bool = false;
+var wdt_timeout_ms: u32 = 0;
+var wdt_caused_last_reset: bool = false;
+var rtc_initialized: bool = false;
 
 // ============================================================
 // System Functions
@@ -1324,6 +1333,198 @@ fn hwUsbSendZlp(ep: u8) HalError!void {
 }
 
 // ============================================================
+// DMA Functions
+// ============================================================
+
+fn hwDmaInit() HalError!void {
+    // Reset DMA controller
+    reg.writeReg(u32, reg.DMA_MASTER_CTRL, reg.DMA_MASTER_RESET);
+    hwDelayUs(10);
+
+    // Enable DMA controller
+    reg.writeReg(u32, reg.DMA_MASTER_CTRL, reg.DMA_MASTER_EN);
+    hwDelayUs(10);
+
+    dma_initialized = true;
+}
+
+fn hwDmaStart(channel: u2, ram_addr: usize, periph_addr: usize, length: u16, direction: DmaDirection, request: DmaRequest, burst: DmaBurstSize) HalError!void {
+    if (!dma_initialized) return HalError.DeviceNotReady;
+
+    const chan_base = reg.dmaChannelBase(channel);
+
+    // Set RAM address
+    reg.writeReg(u32, chan_base + reg.DMA_RAM_ADDR_OFF, @truncate(ram_addr));
+
+    // Set peripheral address
+    reg.writeReg(u32, chan_base + reg.DMA_PER_ADDR_OFF, @truncate(periph_addr));
+
+    // Set increment mode (typically increment RAM, not peripheral for FIFO)
+    reg.writeReg(u32, chan_base + reg.DMA_INCR_OFF, reg.DMA_INCR_RAM);
+
+    // Build flags: length + request ID + burst size
+    const burst_val: u32 = switch (burst) {
+        .burst_1 => reg.DMA_BURST_1,
+        .burst_4 => reg.DMA_BURST_4,
+        .burst_8 => reg.DMA_BURST_8,
+        .burst_16 => reg.DMA_BURST_16,
+    };
+    const flags: u32 = @as(u32, length) |
+        (@as(u32, @intFromEnum(request)) << reg.DMA_FLAGS_REQ_SHIFT) |
+        (burst_val << reg.DMA_FLAGS_BURST_SHIFT);
+    reg.writeReg(u32, chan_base + reg.DMA_FLAGS_OFF, flags);
+
+    // Build command: direction + start + interrupt on complete
+    var cmd: u32 = reg.DMA_CMD_START | reg.DMA_CMD_INTR | reg.DMA_CMD_WAIT_REQ;
+    if (direction == .ram_to_peripheral) {
+        cmd |= reg.DMA_CMD_RAM_TO_PER;
+    }
+    reg.writeReg(u32, chan_base + reg.DMA_CMD_OFF, cmd);
+}
+
+fn hwDmaWait(channel: u2) HalError!void {
+    if (!dma_initialized) return HalError.DeviceNotReady;
+
+    const chan_base = reg.dmaChannelBase(channel);
+    const start = hwGetTicksUs();
+
+    while (true) {
+        const status = reg.readReg(u32, chan_base + reg.DMA_STATUS_OFF);
+        if ((status & reg.DMA_STATUS_BUSY) == 0) {
+            if ((status & reg.DMA_STATUS_ERROR) != 0) {
+                return HalError.TransferError;
+            }
+            return;
+        }
+        if (hwGetTicksUs() - start > reg.DMA_TIMEOUT_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+fn hwDmaIsBusy(channel: u2) bool {
+    if (!dma_initialized) return false;
+
+    const chan_base = reg.dmaChannelBase(channel);
+    const status = reg.readReg(u32, chan_base + reg.DMA_STATUS_OFF);
+    return (status & reg.DMA_STATUS_BUSY) != 0;
+}
+
+fn hwDmaGetState(channel: u2) DmaChannelState {
+    if (!dma_initialized) return .idle;
+
+    const chan_base = reg.dmaChannelBase(channel);
+    const status = reg.readReg(u32, chan_base + reg.DMA_STATUS_OFF);
+
+    if ((status & reg.DMA_STATUS_ERROR) != 0) {
+        return .@"error";
+    } else if ((status & reg.DMA_STATUS_DONE) != 0) {
+        return .done;
+    } else if ((status & reg.DMA_STATUS_BUSY) != 0) {
+        return .running;
+    } else {
+        return .idle;
+    }
+}
+
+fn hwDmaAbort(channel: u2) void {
+    if (!dma_initialized) return;
+
+    const chan_base = reg.dmaChannelBase(channel);
+
+    // Write abort bit to status to stop transfer
+    reg.writeReg(u32, chan_base + reg.DMA_STATUS_OFF, reg.DMA_STATUS_ABORT);
+
+    // Clear command register
+    reg.writeReg(u32, chan_base + reg.DMA_CMD_OFF, 0);
+}
+
+// ============================================================
+// Watchdog Timer Functions
+// ============================================================
+
+fn hwWdtInit(timeout_ms: u32) HalError!void {
+    // Disable watchdog first
+    reg.writeReg(u32, reg.WDT_CTRL, 0);
+    hwDelayUs(10);
+
+    // Store timeout for later
+    wdt_timeout_ms = timeout_ms;
+
+    // Set timeout value (convert ms to timer ticks)
+    // Timer runs at approximately 1kHz
+    const timeout_ticks = timeout_ms & reg.WDT_CTRL_TIMEOUT_MASK;
+    reg.writeReg(u32, reg.WDT_COUNTER, timeout_ticks);
+
+    wdt_initialized = true;
+}
+
+fn hwWdtStart() void {
+    if (!wdt_initialized) return;
+
+    // Enable watchdog with system reset on timeout
+    reg.writeReg(u32, reg.WDT_CTRL, reg.WDT_CTRL_ENABLE | reg.WDT_CTRL_RESET_EN | (wdt_timeout_ms & reg.WDT_CTRL_TIMEOUT_MASK));
+}
+
+fn hwWdtStop() void {
+    // Disable watchdog
+    reg.writeReg(u32, reg.WDT_CTRL, 0);
+}
+
+fn hwWdtRefresh() void {
+    if (!wdt_initialized) return;
+
+    // Write magic value to refresh register to reset counter
+    reg.writeReg(u32, reg.WDT_REFRESH, reg.WDT_REFRESH_KEY);
+}
+
+fn hwWdtCausedReset() bool {
+    // Check if last reset was from watchdog
+    // This is typically stored in a status register that persists through reset
+    return wdt_caused_last_reset;
+}
+
+// ============================================================
+// RTC Functions
+// ============================================================
+
+fn hwRtcInit() HalError!void {
+    // Enable RTC
+    reg.modifyReg(reg.RTC_CTRL, 0, reg.RTC_CTRL_ENABLE);
+    hwDelayUs(10);
+
+    rtc_initialized = true;
+}
+
+fn hwRtcGetTime() u32 {
+    // Read seconds counter
+    return reg.readReg(u32, reg.RTC_SECONDS);
+}
+
+fn hwRtcSetTime(seconds: u32) void {
+    // Write seconds counter
+    reg.writeReg(u32, reg.RTC_SECONDS, seconds);
+}
+
+fn hwRtcSetAlarm(seconds: u32) void {
+    // Set alarm time
+    reg.writeReg(u32, reg.RTC_ALARM, seconds);
+
+    // Enable alarm
+    reg.modifyReg(reg.RTC_CTRL, 0, reg.RTC_CTRL_ALARM_EN);
+}
+
+fn hwRtcClearAlarm() void {
+    // Disable alarm and clear interrupt flag
+    reg.modifyReg(reg.RTC_CTRL, reg.RTC_CTRL_ALARM_EN | reg.RTC_CTRL_ALARM_IRQ, 0);
+}
+
+fn hwRtcAlarmTriggered() bool {
+    const ctrl = reg.readReg(u32, reg.RTC_CTRL);
+    return (ctrl & reg.RTC_CTRL_ALARM_IRQ) != 0;
+}
+
+// ============================================================
 // Cache Functions
 // ============================================================
 
@@ -1462,4 +1663,24 @@ pub const hal = Hal{
     .usb_clear_interrupts = hwUsbClearInterrupts,
     .usb_read_setup = hwUsbReadSetup,
     .usb_send_zlp = hwUsbSendZlp,
+
+    .dma_init = hwDmaInit,
+    .dma_start = hwDmaStart,
+    .dma_wait = hwDmaWait,
+    .dma_is_busy = hwDmaIsBusy,
+    .dma_get_state = hwDmaGetState,
+    .dma_abort = hwDmaAbort,
+
+    .wdt_init = hwWdtInit,
+    .wdt_start = hwWdtStart,
+    .wdt_stop = hwWdtStop,
+    .wdt_refresh = hwWdtRefresh,
+    .wdt_caused_reset = hwWdtCausedReset,
+
+    .rtc_init = hwRtcInit,
+    .rtc_get_time = hwRtcGetTime,
+    .rtc_set_time = hwRtcSetTime,
+    .rtc_set_alarm = hwRtcSetAlarm,
+    .rtc_clear_alarm = hwRtcClearAlarm,
+    .rtc_alarm_triggered = hwRtcAlarmTriggered,
 };

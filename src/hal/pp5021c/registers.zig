@@ -674,7 +674,96 @@ pub const DMA_CMD_WAIT_REQ: u32 = 0x01000000;
 
 // DMA request IDs
 pub const DMA_REQ_IIS: u8 = 2;
+pub const DMA_REQ_IDE: u8 = 7;
 pub const DMA_REQ_SDHC: u8 = 13;
+
+// DMA status bits
+pub const DMA_STATUS_BUSY: u32 = 0x80000000;
+pub const DMA_STATUS_DONE: u32 = 0x40000000;
+pub const DMA_STATUS_ERROR: u32 = 0x20000000;
+pub const DMA_STATUS_ABORT: u32 = 0x10000000;
+
+// DMA flags bits
+pub const DMA_FLAGS_LENGTH_MASK: u32 = 0x0000FFFF;
+pub const DMA_FLAGS_REQ_MASK: u32 = 0x001F0000;
+pub const DMA_FLAGS_REQ_SHIFT: u5 = 16;
+pub const DMA_FLAGS_BURST_MASK: u32 = 0x07000000;
+pub const DMA_FLAGS_BURST_SHIFT: u5 = 24;
+
+// DMA burst sizes
+pub const DMA_BURST_1: u32 = 0;
+pub const DMA_BURST_4: u32 = 1;
+pub const DMA_BURST_8: u32 = 2;
+pub const DMA_BURST_16: u32 = 3;
+
+// DMA increment modes
+pub const DMA_INCR_RAM: u32 = 0x00000001; // Increment RAM address
+pub const DMA_INCR_PER: u32 = 0x00000002; // Increment peripheral address
+pub const DMA_INCR_BOTH: u32 = 0x00000003; // Increment both
+
+// DMA master control bits
+pub const DMA_MASTER_EN: u32 = 0x80000000;
+pub const DMA_MASTER_RESET: u32 = 0x40000000;
+
+// DMA channel count
+pub const DMA_NUM_CHANNELS: u8 = 4;
+
+/// Get DMA channel base address
+pub inline fn dmaChannelBase(channel: u2) usize {
+    return DMA_CHAN0_BASE + (@as(usize, channel) * 0x20);
+}
+
+// DMA timeout
+pub const DMA_TIMEOUT_US: u32 = 5_000_000; // 5 seconds
+
+// ============================================================
+// Watchdog Timer
+// ============================================================
+//
+// The PP5021C has a watchdog timer that can reset the system
+// if not periodically refreshed.
+
+pub const WDT_BASE: usize = 0x60006100;
+pub const WDT_CTRL: usize = WDT_BASE + 0x00;
+pub const WDT_COUNTER: usize = WDT_BASE + 0x04;
+pub const WDT_REFRESH: usize = WDT_BASE + 0x08;
+
+// Watchdog control bits
+pub const WDT_CTRL_ENABLE: u32 = 0x80000000;
+pub const WDT_CTRL_RESET_EN: u32 = 0x40000000; // Enable system reset on timeout
+pub const WDT_CTRL_IRQ_EN: u32 = 0x20000000; // Enable interrupt on timeout
+pub const WDT_CTRL_TIMEOUT_MASK: u32 = 0x0000FFFF;
+
+// Watchdog refresh magic value
+pub const WDT_REFRESH_KEY: u32 = 0x5AA55AA5;
+
+// Watchdog timeout values (approximate, in timer ticks)
+pub const WDT_TIMEOUT_1S: u32 = 1000;
+pub const WDT_TIMEOUT_5S: u32 = 5000;
+pub const WDT_TIMEOUT_10S: u32 = 10000;
+pub const WDT_TIMEOUT_30S: u32 = 30000;
+
+// ============================================================
+// Real-Time Clock (RTC)
+// ============================================================
+//
+// The PP5021C RTC provides seconds counter and alarm functionality.
+// The RTC is battery-backed and runs when the device is off.
+
+pub const RTC_BASE: usize = 0x60005014;
+pub const RTC_SECONDS: usize = RTC_BASE;          // Current seconds since epoch
+pub const RTC_ALARM: usize = RTC_BASE + 0x04;     // Alarm seconds
+pub const RTC_CTRL: usize = RTC_BASE + 0x08;      // Control register
+
+// RTC control bits
+pub const RTC_CTRL_ENABLE: u32 = 0x80000000;
+pub const RTC_CTRL_ALARM_EN: u32 = 0x40000000;
+pub const RTC_CTRL_ALARM_IRQ: u32 = 0x20000000;   // Alarm interrupt pending
+pub const RTC_CTRL_TICK_IRQ: u32 = 0x10000000;    // 1Hz tick interrupt pending
+pub const RTC_CTRL_TICK_EN: u32 = 0x08000000;     // Enable 1Hz tick interrupt
+
+// RTC epoch (Unix time base: Jan 1, 1970)
+pub const RTC_UNIX_EPOCH: u32 = 0;
 
 // ============================================================
 // Cache Controller

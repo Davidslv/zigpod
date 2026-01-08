@@ -36,20 +36,20 @@ This document outlines what's needed to run ZigPod on real iPod Classic (6th/7th
 
 | Component | Location | What's Done | What's Missing |
 |-----------|----------|-------------|----------------|
-| ATA storage | `src/hal/pp5021c/` | Structure | PIO read/write |
-| LCD display | `src/drivers/display/` | Framebuffer ops | BCM2722 init |
-| Audio output | `src/drivers/audio/` | Codec registers | I2S DMA streaming |
-| Click wheel | `src/hal/pp5021c/` | Constants | Position/button read |
 | Power mgmt | `src/drivers/power.zig` | Framework | Battery monitoring |
 
-### Not Started
+### Recently Completed
 
-| Component | Priority | Complexity |
-|-----------|----------|------------|
-| USB device mode | High | High |
-| DMA controller | Medium | Medium |
-| Watchdog timer | Low | Low |
-| RTC | Low | Low |
+| Component | Location | Notes |
+|-----------|----------|-------|
+| ATA storage | `src/hal/pp5021c/` | PIO read/write, LBA28/48, IDENTIFY |
+| LCD display | `src/hal/pp5021c/` | BCM2722 init, framebuffer transfer |
+| Audio output | `src/hal/pp5021c/` | I2S driver, multiple sample rates |
+| Click wheel | `src/hal/pp5021c/` | Position tracking, button states |
+| USB device mode | `src/hal/pp5021c/` | Device enumeration, endpoints |
+| DMA controller | `src/hal/pp5021c/` | 4-channel transfers, burst modes |
+| Watchdog timer | `src/hal/pp5021c/` | Timeout, refresh, reset detection |
+| RTC | `src/hal/pp5021c/` | Time read/write, alarm support |
 
 ---
 
