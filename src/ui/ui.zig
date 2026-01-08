@@ -12,6 +12,7 @@ const clickwheel = @import("../drivers/input/clickwheel.zig");
 pub const now_playing = @import("now_playing.zig");
 pub const file_browser = @import("file_browser.zig");
 pub const settings = @import("settings.zig");
+pub const system_info = @import("system_info.zig");
 
 // ============================================================
 // UI Constants

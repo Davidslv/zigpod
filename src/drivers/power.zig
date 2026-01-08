@@ -291,6 +291,248 @@ pub fn checkSleepTimer() bool {
 }
 
 // ============================================================
+// Wake Sources
+// ============================================================
+
+pub const WakeSource = enum {
+    none,
+    button, // Any button press
+    wheel, // Click wheel touch
+    usb, // USB connection
+    alarm, // RTC alarm
+    timer, // Sleep timer expired
+};
+
+var wake_source: WakeSource = .none;
+var wake_mask: u8 = 0xFF; // All sources enabled by default
+
+/// Enable/disable wake source
+pub fn setWakeSourceEnabled(source: WakeSource, enabled: bool) void {
+    const bit: u8 = @as(u8, 1) << @intFromEnum(source);
+    if (enabled) {
+        wake_mask |= bit;
+    } else {
+        wake_mask &= ~bit;
+    }
+}
+
+/// Check if wake source is enabled
+pub fn isWakeSourceEnabled(source: WakeSource) bool {
+    const bit: u8 = @as(u8, 1) << @intFromEnum(source);
+    return (wake_mask & bit) != 0;
+}
+
+/// Get what woke the device
+pub fn getWakeSource() WakeSource {
+    return wake_source;
+}
+
+/// Record wake source (called by interrupt handlers)
+pub fn recordWakeSource(source: WakeSource) void {
+    wake_source = source;
+}
+
+/// Clear wake source
+pub fn clearWakeSource() void {
+    wake_source = .none;
+}
+
+// ============================================================
+// Power Profiles
+// ============================================================
+
+pub const PowerProfile = struct {
+    name: []const u8,
+    backlight_timeout_sec: u16,
+    cpu_speed_mhz: u8,
+    hold_to_sleep: bool,
+    auto_sleep_minutes: u16, // 0 = disabled
+    eq_enabled: bool,
+};
+
+pub const DEFAULT_PROFILES = [_]PowerProfile{
+    .{
+        .name = "Normal",
+        .backlight_timeout_sec = 30,
+        .cpu_speed_mhz = 80,
+        .hold_to_sleep = true,
+        .auto_sleep_minutes = 30,
+        .eq_enabled = true,
+    },
+    .{
+        .name = "Power Saver",
+        .backlight_timeout_sec = 10,
+        .cpu_speed_mhz = 30,
+        .hold_to_sleep = true,
+        .auto_sleep_minutes = 15,
+        .eq_enabled = false,
+    },
+    .{
+        .name = "Performance",
+        .backlight_timeout_sec = 60,
+        .cpu_speed_mhz = 80,
+        .hold_to_sleep = false,
+        .auto_sleep_minutes = 0,
+        .eq_enabled = true,
+    },
+};
+
+var current_profile: usize = 0; // Normal
+
+/// Get current power profile
+pub fn getProfile() PowerProfile {
+    return DEFAULT_PROFILES[current_profile];
+}
+
+/// Set power profile by index
+pub fn setProfile(index: usize) void {
+    if (index < DEFAULT_PROFILES.len) {
+        current_profile = index;
+        const profile = DEFAULT_PROFILES[index];
+        setBacklightTimeout(profile.backlight_timeout_sec);
+        // CPU speed change would be done here
+    }
+}
+
+// ============================================================
+// Auto Sleep
+// ============================================================
+
+var auto_sleep_enabled: bool = true;
+var last_playback_time: u64 = 0;
+
+/// Update playback activity (call when audio is playing)
+pub fn recordPlaybackActivity() void {
+    last_playback_time = hal.getTicksUs();
+}
+
+/// Check if device should auto-sleep
+pub fn checkAutoSleep() bool {
+    const profile = getProfile();
+    if (!auto_sleep_enabled or profile.auto_sleep_minutes == 0) return false;
+
+    const current_time = hal.getTicksUs();
+
+    // Check both activity and playback
+    const activity_elapsed_min = (current_time - last_activity_time) / (1000 * 1000 * 60);
+    const playback_elapsed_min = (current_time - last_playback_time) / (1000 * 1000 * 60);
+
+    // Sleep if no activity and no playback for auto_sleep_minutes
+    return activity_elapsed_min >= profile.auto_sleep_minutes and
+        playback_elapsed_min >= profile.auto_sleep_minutes;
+}
+
+/// Enable/disable auto sleep
+pub fn setAutoSleepEnabled(enabled: bool) void {
+    auto_sleep_enabled = enabled;
+}
+
+// ============================================================
+// Deep Sleep Mode
+// ============================================================
+
+/// Enter deep sleep mode (stops audio, minimal power)
+pub fn enterDeepSleep() !void {
+    // Save state for resume
+    const was_playing = false; // Would check audio.isPlaying()
+
+    // Stop audio
+    // audio.stop();
+
+    // Turn off peripherals
+    lcd.setBacklight(false);
+    lcd.clear(lcd.Colors.BLACK);
+
+    // Configure wake sources with PMU
+    // This would configure actual hardware wake pins
+
+    // Enter low power mode
+    current_state = .standby;
+
+    // In real hardware, CPU would halt here until wake event
+    hal.sleep();
+
+    // Woke up - restore state
+    if (was_playing) {
+        // Resume playback
+    }
+
+    // Return to active state
+    current_state = .active;
+    lcd.setBacklight(true);
+    backlight_on = true;
+}
+
+/// Handle hold switch (enter/exit sleep)
+pub fn handleHoldSwitch(is_held: bool) !void {
+    const profile = getProfile();
+
+    if (is_held and profile.hold_to_sleep) {
+        // Hold switch activated - enter sleep
+        try setState(.sleep);
+    } else if (!is_held and current_state == .sleep) {
+        // Hold switch released - wake up
+        try setState(.active);
+    }
+}
+
+// ============================================================
+// Statistics Tracking
+// ============================================================
+
+pub const PowerStats = struct {
+    total_runtime_sec: u32 = 0,
+    playback_time_sec: u32 = 0,
+    sleep_time_sec: u32 = 0,
+    charge_cycles: u16 = 0,
+    last_full_charge_time: u32 = 0,
+    boot_count: u32 = 0,
+
+    pub fn getUptimeString(self: *const PowerStats, buffer: []u8) []u8 {
+        const hours = self.total_runtime_sec / 3600;
+        const minutes = (self.total_runtime_sec % 3600) / 60;
+        return std.fmt.bufPrint(buffer, "{d}h {d}m", .{ hours, minutes }) catch buffer[0..0];
+    }
+
+    pub fn getPlaybackTimeString(self: *const PowerStats, buffer: []u8) []u8 {
+        const hours = self.playback_time_sec / 3600;
+        const minutes = (self.playback_time_sec % 3600) / 60;
+        return std.fmt.bufPrint(buffer, "{d}h {d}m", .{ hours, minutes }) catch buffer[0..0];
+    }
+};
+
+var power_stats = PowerStats{};
+
+/// Get power statistics
+pub fn getStats() PowerStats {
+    return power_stats;
+}
+
+/// Update runtime statistics (call periodically, e.g., once per second)
+pub fn updateStats(is_playing: bool) void {
+    power_stats.total_runtime_sec += 1;
+
+    if (is_playing) {
+        power_stats.playback_time_sec += 1;
+    }
+
+    if (current_state == .sleep or current_state == .standby) {
+        power_stats.sleep_time_sec += 1;
+    }
+}
+
+/// Record a charge cycle
+pub fn recordChargeCycle() void {
+    power_stats.charge_cycles += 1;
+    power_stats.last_full_charge_time = @intCast(hal.getTicksUs() / 1_000_000);
+}
+
+/// Increment boot count
+pub fn recordBoot() void {
+    power_stats.boot_count += 1;
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
