@@ -16,6 +16,9 @@ pub const decoders = @import("decoders/decoders.zig");
 // Export metadata parser
 pub const metadata = @import("metadata.zig");
 
+// Export DSP effects
+pub const dsp = @import("dsp.zig");
+
 // ============================================================
 // Audio Constants
 // ============================================================

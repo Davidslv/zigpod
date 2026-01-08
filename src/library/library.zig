@@ -6,6 +6,9 @@
 const std = @import("std");
 const audio = @import("../audio/audio.zig");
 
+// Export playlist file parser
+pub const playlist_parser = @import("playlist.zig");
+
 // ============================================================
 // Constants
 // ============================================================
