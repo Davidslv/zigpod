@@ -1,0 +1,407 @@
+//! PP5021C Register Definitions
+//!
+//! This file contains all hardware register addresses and bit definitions
+//! for the PortalPlayer PP5021C SoC used in iPod Video 5th Generation.
+//!
+//! Sources:
+//! - Rockbox firmware/export/pp5020.h
+//! - docs/004-hardware-reference.md
+
+const std = @import("std");
+
+// ============================================================
+// Volatile Register Access Helper
+// ============================================================
+
+/// Read from a memory-mapped register
+pub inline fn readReg(comptime T: type, addr: usize) T {
+    return @as(*volatile T, @ptrFromInt(addr)).*;
+}
+
+/// Write to a memory-mapped register
+pub inline fn writeReg(comptime T: type, addr: usize, value: T) void {
+    @as(*volatile T, @ptrFromInt(addr)).* = value;
+}
+
+/// Modify register with mask
+pub inline fn modifyReg(addr: usize, clear_mask: u32, set_mask: u32) void {
+    const val = readReg(u32, addr);
+    writeReg(u32, addr, (val & ~clear_mask) | set_mask);
+}
+
+// ============================================================
+// Memory Map Constants
+// ============================================================
+
+pub const DRAM_START: usize = 0x40000000;
+pub const DRAM_SIZE_32MB: usize = 32 * 1024 * 1024;
+pub const DRAM_SIZE_64MB: usize = 64 * 1024 * 1024;
+
+pub const IRAM_START: usize = 0x10000000;
+pub const IRAM_SIZE: usize = 8 * 1024;
+
+pub const ROM_START: usize = 0x00000000;
+pub const ROM_SIZE: usize = 128 * 1024;
+
+// ============================================================
+// Processor Control
+// ============================================================
+
+pub const CPU_CTL: usize = 0x60007000;
+pub const COP_CTL: usize = 0x60007004;
+
+// CPU/COP control bits
+pub const PROC_SLEEP: u32 = 0x80000000;
+pub const PROC_WAIT_CNT: u32 = 0x40000000;
+pub const PROC_WAKE_INT: u32 = 0x20000000;
+pub const PROC_CNT_CLKS: u32 = 0x08000000;
+pub const PROC_CNT_USEC: u32 = 0x02000000;
+pub const PROC_CNT_MSEC: u32 = 0x01000000;
+pub const PROC_CNT_SEC: u32 = 0x00800000;
+
+// Processor identification
+pub const CPU_ID: u8 = 0x55;
+pub const COP_ID: u8 = 0xAA;
+
+// ============================================================
+// Mailbox (Inter-processor Communication)
+// ============================================================
+
+pub const MBX_MSG_STAT: usize = 0x60001000;
+pub const MBX_MSG_SET: usize = 0x60001004;
+pub const MBX_MSG_CLR: usize = 0x60001008;
+pub const CPU_QUEUE: usize = 0x60001010;
+pub const COP_QUEUE: usize = 0x60001020;
+
+// ============================================================
+// Interrupt Controller
+// ============================================================
+
+// CPU interrupt registers
+pub const CPU_INT_STAT: usize = 0x60004000;
+pub const CPU_INT_EN: usize = 0x60004004;
+pub const CPU_INT_CLR: usize = 0x60004008;
+pub const CPU_INT_PRIO: usize = 0x6000400C;
+pub const CPU_HI_INT_STAT: usize = 0x60004100;
+pub const CPU_HI_INT_EN: usize = 0x60004104;
+pub const CPU_HI_INT_CLR: usize = 0x60004108;
+
+// COP interrupt registers
+pub const COP_INT_STAT: usize = 0x60004010;
+pub const COP_INT_EN: usize = 0x60004014;
+pub const COP_INT_CLR: usize = 0x60004018;
+pub const COP_INT_PRIO: usize = 0x6000401C;
+pub const COP_HI_INT_STAT: usize = 0x60004110;
+pub const COP_HI_INT_EN: usize = 0x60004114;
+pub const COP_HI_INT_CLR: usize = 0x60004118;
+
+// Interrupt source bits
+pub const TIMER1_IRQ: u32 = 1 << 0;
+pub const TIMER2_IRQ: u32 = 1 << 1;
+pub const MAILBOX_IRQ: u32 = 1 << 2;
+pub const IIS_IRQ: u32 = 1 << 4;
+pub const USB_IRQ: u32 = 1 << 5;
+pub const IDE_IRQ: u32 = 1 << 6;
+pub const FIREWIRE_IRQ: u32 = 1 << 7;
+pub const DMA_IRQ: u32 = 1 << 8;
+pub const GPIO0_IRQ: u32 = 1 << 9;
+pub const GPIO1_IRQ: u32 = 1 << 10;
+pub const GPIO2_IRQ: u32 = 1 << 11;
+pub const SER0_IRQ: u32 = 1 << 12;
+pub const SER1_IRQ: u32 = 1 << 13;
+pub const I2C_IRQ: u32 = 1 << 14;
+
+// ============================================================
+// Timers
+// ============================================================
+
+pub const TIMER1_CFG: usize = 0x60005000;
+pub const TIMER1_VAL: usize = 0x60005004;
+pub const TIMER2_CFG: usize = 0x60005008;
+pub const TIMER2_VAL: usize = 0x6000500C;
+pub const USEC_TIMER: usize = 0x60005010;
+pub const RTC: usize = 0x60005014;
+
+pub const TIMER_FREQ: u32 = 1_000_000; // 1 MHz
+
+// ============================================================
+// Device Enable / Clock Control
+// ============================================================
+
+pub const DEV_RS: usize = 0x60006004;
+pub const DEV_RS2: usize = 0x60006008;
+pub const DEV_EN: usize = 0x6000600C;
+pub const DEV_EN2: usize = 0x60006010;
+
+// Device enable bits
+pub const DEV_EXTCLOCKS: u32 = 0x00000002;
+pub const DEV_SYSTEM: u32 = 0x00000004;
+pub const DEV_USB0: u32 = 0x00000008;
+pub const DEV_USB1: u32 = 0x00000010;
+pub const DEV_I2S: u32 = 0x00000800;
+pub const DEV_I2C: u32 = 0x00001000;
+pub const DEV_ATA: u32 = 0x00004000;
+pub const DEV_LCD: u32 = 0x00010000;
+pub const DEV_OPTO: u32 = 0x00800000; // Click wheel
+
+// Clock control
+pub const CLOCK_SOURCE: usize = 0x60006020;
+pub const MLCD_SCLK_DIV: usize = 0x6000602C;
+pub const PLL_CONTROL: usize = 0x60006034;
+pub const PLL_STATUS: usize = 0x6000603C;
+pub const ADC_CLOCK_SRC: usize = 0x60006094;
+pub const CLCD_CLOCK_SRC: usize = 0x600060A0;
+
+// Clock source values
+pub const CLOCK_32KHZ: u32 = 0x20002222;
+pub const CLOCK_PLL: u32 = 0x20007777;
+
+// PLL control bits
+pub const PLL_ENABLE: u32 = 0x80000000;
+pub const PLL_LOCK: u32 = 0x80000000;
+
+// ============================================================
+// GPIO
+// ============================================================
+
+pub const GPIO_BASE: usize = 0x6000D000;
+
+// GPIO port offsets (multiply port number by 0x20)
+pub const GPIO_PORT_OFFSET: usize = 0x20;
+
+// Per-port register offsets
+pub const GPIO_ENABLE_OFF: usize = 0x00;
+pub const GPIO_INT_EN_OFF: usize = 0x04;
+pub const GPIO_INT_LEV_OFF: usize = 0x08;
+pub const GPIO_INT_CLR_OFF: usize = 0x0C;
+pub const GPIO_OUTPUT_EN_OFF: usize = 0x10;
+pub const GPIO_OUTPUT_VAL_OFF: usize = 0x14;
+pub const GPIO_INPUT_VAL_OFF: usize = 0x18;
+pub const GPIO_INT_STAT_OFF: usize = 0x1C;
+
+/// Calculate GPIO register address
+pub inline fn gpioReg(port: u4, offset: usize) usize {
+    return GPIO_BASE + (@as(usize, port) * GPIO_PORT_OFFSET) + offset;
+}
+
+// GPIO port identifiers
+pub const GPIO_PORT_A: u4 = 0;
+pub const GPIO_PORT_B: u4 = 1;
+pub const GPIO_PORT_C: u4 = 2;
+pub const GPIO_PORT_D: u4 = 3;
+pub const GPIO_PORT_E: u4 = 4;
+pub const GPIO_PORT_F: u4 = 5;
+pub const GPIO_PORT_G: u4 = 6;
+pub const GPIO_PORT_H: u4 = 7;
+pub const GPIO_PORT_I: u4 = 8;
+pub const GPIO_PORT_J: u4 = 9;
+pub const GPIO_PORT_K: u4 = 10;
+pub const GPIO_PORT_L: u4 = 11;
+
+// ============================================================
+// I2C Controller
+// ============================================================
+
+pub const I2C_BASE: usize = 0x7000C000;
+
+pub const I2C_CTRL: usize = I2C_BASE + 0x00;
+pub const I2C_ADDR: usize = I2C_BASE + 0x04;
+pub const I2C_DATA0: usize = I2C_BASE + 0x0C;
+pub const I2C_DATA1: usize = I2C_BASE + 0x10;
+pub const I2C_DATA2: usize = I2C_BASE + 0x14;
+pub const I2C_DATA3: usize = I2C_BASE + 0x18;
+pub const I2C_STATUS: usize = I2C_BASE + 0x1C;
+
+/// Get I2C data register address
+pub inline fn i2cDataReg(index: u2) usize {
+    return I2C_DATA0 + (@as(usize, index) * 4);
+}
+
+// I2C control bits
+pub const I2C_SEND: u8 = 0x80;
+pub const I2C_BUSY: u8 = 0x40;
+pub const I2C_READ_BIT: u8 = 0x01;
+
+// ============================================================
+// I2S Audio Interface
+// ============================================================
+
+pub const IISDIV: usize = 0x60006080;
+pub const IISCONFIG: usize = 0x70002800;
+pub const IISFIFO_CFG: usize = 0x7000280C;
+pub const IISFIFO_WR: usize = 0x70002840;
+pub const IISFIFO_RD: usize = 0x70002880;
+
+// IISCONFIG bits
+pub const IIS_RESET: u32 = 0x80000000;
+pub const IIS_TXFIFOEN: u32 = 0x20000000;
+pub const IIS_RXFIFOEN: u32 = 0x10000000;
+pub const IIS_MASTER: u32 = 0x00001000;
+pub const IIS_IRQTX: u32 = 0x00000200;
+pub const IIS_IRQRX: u32 = 0x00000100;
+
+// I2S format
+pub const IIS_FORMAT_IIS: u32 = 0x00000000;
+pub const IIS_FORMAT_LJUST: u32 = 0x00400000;
+pub const IIS_SIZE_16BIT: u32 = 0x00000000;
+pub const IIS_SIZE_24BIT: u32 = 0x00020000;
+pub const IIS_SIZE_32BIT: u32 = 0x00040000;
+
+// FIFO status masks
+pub const IIS_TX_FREE_MASK: u32 = 0x0001E000;
+pub const IIS_TX_FREE_SHIFT: u5 = 13;
+pub const IIS_RX_FULL_MASK: u32 = 0x00780000;
+pub const IIS_RX_FULL_SHIFT: u5 = 19;
+
+// ============================================================
+// IDE/ATA Controller
+// ============================================================
+
+pub const IDE0_CFG: usize = 0xC3000000;
+pub const IDE0_CNTRLR: usize = 0xC3000004;
+pub const IDE0_STAT: usize = 0xC300000C;
+pub const IDE1_CFG: usize = 0xC3000010;
+pub const IDE1_CNTRLR: usize = 0xC3000014;
+pub const IDE1_STAT: usize = 0xC300001C;
+
+// ATA Commands
+pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
+pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
+pub const ATA_CMD_READ_SECTORS_EXT: u8 = 0x24;
+pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+pub const ATA_CMD_WRITE_SECTORS_EXT: u8 = 0x34;
+pub const ATA_CMD_STANDBY_IMMEDIATE: u8 = 0xE0;
+pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+
+// ATA Status bits
+pub const ATA_STATUS_BSY: u8 = 0x80;
+pub const ATA_STATUS_DRDY: u8 = 0x40;
+pub const ATA_STATUS_DRQ: u8 = 0x08;
+pub const ATA_STATUS_ERR: u8 = 0x01;
+
+// ============================================================
+// LCD Controller (BCM2722)
+// ============================================================
+
+pub const BCM_DATA: usize = 0x30000000;
+pub const BCM_WR_ADDR: usize = 0x30010000;
+pub const BCM_RD_ADDR: usize = 0x30020000;
+pub const BCM_CONTROL: usize = 0x30030000;
+
+pub const BCM_ALT_DATA: usize = 0x30040000;
+pub const BCM_ALT_WR_ADDR: usize = 0x30050000;
+pub const BCM_ALT_RD_ADDR: usize = 0x30060000;
+pub const BCM_ALT_CONTROL: usize = 0x30070000;
+
+// BCM command encoding
+pub inline fn bcmCmd(x: u16) u32 {
+    return (~@as(u32, x) << 16) | x;
+}
+
+pub const BCMCMD_LCD_UPDATE: u32 = bcmCmd(0x00);
+pub const BCMCMD_LCD_UPDATERECT: u32 = bcmCmd(0x05);
+pub const BCMCMD_LCD_SLEEP: u32 = bcmCmd(0x08);
+pub const BCMCMD_SELFTEST: u32 = bcmCmd(0x01);
+
+// LCD dimensions
+pub const LCD_WIDTH: u16 = 320;
+pub const LCD_HEIGHT: u16 = 240;
+pub const LCD_BPP: u8 = 16;
+
+// ============================================================
+// USB Controller
+// ============================================================
+
+pub const USB_BASE: usize = 0xC5000000;
+pub const USB_NUM_ENDPOINTS: u8 = 3;
+
+// ============================================================
+// DMA Engine
+// ============================================================
+
+pub const DMA_MASTER_CTRL: usize = 0x6000A000;
+pub const DMA_MASTER_STATUS: usize = 0x6000A004;
+pub const DMA_REQ_STATUS: usize = 0x6000A008;
+
+// DMA channel base addresses
+pub const DMA_CHAN0_BASE: usize = 0x6000B000;
+pub const DMA_CHAN1_BASE: usize = 0x6000B020;
+pub const DMA_CHAN2_BASE: usize = 0x6000B040;
+pub const DMA_CHAN3_BASE: usize = 0x6000B060;
+
+// Per-channel register offsets
+pub const DMA_CMD_OFF: usize = 0x00;
+pub const DMA_STATUS_OFF: usize = 0x04;
+pub const DMA_RAM_ADDR_OFF: usize = 0x08;
+pub const DMA_FLAGS_OFF: usize = 0x0C;
+pub const DMA_PER_ADDR_OFF: usize = 0x10;
+pub const DMA_INCR_OFF: usize = 0x14;
+
+// DMA command bits
+pub const DMA_CMD_START: u32 = 0x80000000;
+pub const DMA_CMD_INTR: u32 = 0x40000000;
+pub const DMA_CMD_SLEEP_WAIT: u32 = 0x20000000;
+pub const DMA_CMD_RAM_TO_PER: u32 = 0x10000000;
+pub const DMA_CMD_SINGLE: u32 = 0x08000000;
+pub const DMA_CMD_WAIT_REQ: u32 = 0x01000000;
+
+// DMA request IDs
+pub const DMA_REQ_IIS: u8 = 2;
+pub const DMA_REQ_SDHC: u8 = 13;
+
+// ============================================================
+// Cache Controller
+// ============================================================
+
+pub const CACHE_CTL: usize = 0x6000C000;
+pub const CACHE_MASK: usize = 0x6000C004;
+pub const CACHE_OPERATION: usize = 0x6000C008;
+pub const CACHE_FLUSH_MASK: usize = 0x6000C00C;
+
+// Cache control bits
+pub const CACHE_CTL_ENABLE: u32 = 0x80000000;
+pub const CACHE_CTL_RUN: u32 = 0x40000000;
+pub const CACHE_CTL_INIT: u32 = 0x20000000;
+pub const CACHE_CTL_VECT_REMAP: u32 = 0x10000000;
+pub const CACHE_CTL_READY: u32 = 0x00000002;
+pub const CACHE_CTL_BUSY: u32 = 0x00000001;
+
+// Cache operations
+pub const CACHE_OP_FLUSH: u32 = 0x01;
+pub const CACHE_OP_INVALIDATE: u32 = 0x02;
+
+// Cache alignment
+pub const CACHEALIGN_SIZE: usize = 16;
+
+// ============================================================
+// Device Initialization
+// ============================================================
+
+pub const PP_VER1: usize = 0x70000000;
+pub const PP_VER2: usize = 0x70000004;
+pub const STRAP_OPT_A: usize = 0x70000010;
+pub const DEV_INIT1: usize = 0x70000020;
+pub const DEV_INIT2: usize = 0x70000024;
+pub const GPO32_VAL: usize = 0x70000080;
+pub const GPO32_EN: usize = 0x70000084;
+
+pub const INIT_BUTTONS: u32 = 0x00000008;
+
+// ============================================================
+// Tests
+// ============================================================
+
+test "register address calculations" {
+    // Verify GPIO register calculation
+    try std.testing.expectEqual(@as(usize, 0x6000D000), gpioReg(0, GPIO_ENABLE_OFF));
+    try std.testing.expectEqual(@as(usize, 0x6000D020), gpioReg(1, GPIO_ENABLE_OFF));
+    try std.testing.expectEqual(@as(usize, 0x6000D034), gpioReg(1, GPIO_OUTPUT_VAL_OFF));
+
+    // Verify I2C data register calculation
+    try std.testing.expectEqual(@as(usize, 0x7000C00C), i2cDataReg(0));
+    try std.testing.expectEqual(@as(usize, 0x7000C010), i2cDataReg(1));
+
+    // Verify BCM command encoding
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), bcmCmd(0x00));
+    try std.testing.expectEqual(@as(u32, 0xFFFA0005), bcmCmd(0x05));
+}

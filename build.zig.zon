@@ -1,0 +1,19 @@
+.{
+    .fingerprint = 0xd5e3effb15aa5172,
+    .name = .zigpod,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+        // No external dependencies yet
+        // Future: raylib for simulator GUI
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "linker",
+        "docs",
+    },
+}

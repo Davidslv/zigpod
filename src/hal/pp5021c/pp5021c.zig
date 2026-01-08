@@ -1,0 +1,609 @@
+//! PP5021C Hardware Implementation
+//!
+//! This module provides the actual hardware implementation of the HAL
+//! for the PortalPlayer PP5021C SoC used in iPod Video 5th Generation.
+//!
+//! WARNING: This code directly accesses hardware registers. Only use on
+//! actual iPod hardware. Use mock implementation for testing.
+
+const std = @import("std");
+const reg = @import("registers.zig");
+const hal_types = @import("../hal.zig");
+const Hal = hal_types.Hal;
+const HalError = hal_types.HalError;
+const GpioDirection = hal_types.GpioDirection;
+const GpioInterruptMode = hal_types.GpioInterruptMode;
+const I2sFormat = hal_types.I2sFormat;
+const I2sSampleSize = hal_types.I2sSampleSize;
+const AtaDeviceInfo = hal_types.AtaDeviceInfo;
+
+// ============================================================
+// Internal State
+// ============================================================
+
+var system_initialized: bool = false;
+var i2c_initialized: bool = false;
+var i2s_initialized: bool = false;
+var ata_initialized: bool = false;
+var lcd_initialized: bool = false;
+
+// ============================================================
+// System Functions
+// ============================================================
+
+fn hwSystemInit() HalError!void {
+    // Disable all interrupts first
+    hwIrqDisable();
+    reg.writeReg(u32, reg.CPU_INT_EN, 0);
+    reg.writeReg(u32, reg.COP_INT_EN, 0);
+    reg.writeReg(u32, reg.CPU_HI_INT_EN, 0);
+    reg.writeReg(u32, reg.COP_HI_INT_EN, 0);
+
+    // Clear pending interrupts
+    reg.writeReg(u32, reg.CPU_INT_CLR, 0xFFFFFFFF);
+    reg.writeReg(u32, reg.COP_INT_CLR, 0xFFFFFFFF);
+    reg.writeReg(u32, reg.CPU_HI_INT_CLR, 0xFFFFFFFF);
+    reg.writeReg(u32, reg.COP_HI_INT_CLR, 0xFFFFFFFF);
+
+    // Disable GPIO interrupts on all ports
+    var port: u4 = 0;
+    while (port < 12) : (port += 1) {
+        reg.writeReg(u32, reg.gpioReg(port, reg.GPIO_INT_EN_OFF), 0);
+    }
+
+    // Enable required device clocks
+    var dev_en = reg.readReg(u32, reg.DEV_EN);
+    dev_en |= reg.DEV_SYSTEM | reg.DEV_EXTCLOCKS | reg.DEV_I2C;
+    reg.writeReg(u32, reg.DEV_EN, dev_en);
+
+    // Small delay for clocks to stabilize
+    hwDelayUs(100);
+
+    system_initialized = true;
+}
+
+fn hwGetTicksUs() u64 {
+    return reg.readReg(u32, reg.USEC_TIMER);
+}
+
+fn hwDelayUs(us: u32) void {
+    const start = reg.readReg(u32, reg.USEC_TIMER);
+    while (reg.readReg(u32, reg.USEC_TIMER) -% start < us) {
+        // Busy wait - could add yield here
+    }
+}
+
+fn hwDelayMs(ms: u32) void {
+    var i: u32 = 0;
+    while (i < ms) : (i += 1) {
+        hwDelayUs(1000);
+    }
+}
+
+fn hwSleep() void {
+    // Enter sleep mode, wake on interrupt
+    reg.writeReg(u32, reg.CPU_CTL, reg.PROC_SLEEP | reg.PROC_WAKE_INT);
+}
+
+fn hwReset() noreturn {
+    // Trigger system reset
+    // This typically involves writing to a reset register or watchdog
+    // For now, just hang
+    while (true) {
+        hwSleep();
+    }
+}
+
+// ============================================================
+// GPIO Functions
+// ============================================================
+
+fn hwGpioSetDirection(port: u4, pin: u5, direction: GpioDirection) void {
+    if (port >= 12 or pin >= 32) return;
+
+    const pin_mask = @as(u32, 1) << pin;
+
+    // Enable GPIO function
+    reg.modifyReg(reg.gpioReg(port, reg.GPIO_ENABLE_OFF), 0, pin_mask);
+
+    // Set direction
+    if (direction == .output) {
+        reg.modifyReg(reg.gpioReg(port, reg.GPIO_OUTPUT_EN_OFF), 0, pin_mask);
+    } else {
+        reg.modifyReg(reg.gpioReg(port, reg.GPIO_OUTPUT_EN_OFF), pin_mask, 0);
+    }
+}
+
+fn hwGpioWrite(port: u4, pin: u5, value: bool) void {
+    if (port >= 12 or pin >= 32) return;
+
+    const pin_mask = @as(u32, 1) << pin;
+    if (value) {
+        reg.modifyReg(reg.gpioReg(port, reg.GPIO_OUTPUT_VAL_OFF), 0, pin_mask);
+    } else {
+        reg.modifyReg(reg.gpioReg(port, reg.GPIO_OUTPUT_VAL_OFF), pin_mask, 0);
+    }
+}
+
+fn hwGpioRead(port: u4, pin: u5) bool {
+    if (port >= 12 or pin >= 32) return false;
+
+    const pin_mask = @as(u32, 1) << pin;
+    const val = reg.readReg(u32, reg.gpioReg(port, reg.GPIO_INPUT_VAL_OFF));
+    return (val & pin_mask) != 0;
+}
+
+fn hwGpioSetInterrupt(port: u4, pin: u5, mode: GpioInterruptMode) void {
+    if (port >= 12 or pin >= 32) return;
+
+    const pin_mask = @as(u32, 1) << pin;
+
+    if (mode == .none) {
+        reg.modifyReg(reg.gpioReg(port, reg.GPIO_INT_EN_OFF), pin_mask, 0);
+    } else {
+        // Configure level/edge sensitivity
+        const level_mode = (mode == .high_level or mode == .low_level);
+        if (level_mode) {
+            reg.modifyReg(reg.gpioReg(port, reg.GPIO_INT_LEV_OFF), 0, pin_mask);
+        } else {
+            reg.modifyReg(reg.gpioReg(port, reg.GPIO_INT_LEV_OFF), pin_mask, 0);
+        }
+
+        // Enable interrupt
+        reg.modifyReg(reg.gpioReg(port, reg.GPIO_INT_EN_OFF), 0, pin_mask);
+    }
+}
+
+// ============================================================
+// I2C Functions
+// ============================================================
+
+const I2C_TIMEOUT_US: u32 = 1_000_000; // 1 second
+
+fn i2cWaitNotBusy() HalError!void {
+    const start = hwGetTicksUs();
+    while (true) {
+        const status = reg.readReg(u8, reg.I2C_STATUS);
+        if ((status & reg.I2C_BUSY) == 0) {
+            return;
+        }
+        if (hwGetTicksUs() - start > I2C_TIMEOUT_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+fn hwI2cInit() HalError!void {
+    // Enable I2C device
+    reg.modifyReg(reg.DEV_EN, 0, reg.DEV_I2C);
+    hwDelayUs(100);
+    i2c_initialized = true;
+}
+
+fn hwI2cWrite(addr: u7, data: []const u8) HalError!void {
+    if (!i2c_initialized) return HalError.DeviceNotReady;
+    if (data.len == 0 or data.len > 4) return HalError.InvalidParameter;
+
+    try i2cWaitNotBusy();
+
+    // Write data to registers
+    var i: usize = 0;
+    while (i < data.len and i < 4) : (i += 1) {
+        reg.writeReg(u8, reg.i2cDataReg(@truncate(i)), data[i]);
+    }
+
+    // Set address (7-bit address shifted left, write mode)
+    reg.writeReg(u8, reg.I2C_ADDR, @as(u8, addr) << 1);
+
+    // Start transfer
+    const ctrl = @as(u8, @truncate((data.len - 1) << 1)) | reg.I2C_SEND;
+    reg.writeReg(u8, reg.I2C_CTRL, ctrl);
+
+    // Wait for completion
+    try i2cWaitNotBusy();
+}
+
+fn hwI2cRead(addr: u7, buffer: []u8) HalError!usize {
+    if (!i2c_initialized) return HalError.DeviceNotReady;
+    if (buffer.len == 0 or buffer.len > 4) return HalError.InvalidParameter;
+
+    try i2cWaitNotBusy();
+
+    // Set address (7-bit address shifted left, read mode)
+    reg.writeReg(u8, reg.I2C_ADDR, (@as(u8, addr) << 1) | reg.I2C_READ_BIT);
+
+    // Start transfer
+    const ctrl = @as(u8, @truncate((buffer.len - 1) << 1)) | reg.I2C_SEND;
+    reg.writeReg(u8, reg.I2C_CTRL, ctrl);
+
+    // Wait for completion
+    try i2cWaitNotBusy();
+
+    // Read data from registers
+    var i: usize = 0;
+    while (i < buffer.len and i < 4) : (i += 1) {
+        buffer[i] = reg.readReg(u8, reg.i2cDataReg(@truncate(i)));
+    }
+
+    return buffer.len;
+}
+
+fn hwI2cWriteRead(addr: u7, write_data: []const u8, read_buffer: []u8) HalError!usize {
+    try hwI2cWrite(addr, write_data);
+    return try hwI2cRead(addr, read_buffer);
+}
+
+// ============================================================
+// I2S Functions
+// ============================================================
+
+fn hwI2sInit(sample_rate: u32, format: I2sFormat, sample_size: I2sSampleSize) HalError!void {
+    _ = sample_rate; // TODO: Configure sample rate divider
+
+    // Reset I2S
+    reg.writeReg(u32, reg.IISCONFIG, reg.IIS_RESET);
+    hwDelayUs(100);
+    reg.writeReg(u32, reg.IISCONFIG, 0);
+
+    // Configure format
+    var config: u32 = 0;
+
+    switch (format) {
+        .i2s_standard => config |= reg.IIS_FORMAT_IIS,
+        .left_justified => config |= reg.IIS_FORMAT_LJUST,
+        .right_justified => {}, // Default
+    }
+
+    switch (sample_size) {
+        .bits_16 => config |= reg.IIS_SIZE_16BIT,
+        .bits_24 => config |= reg.IIS_SIZE_24BIT,
+        .bits_32 => config |= reg.IIS_SIZE_32BIT,
+    }
+
+    // Set as master
+    config |= reg.IIS_MASTER;
+
+    reg.writeReg(u32, reg.IISCONFIG, config);
+
+    i2s_initialized = true;
+}
+
+fn hwI2sWrite(samples: []const i16) HalError!usize {
+    if (!i2s_initialized) return HalError.DeviceNotReady;
+
+    var written: usize = 0;
+    for (samples) |sample| {
+        // Wait for FIFO space
+        while (hwI2sTxFreeSlots() == 0) {}
+
+        // Write sample (both channels, same value for mono)
+        const sample32 = @as(u32, @bitCast(@as(i32, sample)));
+        reg.writeReg(u32, reg.IISFIFO_WR, (sample32 << 16) | (sample32 & 0xFFFF));
+        written += 1;
+    }
+
+    return written;
+}
+
+fn hwI2sTxReady() bool {
+    return hwI2sTxFreeSlots() > 0;
+}
+
+fn hwI2sTxFreeSlots() usize {
+    const cfg = reg.readReg(u32, reg.IISFIFO_CFG);
+    return (cfg & reg.IIS_TX_FREE_MASK) >> reg.IIS_TX_FREE_SHIFT;
+}
+
+fn hwI2sEnable(enable: bool) void {
+    if (enable) {
+        reg.modifyReg(reg.IISCONFIG, 0, reg.IIS_TXFIFOEN);
+    } else {
+        reg.modifyReg(reg.IISCONFIG, reg.IIS_TXFIFOEN, 0);
+    }
+}
+
+// ============================================================
+// Timer Functions
+// ============================================================
+
+fn hwTimerStart(timer_id: u2, period_us: u32, callback: ?*const fn () void) HalError!void {
+    _ = callback; // TODO: Store callback for interrupt handler
+
+    const cfg_reg = if (timer_id == 0) reg.TIMER1_CFG else reg.TIMER2_CFG;
+    const val_reg = if (timer_id == 0) reg.TIMER1_VAL else reg.TIMER2_VAL;
+
+    reg.writeReg(u32, val_reg, period_us);
+    reg.writeReg(u32, cfg_reg, 0x80000000); // Enable timer
+}
+
+fn hwTimerStop(timer_id: u2) void {
+    const cfg_reg = if (timer_id == 0) reg.TIMER1_CFG else reg.TIMER2_CFG;
+    reg.writeReg(u32, cfg_reg, 0);
+}
+
+// ============================================================
+// ATA Functions (Stubs - full implementation needed)
+// ============================================================
+
+fn hwAtaInit() HalError!void {
+    // Enable ATA controller
+    reg.modifyReg(reg.DEV_EN, 0, reg.DEV_ATA);
+    hwDelayMs(50); // Wait for controller
+
+    ata_initialized = true;
+}
+
+fn hwAtaIdentify() HalError!AtaDeviceInfo {
+    if (!ata_initialized) return HalError.DeviceNotReady;
+
+    // TODO: Implement full ATA IDENTIFY command
+    return AtaDeviceInfo{
+        .model = [_]u8{' '} ** 40,
+        .serial = [_]u8{' '} ** 20,
+        .firmware = [_]u8{' '} ** 8,
+        .total_sectors = 0,
+        .sector_size = 512,
+        .supports_lba48 = false,
+        .supports_dma = false,
+    };
+}
+
+fn hwAtaReadSectors(lba: u64, count: u16, buffer: []u8) HalError!void {
+    if (!ata_initialized) return HalError.DeviceNotReady;
+    _ = lba;
+    _ = count;
+    _ = buffer;
+    // TODO: Implement sector read
+    return HalError.NotSupported;
+}
+
+fn hwAtaWriteSectors(lba: u64, count: u16, data: []const u8) HalError!void {
+    if (!ata_initialized) return HalError.DeviceNotReady;
+    _ = lba;
+    _ = count;
+    _ = data;
+    // TODO: Implement sector write
+    return HalError.NotSupported;
+}
+
+fn hwAtaFlush() HalError!void {
+    if (!ata_initialized) return HalError.DeviceNotReady;
+    // TODO: Implement cache flush
+}
+
+fn hwAtaStandby() HalError!void {
+    if (!ata_initialized) return HalError.DeviceNotReady;
+    // TODO: Implement standby command
+}
+
+// ============================================================
+// LCD Functions (Stubs - BCM is complex)
+// ============================================================
+
+fn hwLcdInit() HalError!void {
+    // Enable LCD device
+    reg.modifyReg(reg.DEV_EN, 0, reg.DEV_LCD);
+    hwDelayMs(10);
+
+    // TODO: BCM initialization is complex, needs firmware load
+    lcd_initialized = true;
+}
+
+fn hwLcdWritePixel(x: u16, y: u16, color: u16) void {
+    if (!lcd_initialized) return;
+    if (x >= reg.LCD_WIDTH or y >= reg.LCD_HEIGHT) return;
+
+    // TODO: Write to framebuffer
+    _ = color;
+}
+
+fn hwLcdFillRect(x: u16, y: u16, width: u16, height: u16, color: u16) void {
+    var py = y;
+    while (py < y + height and py < reg.LCD_HEIGHT) : (py += 1) {
+        var px = x;
+        while (px < x + width and px < reg.LCD_WIDTH) : (px += 1) {
+            hwLcdWritePixel(px, py, color);
+        }
+    }
+}
+
+fn hwLcdUpdate(framebuffer: []const u8) HalError!void {
+    if (!lcd_initialized) return HalError.DeviceNotReady;
+    _ = framebuffer;
+    // TODO: DMA framebuffer to BCM
+}
+
+fn hwLcdUpdateRect(x: u16, y: u16, width: u16, height: u16, framebuffer: []const u8) HalError!void {
+    if (!lcd_initialized) return HalError.DeviceNotReady;
+    _ = x;
+    _ = y;
+    _ = width;
+    _ = height;
+    _ = framebuffer;
+    // TODO: Partial BCM update
+}
+
+fn hwLcdSetBacklight(on: bool) void {
+    // TODO: PWM control for backlight via GPIO
+    _ = on;
+}
+
+fn hwLcdSleep() void {
+    // TODO: BCM sleep command
+}
+
+fn hwLcdWake() HalError!void {
+    // TODO: BCM wake
+}
+
+// ============================================================
+// Click Wheel Functions
+// ============================================================
+
+fn hwClickwheelInit() HalError!void {
+    // Enable optical device (click wheel)
+    var dev_en = reg.readReg(u32, reg.DEV_EN);
+    dev_en |= reg.DEV_OPTO;
+    reg.writeReg(u32, reg.DEV_EN, dev_en);
+
+    // Reset optical device
+    var dev_rs = reg.readReg(u32, reg.DEV_RS);
+    dev_rs |= reg.DEV_OPTO;
+    reg.writeReg(u32, reg.DEV_RS, dev_rs);
+    hwDelayUs(5);
+    dev_rs &= ~reg.DEV_OPTO;
+    reg.writeReg(u32, reg.DEV_RS, dev_rs);
+
+    // Initialize buttons
+    var dev_init = reg.readReg(u32, reg.DEV_INIT1);
+    dev_init |= reg.INIT_BUTTONS;
+    reg.writeReg(u32, reg.DEV_INIT1, dev_init);
+
+    // Configure wheel interface (from Rockbox button-clickwheel.c)
+    reg.writeReg(u32, 0x7000C100, 0xC00A1F00);
+    reg.writeReg(u32, 0x7000C104, 0x01000000);
+}
+
+fn hwClickwheelReadButtons() u8 {
+    // Read button state from GPIO or dedicated register
+    // The exact implementation depends on the iPod model
+    // For iPod Video, buttons are read via a specific interface
+    // TODO: Implement actual button reading
+    return 0;
+}
+
+fn hwClickwheelReadPosition() u8 {
+    // Read wheel position (0-95)
+    // TODO: Implement actual wheel position reading
+    return 0;
+}
+
+fn hwGetTicks() u32 {
+    // Return milliseconds since boot
+    return @truncate(hwGetTicksUs() / 1000);
+}
+
+// ============================================================
+// Cache Functions
+// ============================================================
+
+fn hwCacheInvalidateIcache() void {
+    // ARM7TDMI cache invalidation
+    asm volatile ("mcr p15, 0, %[zero], c7, c5, 0"
+        :
+        : [zero] "r" (@as(u32, 0)),
+    );
+}
+
+fn hwCacheInvalidateDcache() void {
+    // ARM7TDMI doesn't have separate D-cache control
+    hwCacheInvalidateIcache();
+}
+
+fn hwCacheFlushDcache() void {
+    // Flush via cache controller
+    reg.writeReg(u32, reg.CACHE_OPERATION, reg.CACHE_OP_FLUSH);
+    while ((reg.readReg(u32, reg.CACHE_CTL) & reg.CACHE_CTL_BUSY) != 0) {}
+}
+
+fn hwCacheEnable(enable: bool) void {
+    if (enable) {
+        // Initialize cache
+        reg.writeReg(u32, reg.CACHE_CTL, reg.CACHE_CTL_INIT);
+        reg.writeReg(u32, reg.CACHE_MASK, 0x00001C00);
+        reg.writeReg(u32, reg.CACHE_CTL, reg.CACHE_CTL_ENABLE | reg.CACHE_CTL_RUN);
+    } else {
+        reg.writeReg(u32, reg.CACHE_CTL, 0);
+    }
+}
+
+// ============================================================
+// Interrupt Functions
+// ============================================================
+
+fn hwIrqEnable() void {
+    asm volatile ("cpsie i");
+}
+
+fn hwIrqDisable() void {
+    asm volatile ("cpsid i");
+}
+
+fn hwIrqEnabled() bool {
+    var cpsr: u32 = undefined;
+    asm volatile ("mrs %[cpsr], cpsr"
+        : [cpsr] "=r" (cpsr),
+    );
+    return (cpsr & 0x80) == 0; // IRQ bit is 0 when enabled
+}
+
+var irq_handlers: [32]?*const fn () void = [_]?*const fn () void{null} ** 32;
+
+fn hwIrqRegister(irq: u8, handler: *const fn () void) void {
+    if (irq < 32) {
+        irq_handlers[irq] = handler;
+    }
+}
+
+// ============================================================
+// HAL Instance
+// ============================================================
+
+pub const hal = Hal{
+    .system_init = hwSystemInit,
+    .get_ticks_us = hwGetTicksUs,
+    .delay_us = hwDelayUs,
+    .delay_ms = hwDelayMs,
+    .sleep = hwSleep,
+    .reset = hwReset,
+
+    .gpio_set_direction = hwGpioSetDirection,
+    .gpio_write = hwGpioWrite,
+    .gpio_read = hwGpioRead,
+    .gpio_set_interrupt = hwGpioSetInterrupt,
+
+    .i2c_init = hwI2cInit,
+    .i2c_write = hwI2cWrite,
+    .i2c_read = hwI2cRead,
+    .i2c_write_read = hwI2cWriteRead,
+
+    .i2s_init = hwI2sInit,
+    .i2s_write = hwI2sWrite,
+    .i2s_tx_ready = hwI2sTxReady,
+    .i2s_tx_free_slots = hwI2sTxFreeSlots,
+    .i2s_enable = hwI2sEnable,
+
+    .timer_start = hwTimerStart,
+    .timer_stop = hwTimerStop,
+
+    .ata_init = hwAtaInit,
+    .ata_identify = hwAtaIdentify,
+    .ata_read_sectors = hwAtaReadSectors,
+    .ata_write_sectors = hwAtaWriteSectors,
+    .ata_flush = hwAtaFlush,
+    .ata_standby = hwAtaStandby,
+
+    .lcd_init = hwLcdInit,
+    .lcd_write_pixel = hwLcdWritePixel,
+    .lcd_fill_rect = hwLcdFillRect,
+    .lcd_update = hwLcdUpdate,
+    .lcd_update_rect = hwLcdUpdateRect,
+    .lcd_set_backlight = hwLcdSetBacklight,
+    .lcd_sleep = hwLcdSleep,
+    .lcd_wake = hwLcdWake,
+
+    .clickwheel_init = hwClickwheelInit,
+    .clickwheel_read_buttons = hwClickwheelReadButtons,
+    .clickwheel_read_position = hwClickwheelReadPosition,
+    .get_ticks = hwGetTicks,
+
+    .cache_invalidate_icache = hwCacheInvalidateIcache,
+    .cache_invalidate_dcache = hwCacheInvalidateDcache,
+    .cache_flush_dcache = hwCacheFlushDcache,
+    .cache_enable = hwCacheEnable,
+
+    .irq_enable = hwIrqEnable,
+    .irq_disable = hwIrqDisable,
+    .irq_enabled = hwIrqEnabled,
+    .irq_register = hwIrqRegister,
+};

@@ -1,0 +1,18 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# OS generated files
+.DS_Store
+*.swp
+*.swo
+
+# IDE files
+.idea/
+.vscode/
+*.code-workspace
+
+# Binary outputs
+*.bin
+*.elf
+*.hex
