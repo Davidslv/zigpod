@@ -36,6 +36,12 @@ pub const interrupts = struct {
     pub const timer_sim = @import("interrupts/timer_sim.zig");
 };
 
+// Export I2C device simulation modules
+pub const i2c = struct {
+    pub const wm8758_sim = @import("i2c/wm8758_sim.zig");
+    pub const pcf50605_sim = @import("i2c/pcf50605_sim.zig");
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -833,4 +839,6 @@ test {
     std.testing.refAllDecls(storage);
     // Reference interrupt modules to include their tests
     std.testing.refAllDecls(interrupts);
+    // Reference I2C device modules to include their tests
+    std.testing.refAllDecls(i2c);
 }
