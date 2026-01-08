@@ -6,6 +6,7 @@ pub const wav = @import("wav.zig");
 pub const flac = @import("flac.zig");
 pub const mp3 = @import("mp3.zig");
 pub const aiff = @import("aiff.zig");
+pub const aac = @import("aac.zig");
 
 /// Audio decoder type for runtime codec selection
 pub const DecoderType = enum {
@@ -13,6 +14,8 @@ pub const DecoderType = enum {
     flac,
     mp3,
     aiff,
+    aac,
+    m4a,
     unknown,
 };
 
@@ -22,6 +25,13 @@ pub fn detectFormat(data: []const u8) DecoderType {
     if (flac.isFlacFile(data)) return .flac;
     if (aiff.isAiffFile(data)) return .aiff;
     if (mp3.isMp3File(data)) return .mp3;
+    if (aac.isAacFile(data)) {
+        // Check if it's M4A container or raw ADTS
+        if (data.len >= 8 and std.mem.eql(u8, data[4..8], "ftyp")) {
+            return .m4a;
+        }
+        return .aac;
+    }
     return .unknown;
 }
 
@@ -32,6 +42,8 @@ pub fn getExtension(decoder_type: DecoderType) []const u8 {
         .flac => ".flac",
         .mp3 => ".mp3",
         .aiff => ".aiff",
+        .aac => ".aac",
+        .m4a => ".m4a",
         .unknown => "",
     };
 }
@@ -52,7 +64,10 @@ pub fn isSupportedExtension(ext: []const u8) bool {
         std.mem.eql(u8, lower, ".fla") or
         std.mem.eql(u8, lower, ".mp3") or
         std.mem.eql(u8, lower, ".aiff") or
-        std.mem.eql(u8, lower, ".aif");
+        std.mem.eql(u8, lower, ".aif") or
+        std.mem.eql(u8, lower, ".aac") or
+        std.mem.eql(u8, lower, ".m4a") or
+        std.mem.eql(u8, lower, ".mp4");
 }
 
 const std = @import("std");
@@ -88,6 +103,18 @@ test "detect format - aiff" {
     try std.testing.expectEqual(DecoderType.aiff, detectFormat(&aifc_data));
 }
 
+test "detect format - aac adts" {
+    // ADTS sync word 0xFFF
+    const adts_data = [_]u8{ 0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC };
+    try std.testing.expectEqual(DecoderType.aac, detectFormat(&adts_data));
+}
+
+test "detect format - m4a container" {
+    // M4A/MP4 ftyp box
+    const m4a_data = [_]u8{ 0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'M', '4', 'A', ' ' };
+    try std.testing.expectEqual(DecoderType.m4a, detectFormat(&m4a_data));
+}
+
 test "supported extensions" {
     try std.testing.expect(isSupportedExtension(".wav"));
     try std.testing.expect(isSupportedExtension(".WAV"));
@@ -97,5 +124,8 @@ test "supported extensions" {
     try std.testing.expect(isSupportedExtension(".aiff"));
     try std.testing.expect(isSupportedExtension(".aif"));
     try std.testing.expect(isSupportedExtension(".AIFF"));
+    try std.testing.expect(isSupportedExtension(".aac"));
+    try std.testing.expect(isSupportedExtension(".m4a"));
+    try std.testing.expect(isSupportedExtension(".mp4"));
     try std.testing.expect(!isSupportedExtension(".ogg"));
 }
