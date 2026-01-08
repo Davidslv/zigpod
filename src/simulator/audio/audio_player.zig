@@ -240,14 +240,18 @@ pub const AudioPlayer = struct {
         // Resample ratio
         const ratio: f64 = @as(f64, @floatFromInt(source_rate)) / @as(f64, @floatFromInt(output_rate));
 
+        // For downsampling, we need to average multiple source samples to avoid aliasing
+        // Window size should cover the samples we're skipping
+        const window_size: usize = if (ratio > 1.0) @max(2, @as(usize, @intFromFloat(ratio + 0.5))) else 2;
+
         var out_idx: usize = 0;
         while (out_idx < num_output_frames) : (out_idx += 1) {
-            // Calculate fractional source position for linear interpolation
+            // Calculate source position
             const source_pos: f64 = @as(f64, @floatFromInt(source_frame)) + @as(f64, @floatFromInt(out_idx)) * ratio;
             const target_frame: usize = @intFromFloat(source_pos);
-            const frac: f64 = source_pos - @as(f64, @floatFromInt(target_frame)); // Fractional part for interpolation
 
-            if (target_frame + 1 >= total_source_frames) {
+            // Check if we have enough samples for averaging window
+            if (target_frame + window_size >= total_source_frames) {
                 // End of track - fill rest with silence
                 const remaining = (num_output_frames - out_idx) * channels;
                 for (0..remaining) |i| {
@@ -257,46 +261,49 @@ pub const AudioPlayer = struct {
                 break;
             }
 
-            // Read source samples with linear interpolation (handle 16-bit and 24-bit)
-            const src_offset = data_start + target_frame * frame_size;
-            const next_offset = data_start + (target_frame + 1) * frame_size;
-
             for (0..channels) |ch| {
-                const sample_offset = src_offset + ch * bytes_per_sample;
-                const next_sample_offset = next_offset + ch * bytes_per_sample;
+                // Average samples over the window (acts as low-pass anti-aliasing filter)
+                var sum: i64 = 0;
+                var sample_count: usize = 0;
 
-                if (next_sample_offset + bytes_per_sample <= self.audio_data.len) {
-                    var sample1: i32 = 0;
-                    var sample2: i32 = 0;
+                for (0..window_size) |w| {
+                    const frame_idx = target_frame + w;
+                    const src_offset = data_start + frame_idx * frame_size;
+                    const sample_offset = src_offset + ch * bytes_per_sample;
 
-                    if (bytes_per_sample == 3) {
-                        // 24-bit audio: read 3 bytes, convert to 16-bit value (but keep as i32 for interpolation)
-                        const b1_0 = self.audio_data[sample_offset + 1];
-                        const b1_2 = self.audio_data[sample_offset + 2];
-                        sample1 = @as(i32, @as(i16, @bitCast((@as(u16, b1_2) << 8) | @as(u16, b1_0))));
+                    if (sample_offset + bytes_per_sample <= self.audio_data.len) {
+                        var sample: i32 = 0;
 
-                        const b2_0 = self.audio_data[next_sample_offset + 1];
-                        const b2_2 = self.audio_data[next_sample_offset + 2];
-                        sample2 = @as(i32, @as(i16, @bitCast((@as(u16, b2_2) << 8) | @as(u16, b2_0))));
-                    } else {
-                        // 16-bit audio
-                        sample1 = @as(i32, std.mem.readInt(i16, self.audio_data[sample_offset..][0..2], .little));
-                        sample2 = @as(i32, std.mem.readInt(i16, self.audio_data[next_sample_offset..][0..2], .little));
+                        if (bytes_per_sample == 3) {
+                            // 24-bit audio: read 3 bytes, use all 24 bits for averaging precision
+                            const b0 = self.audio_data[sample_offset];
+                            const b1 = self.audio_data[sample_offset + 1];
+                            const b2 = self.audio_data[sample_offset + 2];
+                            // Sign-extend 24-bit to 32-bit, then scale to 16-bit range
+                            const val24: i32 = @bitCast((@as(u32, b2) << 24) | (@as(u32, b1) << 16) | (@as(u32, b0) << 8));
+                            sample = @divTrunc(val24, 256); // Scale 24-bit to 16-bit equivalent
+                        } else {
+                            // 16-bit audio
+                            sample = @as(i32, std.mem.readInt(i16, self.audio_data[sample_offset..][0..2], .little));
+                        }
+
+                        sum += sample;
+                        sample_count += 1;
                     }
-
-                    // Linear interpolation between samples to eliminate aliasing
-                    const interpolated: i32 = sample1 + @as(i32, @intFromFloat(@as(f64, @floatFromInt(sample2 - sample1)) * frac));
-
-                    // Apply volume
-                    var final_sample: i32 = interpolated;
-                    if (self.volume < 100) {
-                        final_sample = @divTrunc(interpolated * self.volume, 100);
-                    }
-
-                    output_samples[out_idx * channels + ch] = @intCast(std.math.clamp(final_sample, -32768, 32767));
-                } else {
-                    output_samples[out_idx * channels + ch] = 0;
                 }
+
+                // Calculate averaged sample
+                var final_sample: i32 = if (sample_count > 0)
+                    @intCast(@divTrunc(sum, @as(i64, @intCast(sample_count))))
+                else
+                    0;
+
+                // Apply volume
+                if (self.volume < 100) {
+                    final_sample = @divTrunc(final_sample * self.volume, 100);
+                }
+
+                output_samples[out_idx * channels + ch] = @intCast(std.math.clamp(final_sample, -32768, 32767));
             }
         }
 
