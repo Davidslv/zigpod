@@ -42,6 +42,11 @@ pub const i2c = struct {
     pub const pcf50605_sim = @import("i2c/pcf50605_sim.zig");
 };
 
+// Export audio simulation modules
+pub const audio = struct {
+    pub const wav_writer = @import("audio/wav_writer.zig");
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -841,4 +846,6 @@ test {
     std.testing.refAllDecls(interrupts);
     // Reference I2C device modules to include their tests
     std.testing.refAllDecls(i2c);
+    // Reference audio modules to include their tests
+    std.testing.refAllDecls(audio);
 }
