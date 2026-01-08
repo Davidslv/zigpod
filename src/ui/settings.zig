@@ -8,6 +8,7 @@ const ui = @import("ui.zig");
 const lcd = @import("../drivers/display/lcd.zig");
 const audio = @import("../audio/audio.zig");
 const codec = @import("../drivers/audio/codec.zig");
+const theme_loader = @import("theme_loader.zig");
 
 // ============================================================
 // Settings Storage
@@ -17,7 +18,7 @@ pub const Settings = struct {
     // Display settings
     brightness: u8 = 80, // 0-100
     backlight_timeout: u16 = 30, // seconds, 0 = always on
-    theme: ThemeChoice = .light,
+    theme_index: u8 = 0, // Index into ThemeRegistry (0=light, 1=dark, 2+=custom)
 
     // Audio settings
     volume: i16 = -10, // dB (-89 to +6)
@@ -30,7 +31,7 @@ pub const Settings = struct {
     // Playback settings
     shuffle: bool = false,
     repeat: RepeatMode = .off,
-    crossfade: u8 = 0, // seconds, 0 = off
+    gapless: bool = true, // Enable gapless playback
     replay_gain: ReplayGainMode = .off,
 
     // System settings
@@ -47,14 +48,17 @@ pub const Settings = struct {
         _ = self.treble_cutoff;
     }
 
-    // Apply display settings
+    // Apply display settings using theme registry
     pub fn applyDisplaySettings(self: *const Settings) void {
         // TODO: Implement LCD brightness control when hardware supports it
         _ = self.brightness;
-        switch (self.theme) {
-            .light => ui.setTheme(ui.default_theme),
-            .dark => ui.setTheme(ui.dark_theme),
-        }
+        // Apply theme from registry
+        theme_loader.getRegistry().selectTheme(self.theme_index);
+    }
+
+    /// Get current theme name for display
+    pub fn getThemeName(self: *const Settings) []const u8 {
+        return theme_loader.getRegistry().getThemeName(self.theme_index);
     }
 };
 
@@ -340,6 +344,101 @@ pub fn drawAboutScreen() void {
     ui.drawFooter("Menu: Back");
 }
 
+/// Draw theme selector screen
+pub fn drawThemeSelector(selected_idx: u8) void {
+    const theme = ui.getTheme();
+    const registry = theme_loader.getRegistry();
+    const count = registry.getThemeCount();
+    const current_idx = registry.getSelectedIndex();
+
+    lcd.clear(theme.background);
+    ui.drawHeader("Select Theme");
+
+    // Calculate visible range
+    const max_visible = ui.MAX_VISIBLE_ITEMS;
+    const visible_start: u8 = if (selected_idx >= max_visible) selected_idx - max_visible + 1 else 0;
+
+    var i: u8 = 0;
+    while (i < max_visible and visible_start + i < count) : (i += 1) {
+        const idx = visible_start + i;
+        const y: u16 = ui.CONTENT_START_Y + @as(u16, i) * ui.MENU_ITEM_HEIGHT;
+        const is_selected = idx == selected_idx;
+
+        const bg = if (is_selected) theme.selected_bg else theme.background;
+        const fg = if (is_selected) theme.selected_fg else theme.foreground;
+
+        // Draw item background
+        lcd.fillRect(0, y, ui.SCREEN_WIDTH, ui.MENU_ITEM_HEIGHT, bg);
+
+        // Draw theme name
+        const name = registry.getThemeName(idx);
+        lcd.drawString(10, y + 6, name, fg, bg);
+
+        // Draw checkmark for currently active theme
+        if (idx == current_idx) {
+            lcd.drawString(ui.SCREEN_WIDTH - 24, y + 6, "*", theme.accent, bg);
+        }
+
+        // Show custom indicator for non-built-in themes
+        if (idx >= theme_loader.ThemeRegistry.BUILTIN_COUNT) {
+            lcd.drawString(ui.SCREEN_WIDTH - 48, y + 6, "[C]", theme.disabled, bg);
+        }
+    }
+
+    // Scroll indicators
+    if (visible_start > 0) {
+        lcd.drawString(ui.SCREEN_WIDTH - 16, ui.CONTENT_START_Y, "^", theme.accent, null);
+    }
+    if (visible_start + max_visible < count) {
+        lcd.drawString(ui.SCREEN_WIDTH - 16, ui.SCREEN_HEIGHT - ui.FOOTER_HEIGHT - 12, "v", theme.accent, null);
+    }
+
+    ui.drawFooter("Wheel: Browse  Select: Apply");
+}
+
+/// Theme selector state
+pub const ThemeSelectorState = struct {
+    selected_idx: u8 = 0,
+    applied: bool = false,
+
+    pub fn init() ThemeSelectorState {
+        return .{
+            .selected_idx = theme_loader.getRegistry().getSelectedIndex(),
+        };
+    }
+
+    /// Handle input, returns true if should exit
+    pub fn handleInput(self: *ThemeSelectorState, wheel_delta: i8, select_pressed: bool, back_pressed: bool) bool {
+        const registry = theme_loader.getRegistry();
+        const count = registry.getThemeCount();
+
+        // Handle wheel navigation
+        if (wheel_delta > 0) {
+            if (self.selected_idx < count - 1) {
+                self.selected_idx += 1;
+            }
+        } else if (wheel_delta < 0) {
+            if (self.selected_idx > 0) {
+                self.selected_idx -= 1;
+            }
+        }
+
+        // Handle select - apply theme
+        if (select_pressed) {
+            selectTheme(self.selected_idx);
+            self.applied = true;
+            return true;
+        }
+
+        // Handle back - exit without applying
+        if (back_pressed) {
+            return true;
+        }
+
+        return false;
+    }
+};
+
 /// Draw reset confirmation
 pub fn drawResetConfirmation(selected: bool) void {
     const theme = ui.getTheme();
@@ -419,11 +518,42 @@ pub fn cycleRepeat() void {
     settings.repeat = settings.repeat.next();
 }
 
-/// Cycle theme
+/// Cycle to next theme (built-in + custom)
 pub fn cycleTheme() void {
     const settings = getSettings();
-    settings.theme = settings.theme.next();
+    const registry = theme_loader.getRegistry();
+    const count = registry.getThemeCount();
+    settings.theme_index = (settings.theme_index + 1) % count;
     settings.applyDisplaySettings();
+}
+
+/// Cycle to previous theme
+pub fn cyclePrevTheme() void {
+    const settings = getSettings();
+    const registry = theme_loader.getRegistry();
+    const count = registry.getThemeCount();
+    if (settings.theme_index == 0) {
+        settings.theme_index = count - 1;
+    } else {
+        settings.theme_index -= 1;
+    }
+    settings.applyDisplaySettings();
+}
+
+/// Select theme by index
+pub fn selectTheme(index: u8) void {
+    const settings = getSettings();
+    const registry = theme_loader.getRegistry();
+    if (index < registry.getThemeCount()) {
+        settings.theme_index = index;
+        settings.applyDisplaySettings();
+    }
+}
+
+/// Toggle gapless playback
+pub fn toggleGapless() void {
+    const settings = getSettings();
+    settings.gapless = !settings.gapless;
 }
 
 /// Reset all settings to defaults
@@ -437,12 +567,17 @@ pub fn resetToDefaults() void {
 // Tests
 // ============================================================
 
-test "theme cycling" {
-    var theme = ThemeChoice.light;
-    theme = theme.next();
-    try std.testing.expectEqual(ThemeChoice.dark, theme);
-    theme = theme.next();
-    try std.testing.expectEqual(ThemeChoice.light, theme);
+test "theme cycling with registry" {
+    // Reset to defaults for testing
+    current_settings = Settings{};
+    try std.testing.expectEqual(@as(u8, 0), current_settings.theme_index);
+
+    // Cycle through built-in themes (at minimum light and dark)
+    cycleTheme();
+    try std.testing.expectEqual(@as(u8, 1), current_settings.theme_index);
+
+    cycleTheme();
+    try std.testing.expectEqual(@as(u8, 0), current_settings.theme_index);
 }
 
 test "repeat mode cycling" {
@@ -459,7 +594,9 @@ test "settings defaults" {
     const settings = Settings{};
     try std.testing.expectEqual(@as(u8, 80), settings.brightness);
     try std.testing.expectEqual(@as(i16, -10), settings.volume);
+    try std.testing.expectEqual(@as(u8, 0), settings.theme_index);
     try std.testing.expect(!settings.shuffle);
+    try std.testing.expect(settings.gapless);
 }
 
 test "volume clamping" {
