@@ -209,107 +209,155 @@ Main Menu
 
 ### 3.1 Library Database
 
-#### Storage Location
+> **Design Decision**: We use a binary database format inspired by Apple's iTunesDB rather than SQLite.
+>
+> **Why not SQLite?**
+> - SQLite requires ~200KB+ of code (SQL parser, query planner, B-tree engine)
+> - Higher memory overhead for query processing
+> - Overkill for a music library with known, fixed queries
+> - The original iPod ran successfully for 15+ years with iTunesDB
+>
+> **Benefits of binary format:**
+> - Smaller code footprint (~10KB vs 200KB+)
+> - Direct memory-mapped access
+> - Predictable performance (no query planning)
+> - Compatible with existing iPod ecosystem
+
+#### Storage Location (iTunes-Compatible)
 ```
-/Music/
-├── ZigPod/
-│   ├── library.db          # SQLite database
-│   ├── artwork/            # Cached album art
-│   │   ├── {hash}.art      # 100x100 RGB565
-│   │   └── thumbs/         # 50x50 thumbnails
-│   ├── playlists/
-│   │   ├── on-the-go.m3u
-│   │   └── *.m3u
-│   └── state/
-│       ├── now_playing.dat
-│       └── play_counts.dat
-└── [User's music files]
+/iPod_Control/
+├── iTunes/
+│   ├── iTunesDB           # Main track/playlist database (binary)
+│   ├── iTunesSD           # Shuffle database (if needed)
+│   ├── ArtworkDB          # Album artwork database
+│   └── DeviceInfo         # Device identification
+├── Music/
+│   ├── F00/               # Music files (obfuscated names)
+│   ├── F01/               # Distributed across ~50 folders
+│   ├── ...
+│   └── F49/
+└── Artwork/
+    └── Cache/             # Processed artwork cache
 ```
 
-#### Database Schema
-```sql
--- Tracks table
-CREATE TABLE tracks (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    title TEXT,
-    artist TEXT,
-    album TEXT,
-    album_artist TEXT,
-    genre TEXT,
-    composer TEXT,
-    year INTEGER,
-    track_number INTEGER,
-    disc_number INTEGER,
-    duration_ms INTEGER,
-    file_size INTEGER,
-    bitrate INTEGER,
-    sample_rate INTEGER,
-    format TEXT,
-    artwork_hash TEXT,
-    play_count INTEGER DEFAULT 0,
-    last_played INTEGER,
-    rating INTEGER DEFAULT 0,
-    added_date INTEGER,
-    modified_date INTEGER
-);
+#### iTunesDB Binary Format
 
--- Albums table (derived, cached)
-CREATE TABLE albums (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    artist TEXT,
-    year INTEGER,
-    track_count INTEGER,
-    artwork_hash TEXT,
-    UNIQUE(name, artist)
-);
+The database uses a hierarchical object structure with 4-byte magic headers:
 
--- Artists table (derived, cached)
-CREATE TABLE artists (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    album_count INTEGER,
-    track_count INTEGER
-);
+```
+┌─────────────────────────────────────────────────────────┐
+│ mhbd (Database Header)                                  │
+│   ├── Header size, version, track count                 │
+│   │                                                     │
+│   ├── mhsd (Data Set - Tracks)                         │
+│   │   └── mhlt (Track List)                            │
+│   │       ├── mhit (Track 1)                           │
+│   │       │   ├── mhod (Title string)                  │
+│   │       │   ├── mhod (Artist string)                 │
+│   │       │   ├── mhod (Album string)                  │
+│   │       │   └── mhod (Path string)                   │
+│   │       ├── mhit (Track 2)                           │
+│   │       │   └── ...                                  │
+│   │       └── ...                                      │
+│   │                                                     │
+│   └── mhsd (Data Set - Playlists)                      │
+│       └── mhlp (Playlist List)                         │
+│           ├── mhyp (Master Playlist)                   │
+│           │   └── mhip (Track references)              │
+│           └── mhyp (User Playlist)                     │
+│               └── mhip (Track references)              │
+└─────────────────────────────────────────────────────────┘
+```
 
--- Playlists table
-CREATE TABLE playlists (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    track_count INTEGER,
-    duration_ms INTEGER,
-    created_date INTEGER,
-    modified_date INTEGER
-);
+#### Zig Structure Definitions
 
--- Playlist tracks
-CREATE TABLE playlist_tracks (
-    playlist_id INTEGER,
-    track_id INTEGER,
-    position INTEGER,
-    FOREIGN KEY(playlist_id) REFERENCES playlists(id),
-    FOREIGN KEY(track_id) REFERENCES tracks(id)
-);
+```zig
+/// Database header (mhbd)
+pub const DbHeader = extern struct {
+    magic: [4]u8 = "mhbd".*,     // Magic identifier
+    header_size: u32,            // Size of this header
+    total_size: u32,             // Total database size
+    version: u32,                // Database version
+    child_count: u32,            // Number of mhsd children
+    id: u64,                     // Database ID
+    // ... padding to header_size
+};
 
--- Indexes for fast lookup
-CREATE INDEX idx_tracks_artist ON tracks(artist);
-CREATE INDEX idx_tracks_album ON tracks(album);
-CREATE INDEX idx_tracks_genre ON tracks(genre);
-CREATE INDEX idx_tracks_title ON tracks(title);
+/// Track item (mhit)
+pub const TrackItem = extern struct {
+    magic: [4]u8 = "mhit".*,
+    header_size: u32,
+    total_size: u32,
+    string_count: u32,           // Number of mhod children
+    track_id: u32,               // Unique track ID
+    visible: u32,                // 1 = visible in library
+    file_type: u32,              // MP3, AAC, etc.
+    duration_ms: u32,
+    bitrate: u32,
+    sample_rate: u32,
+    year: u16,
+    track_number: u16,
+    disc_number: u16,
+    rating: u8,                  // 0-100
+    play_count: u32,
+    last_played: u32,            // Mac timestamp
+    added_date: u32,
+    file_size: u32,
+    // ... additional fields
+};
+
+/// String data (mhod)
+pub const StringData = extern struct {
+    magic: [4]u8 = "mhod".*,
+    header_size: u32,
+    total_size: u32,
+    string_type: u32,            // 1=title, 2=path, 3=album, 4=artist...
+    // Followed by UTF-16LE string data
+};
+```
+
+#### String Types (mhod)
+| Type | Value | Description |
+|------|-------|-------------|
+| Title | 1 | Track title |
+| Location | 2 | File path (iPod format) |
+| Album | 3 | Album name |
+| Artist | 4 | Artist name |
+| Genre | 5 | Genre |
+| Comment | 6 | Comment |
+| Composer | 12 | Composer name |
+| Album Artist | 22 | Album artist |
+
+#### Database Operations
+
+```zig
+pub const ItunesDb = struct {
+    data: []align(4) u8,         // Memory-mapped file
+    track_index: []u32,          // Offset to each mhit
+
+    pub fn open(path: []const u8) !ItunesDb;
+    pub fn getTrackCount(self: *ItunesDb) u32;
+    pub fn getTrack(self: *ItunesDb, id: u32) ?*TrackItem;
+    pub fn getTrackString(self: *ItunesDb, track: *TrackItem, string_type: u32) ?[]const u16;
+    pub fn iterateTracks(self: *ItunesDb) TrackIterator;
+
+    // Playlist operations
+    pub fn getPlaylistCount(self: *ItunesDb) u32;
+    pub fn getPlaylistTracks(self: *ItunesDb, playlist_id: u32) []u32;
+};
 ```
 
 ### 3.2 Library Scanning
 
 #### Scan Process
-1. Walk `/Music/` directory recursively
+1. Walk `/iPod_Control/Music/` directory recursively
 2. For each supported file:
-   - Parse metadata (ID3, Vorbis, FLAC tags)
+   - Parse metadata (ID3v2 for MP3, iTunes atoms for M4A/AAC, AIFF/WAV chunks)
    - Extract embedded artwork (if present)
    - Generate artwork hash
-   - Insert/update database
+   - Insert/update iTunesDB
 3. Remove entries for deleted files
-4. Rebuild derived tables (albums, artists)
+4. Rebuild master playlist
 5. Update statistics
 
 #### Incremental Updates
@@ -432,27 +480,36 @@ Track B decoding      ────────────────┼──�
 
 ## 5. Supported Formats
 
+> **Note**: These formats match the original iPod Classic specifications exactly.
+> See [Apple's official specs](https://support.apple.com/en-us/112601) for reference.
+
 ### 5.1 Audio Formats
 
-| Format | Extensions | Max Bitrate | Sample Rates | Notes |
-|--------|------------|-------------|--------------|-------|
-| MP3 | .mp3 | 320 kbps | 8-48 kHz | MPEG-1/2 Layer III |
-| AAC | .m4a, .aac | 320 kbps | 8-48 kHz | LC-AAC only |
-| FLAC | .flac | Lossless | 8-96 kHz | Up to 24-bit |
-| ALAC | .m4a | Lossless | 8-96 kHz | Apple Lossless |
-| WAV | .wav | Uncompressed | 8-96 kHz | PCM only |
-| Ogg Vorbis | .ogg | 500 kbps | 8-48 kHz | |
-| WMA | .wma | 320 kbps | 8-48 kHz | Non-DRM only |
+| Format | Extensions | Bitrate | Sample Rates | Notes |
+|--------|------------|---------|--------------|-------|
+| **AAC** | .m4a, .aac | 8-320 kbps | 8-48 kHz | LC-AAC, includes Protected AAC |
+| **MP3** | .mp3 | 8-320 kbps | 8-48 kHz | MPEG-1/2 Layer III, VBR supported |
+| **Apple Lossless** | .m4a | Lossless | 8-48 kHz | Up to 24-bit/48kHz max |
+| **AIFF** | .aiff, .aif | Uncompressed | 8-48 kHz | PCM audio |
+| **WAV** | .wav | Uncompressed | 8-48 kHz | PCM audio |
+| **Audible** | .aa, .aax | Variable | 22-44 kHz | Audiobook formats 2, 3, 4, AAX |
+
+#### Formats NOT Supported (by design)
+| Format | Reason |
+|--------|--------|
+| FLAC | Not supported by original iPod hardware/firmware |
+| Ogg Vorbis | Not supported by original iPod |
+| WMA | Not supported by original iPod (requires license) |
+| MPEG-1/2 Layer I/II | Only Layer III (MP3) supported |
 
 ### 5.2 Metadata Formats
 
 | Container | Tag Format |
 |-----------|------------|
 | MP3 | ID3v1, ID3v2.3, ID3v2.4 |
-| M4A/AAC | iTunes metadata atoms |
-| FLAC | Vorbis comments |
-| OGG | Vorbis comments |
-| WAV | INFO chunk, ID3 |
+| M4A/AAC/ALAC | iTunes metadata atoms (moov/udta/meta) |
+| AIFF | ID3v2, AIFF chunks |
+| WAV | INFO chunk (RIFF), ID3v2 |
 
 ### 5.3 Playlist Formats
 
