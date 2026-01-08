@@ -1,0 +1,32 @@
+; Nord Theme
+; Arctic, north-bluish color palette
+; Inspired by the popular Nord color scheme
+;
+; ZigPod Community Theme
+
+[theme]
+name=Nord
+author=ZigPod Community
+
+[colors]
+; Polar night background
+background=46,52,64
+foreground=216,222,233
+
+; Darker polar night header
+header_bg=36,40,50
+header_fg=229,233,240
+
+; Frost blue selection
+selected_bg=94,129,172
+selected_fg=236,239,244
+
+; Dark footer
+footer_bg=36,40,50
+footer_fg=180,190,205
+
+; Aurora frost accent
+accent=136,192,208
+
+; Muted polar for disabled
+disabled=100,110,130

@@ -1,0 +1,32 @@
+; Solarized Dark Theme
+; Precision colors for machines and people
+; Inspired by Ethan Schoonover's Solarized
+;
+; ZigPod Community Theme
+
+[theme]
+name=Solarized Dark
+author=ZigPod Community
+
+[colors]
+; Base03 background
+background=0,43,54
+foreground=131,148,150
+
+; Base02 header
+header_bg=7,54,66
+header_fg=147,161,161
+
+; Blue selection
+selected_bg=38,139,210
+selected_fg=253,246,227
+
+; Dark footer
+footer_bg=7,54,66
+footer_fg=101,123,131
+
+; Cyan accent
+accent=42,161,152
+
+; Base01 for disabled
+disabled=88,110,117

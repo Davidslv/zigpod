@@ -1,0 +1,32 @@
+; Retro Green Theme
+; Classic terminal/matrix style with phosphor green on black
+;
+; ZigPod Community Theme
+; Feel free to modify and share!
+
+[theme]
+name=Retro Green
+author=ZigPod Community
+
+[colors]
+; Main colors
+background=0,0,0
+foreground=0,255,0
+
+; Header bar
+header_bg=0,40,0
+header_fg=0,255,0
+
+; Selected item highlight
+selected_bg=0,180,0
+selected_fg=0,0,0
+
+; Footer/status bar
+footer_bg=0,40,0
+footer_fg=0,180,0
+
+; Accent color (progress bars, icons)
+accent=0,255,0
+
+; Disabled/inactive items
+disabled=0,80,0

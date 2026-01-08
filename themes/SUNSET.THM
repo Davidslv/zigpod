@@ -1,0 +1,31 @@
+; Sunset Theme
+; Warm orange and purple tones
+;
+; ZigPod Community Theme
+
+[theme]
+name=Sunset
+author=ZigPod Community
+
+[colors]
+; Dark purple background
+background=25,15,35
+foreground=255,220,180
+
+; Deep magenta header
+header_bg=80,20,60
+header_fg=255,200,150
+
+; Warm orange selection
+selected_bg=230,120,50
+selected_fg=255,255,255
+
+; Purple footer
+footer_bg=60,20,50
+footer_fg=220,180,200
+
+; Bright orange accent
+accent=255,140,0
+
+; Muted mauve for disabled
+disabled=120,90,110

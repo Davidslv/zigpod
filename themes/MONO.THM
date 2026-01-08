@@ -1,0 +1,32 @@
+; Monochrome Theme
+; Clean grayscale aesthetic
+;
+; ZigPod Community Theme
+; Simple and elegant
+
+[theme]
+name=Monochrome
+author=ZigPod Community
+
+[colors]
+; Light gray background
+background=245,245,245
+foreground=30,30,30
+
+; Dark header
+header_bg=40,40,40
+header_fg=240,240,240
+
+; Medium gray selection
+selected_bg=80,80,80
+selected_fg=255,255,255
+
+; Matching dark footer
+footer_bg=50,50,50
+footer_fg=200,200,200
+
+; Black accent
+accent=0,0,0
+
+; Light gray for disabled
+disabled=160,160,160

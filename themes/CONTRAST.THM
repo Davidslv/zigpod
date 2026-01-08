@@ -1,0 +1,32 @@
+; High Contrast Theme
+; Maximum readability for accessibility
+;
+; ZigPod Community Theme
+; Designed for users who need high visibility
+
+[theme]
+name=High Contrast
+author=Accessibility Team
+
+[colors]
+; Pure black background for maximum contrast
+background=0,0,0
+foreground=255,255,255
+
+; Bold blue header
+header_bg=0,0,180
+header_fg=255,255,0
+
+; Yellow on black selection - highly visible
+selected_bg=255,255,0
+selected_fg=0,0,0
+
+; Footer matches header
+footer_bg=0,0,180
+footer_fg=255,255,255
+
+; Bright accent
+accent=255,255,0
+
+; Gray for disabled (still readable)
+disabled=160,160,160

@@ -1,0 +1,31 @@
+; Coffee Theme
+; Warm brown tones for a cozy feel
+;
+; ZigPod Community Theme
+
+[theme]
+name=Coffee
+author=ZigPod Community
+
+[colors]
+; Cream background
+background=250,240,230
+foreground=60,40,30
+
+; Dark roast header
+header_bg=70,45,30
+header_fg=250,235,220
+
+; Caramel selection
+selected_bg=180,120,60
+selected_fg=255,255,255
+
+; Espresso footer
+footer_bg=55,35,25
+footer_fg=210,190,170
+
+; Rich brown accent
+accent=140,80,40
+
+; Faded brown for disabled
+disabled=170,150,130

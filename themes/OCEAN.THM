@@ -1,0 +1,31 @@
+; Ocean Blue Theme
+; Calm, modern aesthetic inspired by the sea
+;
+; ZigPod Community Theme
+
+[theme]
+name=Ocean Blue
+author=ZigPod Community
+
+[colors]
+; Soft off-white background
+background=240,248,255
+foreground=20,40,80
+
+; Deep ocean blue header
+header_bg=25,55,95
+header_fg=255,255,255
+
+; Sky blue selection
+selected_bg=100,149,237
+selected_fg=255,255,255
+
+; Matching footer
+footer_bg=25,55,95
+footer_fg=200,220,255
+
+; Coral accent for contrast
+accent=65,105,225
+
+; Muted blue-gray for disabled
+disabled=140,160,180
