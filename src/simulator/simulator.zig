@@ -11,6 +11,9 @@
 const std = @import("std");
 const hal = @import("../hal/hal.zig");
 
+// Export terminal UI module
+pub const terminal_ui = @import("terminal_ui.zig");
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
