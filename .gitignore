@@ -17,4 +17,10 @@ zig-out/
 *.elf
 *.hex
 
-audio-samples/
+# Audio samples - exclude large source files, include test files
+audio-samples/*.dsf
+audio-samples/*.wav
+audio-samples/*.aiff
+audio-samples/*.flac
+audio-samples/*.mp3
+audio-samples/.DS_Store
