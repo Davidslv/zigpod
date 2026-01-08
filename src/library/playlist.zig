@@ -386,6 +386,8 @@ pub fn isPlaylistExtension(filename: []const u8) bool {
         std.mem.eql(u8, lower, ".pls");
 }
 
+var toLowerBuffer: [16]u8 = undefined;
+
 fn toLowerExtension(filename: []const u8) []const u8 {
     // Find last dot
     var last_dot: ?usize = null;
@@ -394,7 +396,12 @@ fn toLowerExtension(filename: []const u8) []const u8 {
     }
 
     if (last_dot) |dot| {
-        return filename[dot..];
+        const ext = filename[dot..];
+        const len = @min(ext.len, toLowerBuffer.len);
+        for (ext[0..len], 0..) |c, i| {
+            toLowerBuffer[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        return toLowerBuffer[0..len];
     }
     return "";
 }

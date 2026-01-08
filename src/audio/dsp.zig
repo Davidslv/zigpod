@@ -22,6 +22,12 @@ pub const MIN_GAIN_DB: i8 = -12;
 /// Sample rate (assumed 44100 Hz)
 pub const SAMPLE_RATE: u32 = 44100;
 
+/// Stereo sample pair used throughout DSP processing
+pub const StereoSample = struct {
+    left: i16,
+    right: i16,
+};
+
 // ============================================================
 // Equalizer Band
 // ============================================================
@@ -117,7 +123,7 @@ pub const EqBand = struct {
     }
 
     /// Process a single stereo sample through the filter
-    pub fn process(self: *EqBand, left: i16, right: i16) struct { left: i16, right: i16 } {
+    pub fn process(self: *EqBand, left: i16, right: i16) StereoSample {
         // Left channel
         const x_l: i32 = left;
         var y_l: i64 = @as(i64, self.a0) * x_l;
@@ -240,7 +246,7 @@ pub const Equalizer = struct {
     }
 
     /// Process a stereo sample pair
-    pub fn process(self: *Equalizer, left: i16, right: i16) struct { left: i16, right: i16 } {
+    pub fn process(self: *Equalizer, left: i16, right: i16) StereoSample {
         if (!self.enabled) {
             return .{ .left = left, .right = right };
         }
@@ -325,7 +331,7 @@ pub const StereoWidener = struct {
     }
 
     /// Process a stereo sample pair
-    pub fn process(self: *const StereoWidener, left: i16, right: i16) struct { left: i16, right: i16 } {
+    pub fn process(self: *const StereoWidener, left: i16, right: i16) StereoSample {
         if (!self.enabled or self.width == 0x10000) {
             return .{ .left = left, .right = right };
         }
@@ -396,7 +402,7 @@ pub const BassBoost = struct {
         self.alpha = @intCast(@divTrunc(cutoff_fp * 6, SAMPLE_RATE));
     }
 
-    pub fn process(self: *BassBoost, left: i16, right: i16) struct { left: i16, right: i16 } {
+    pub fn process(self: *BassBoost, left: i16, right: i16) StereoSample {
         if (!self.enabled or self.boost_db == 0) {
             return .{ .left = left, .right = right };
         }
@@ -440,7 +446,7 @@ pub const DspChain = struct {
     }
 
     /// Process a stereo sample through the entire DSP chain
-    pub fn process(self: *DspChain, left: i16, right: i16) struct { left: i16, right: i16 } {
+    pub fn process(self: *DspChain, left: i16, right: i16) StereoSample {
         if (!self.enabled) {
             return .{ .left = left, .right = right };
         }
@@ -484,33 +490,34 @@ pub const DspChain = struct {
 fn dbToLinear(db: i8) i32 {
     if (db == 0) return 0x10000; // 1.0
 
-    // Lookup table for common values
+    // Lookup table for common values (Q16.16 fixed point, 0x10000 = 1.0)
+    // Formula: round(10^(dB/20) * 65536)
     const db_table = [_]i32{
-        0x0411,  // -12 dB = 0.251
-        0x0521,  // -11 dB = 0.282
-        0x0673,  // -10 dB = 0.316
-        0x0804,  // -9 dB = 0.355
-        0x0A12,  // -8 dB = 0.398
-        0x0CB6,  // -7 dB = 0.447
-        0x1000,  // -6 dB = 0.501
-        0x143D,  // -5 dB = 0.562
-        0x1959,  // -4 dB = 0.631
-        0x1FD9,  // -3 dB = 0.708
-        0x287A,  // -2 dB = 0.794
-        0x32F5,  // -1 dB = 0.891
+        0x4027,  // -12 dB = 0.251
+        0x47FB,  // -11 dB = 0.282
+        0x50C3,  // -10 dB = 0.316
+        0x5AB0,  // -9 dB = 0.355
+        0x65EA,  // -8 dB = 0.398
+        0x72A5,  // -7 dB = 0.447
+        0x8000,  // -6 dB = 0.501
+        0x8F9E,  // -5 dB = 0.562
+        0xA124,  // -4 dB = 0.631
+        0xB4CE,  // -3 dB = 0.708
+        0xCADD,  // -2 dB = 0.794
+        0xE39E,  // -1 dB = 0.891
         0x10000, // 0 dB = 1.0
-        0x14A0,  // +1 dB = 1.122 (shifted to use same table)
-        0x1A36,  // +2 dB = 1.259
-        0x2109,  // +3 dB = 1.413
-        0x2999,  // +4 dB = 1.585
-        0x346D,  // +5 dB = 1.778
-        0x4000,  // +6 dB = 1.995
-        0x5082,  // +7 dB = 2.239
-        0x65A5,  // +8 dB = 2.512
-        0x7FF6,  // +9 dB = 2.818
-        0xA12D,  // +10 dB = 3.162
-        0xCB63,  // +11 dB = 3.548
-        0x10000, // +12 dB = 3.981 (clamped for safety)
+        0x11F60, // +1 dB = 1.122
+        0x14249, // +2 dB = 1.259
+        0x16C31, // +3 dB = 1.413
+        0x19B8C, // +4 dB = 1.585
+        0x1D2F7, // +5 dB = 1.778
+        0x1FEDF, // +6 dB = 1.995
+        0x23BC1, // +7 dB = 2.239
+        0x28185, // +8 dB = 2.512
+        0x2D4EF, // +9 dB = 2.818
+        0x32D64, // +10 dB = 3.162
+        0x39178, // +11 dB = 3.548
+        0x3FFF0, // +12 dB = 3.981
     };
 
     const idx = @as(usize, @intCast(@as(i32, db) + 12));

@@ -13,6 +13,9 @@ const clickwheel = @import("../drivers/input/clickwheel.zig");
 const audio = @import("../audio/audio.zig");
 const ui = @import("../ui/ui.zig");
 const simulator = @import("../simulator/simulator.zig");
+const power = @import("../drivers/power.zig");
+const bootloader = @import("../kernel/bootloader.zig");
+const library = @import("../library/library.zig");
 
 // ============================================================
 // Test Helpers
@@ -419,4 +422,291 @@ test "menu navigation with wheel simulation" {
 
     // Draw the menu
     ui.drawMenu(&main_menu);
+}
+
+// ============================================================
+// Audio Decoder Integration Tests
+// ============================================================
+
+test "audio decoder format detection" {
+    // WAV
+    const wav_header = [_]u8{ 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E' };
+    try std.testing.expectEqual(audio.decoders.DecoderType.wav, audio.decoders.detectFormat(&wav_header));
+
+    // FLAC
+    const flac_header = [_]u8{ 'f', 'L', 'a', 'C', 0, 0, 0, 0 };
+    try std.testing.expectEqual(audio.decoders.DecoderType.flac, audio.decoders.detectFormat(&flac_header));
+
+    // MP3 (ID3v2)
+    const mp3_id3 = [_]u8{ 'I', 'D', '3', 0x04, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(audio.decoders.DecoderType.mp3, audio.decoders.detectFormat(&mp3_id3));
+
+    // AIFF
+    const aiff_header = [_]u8{ 'F', 'O', 'R', 'M', 0, 0, 0, 0, 'A', 'I', 'F', 'F' };
+    try std.testing.expectEqual(audio.decoders.DecoderType.aiff, audio.decoders.detectFormat(&aiff_header));
+
+    // Unknown
+    const unknown = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(audio.decoders.DecoderType.unknown, audio.decoders.detectFormat(&unknown));
+}
+
+test "audio supported extensions" {
+    try std.testing.expect(audio.decoders.isSupportedExtension(".wav"));
+    try std.testing.expect(audio.decoders.isSupportedExtension(".WAV"));
+    try std.testing.expect(audio.decoders.isSupportedExtension(".flac"));
+    try std.testing.expect(audio.decoders.isSupportedExtension(".mp3"));
+    try std.testing.expect(audio.decoders.isSupportedExtension(".MP3"));
+    try std.testing.expect(audio.decoders.isSupportedExtension(".aiff"));
+    try std.testing.expect(audio.decoders.isSupportedExtension(".aif"));
+    try std.testing.expect(!audio.decoders.isSupportedExtension(".ogg"));
+    try std.testing.expect(!audio.decoders.isSupportedExtension(".wma"));
+}
+
+// ============================================================
+// DSP Integration Tests
+// ============================================================
+
+test "dsp equalizer with presets" {
+    var dsp = audio.dsp.DspChain.init();
+
+    // Apply Rock preset
+    dsp.applyPreset(1);
+    try std.testing.expectEqual(@as(i8, 4), dsp.equalizer.getBandGain(0));
+    try std.testing.expectEqual(@as(i8, 2), dsp.equalizer.getBandGain(1));
+
+    // Apply Flat preset
+    dsp.applyPreset(0);
+    for (0..audio.dsp.EQ_BANDS) |i| {
+        try std.testing.expectEqual(@as(i8, 0), dsp.equalizer.getBandGain(i));
+    }
+}
+
+test "dsp stereo widener" {
+    var widener = audio.dsp.StereoWidener.init();
+    widener.enabled = true;
+
+    // Mono (width = 0)
+    widener.setWidth(0);
+    const mono_result = widener.process(1000, -1000);
+    try std.testing.expectEqual(mono_result.left, mono_result.right);
+
+    // Normal (width = 100)
+    widener.setWidth(100);
+    const normal_result = widener.process(1000, -1000);
+    try std.testing.expect(normal_result.left != normal_result.right);
+}
+
+test "dsp chain passthrough" {
+    var dsp = audio.dsp.DspChain.init();
+
+    // With neutral settings, output should be close to input
+    const result = dsp.process(1000, -1000);
+
+    // Allow tolerance for fixed-point math
+    try std.testing.expect(@abs(@as(i32, result.left) - 1000) < 100);
+    try std.testing.expect(@abs(@as(i32, result.right) + 1000) < 100);
+}
+
+// ============================================================
+// Power Management Integration Tests
+// ============================================================
+
+test "battery estimation curve" {
+    // Full charge
+    try std.testing.expectEqual(@as(u8, 100), power.BatteryInfo.estimateFromVoltage(4200));
+
+    // Mid range
+    const mid = power.BatteryInfo.estimateFromVoltage(3700);
+    try std.testing.expect(mid >= 45 and mid <= 55);
+
+    // Low
+    const low = power.BatteryInfo.estimateFromVoltage(3400);
+    try std.testing.expect(low >= 5 and low <= 15);
+
+    // Empty
+    try std.testing.expectEqual(@as(u8, 0), power.BatteryInfo.estimateFromVoltage(3000));
+    try std.testing.expectEqual(@as(u8, 0), power.BatteryInfo.estimateFromVoltage(2500));
+}
+
+test "battery icon selection" {
+    var info = power.BatteryInfo{};
+
+    info.percentage = 90;
+    try std.testing.expectEqualStrings("[####]", info.getIcon());
+
+    info.percentage = 50;
+    try std.testing.expectEqualStrings("[##  ]", info.getIcon());
+
+    info.percentage = 10;
+    try std.testing.expectEqualStrings("[!   ]", info.getIcon());
+
+    info.charging_state = .charging;
+    try std.testing.expectEqualStrings("[CHG]", info.getIcon());
+}
+
+test "power profiles" {
+    const normal = power.DEFAULT_PROFILES[0];
+    try std.testing.expectEqualStrings("Normal", normal.name);
+    try std.testing.expectEqual(@as(u16, 30), normal.backlight_timeout_sec);
+
+    const power_saver = power.DEFAULT_PROFILES[1];
+    try std.testing.expectEqualStrings("Power Saver", power_saver.name);
+    try std.testing.expectEqual(@as(u16, 10), power_saver.backlight_timeout_sec);
+
+    const performance = power.DEFAULT_PROFILES[2];
+    try std.testing.expectEqualStrings("Performance", performance.name);
+    try std.testing.expectEqual(@as(u16, 0), performance.auto_sleep_minutes);
+}
+
+// ============================================================
+// Bootloader Integration Tests
+// ============================================================
+
+test "boot config checksum" {
+    var config = bootloader.BootConfig{};
+    config.updateChecksum();
+    try std.testing.expect(config.isValid());
+
+    // Corrupt data
+    config.boot_count = 12345;
+    try std.testing.expect(!config.isValid());
+
+    // Fix checksum
+    config.updateChecksum();
+    try std.testing.expect(config.isValid());
+}
+
+test "firmware header validation" {
+    var header = bootloader.FirmwareHeader{
+        .size = 65536,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+    };
+    try std.testing.expect(header.isValid());
+
+    // Invalid: zero size
+    header.size = 0;
+    try std.testing.expect(!header.isValid());
+
+    // Invalid: entry before load
+    header.size = 1024;
+    header.entry_point = 0x40000000;
+    try std.testing.expect(!header.isValid());
+}
+
+test "firmware header version string" {
+    const header = bootloader.FirmwareHeader{
+        .version_major = 1,
+        .version_minor = 2,
+        .version_patch = 3,
+    };
+
+    var buf: [16]u8 = undefined;
+    const version = header.getVersion(&buf);
+    try std.testing.expectEqualStrings("1.2.3", version);
+}
+
+// ============================================================
+// Library Integration Tests
+// ============================================================
+
+test "playlist format detection" {
+    try std.testing.expect(library.playlist_parser.isPlaylistExtension("playlist.m3u"));
+    try std.testing.expect(library.playlist_parser.isPlaylistExtension("playlist.M3U8"));
+    try std.testing.expect(library.playlist_parser.isPlaylistExtension("playlist.pls"));
+    try std.testing.expect(!library.playlist_parser.isPlaylistExtension("song.mp3"));
+}
+
+test "m3u playlist parsing" {
+    const m3u_content =
+        \\#EXTM3U
+        \\#PLAYLIST:Test Playlist
+        \\#EXTINF:180,Artist - Song Title
+        \\/music/song.mp3
+        \\#EXTINF:240,Another Song
+        \\/music/song2.mp3
+    ;
+
+    var parser = library.playlist_parser.M3uParser.init(m3u_content);
+    const result = parser.parse();
+
+    try std.testing.expect(result.is_extended);
+    try std.testing.expectEqualStrings("Test Playlist", result.name);
+    try std.testing.expectEqual(@as(usize, 2), result.count);
+    try std.testing.expectEqualStrings("/music/song.mp3", result.entries[0].path);
+    try std.testing.expectEqual(@as(u32, 180), result.entries[0].duration_secs);
+}
+
+// ============================================================
+// Metadata Integration Tests
+// ============================================================
+
+test "metadata empty check" {
+    const empty_data = [_]u8{0} ** 100;
+    const metadata = audio.metadata.parse(&empty_data);
+    try std.testing.expect(metadata.isEmpty());
+}
+
+test "metadata field storage" {
+    var metadata = audio.metadata.Metadata{};
+
+    metadata.setTitle("Test Song");
+    try std.testing.expectEqualStrings("Test Song", metadata.getTitle());
+
+    metadata.setArtist("Test Artist");
+    try std.testing.expectEqualStrings("Test Artist", metadata.getArtist());
+
+    metadata.setAlbum("Test Album");
+    try std.testing.expectEqualStrings("Test Album", metadata.getAlbum());
+}
+
+// ============================================================
+// Simulator Terminal UI Integration Tests
+// ============================================================
+
+test "simulator rgb565 conversion" {
+    const terminal_ui = simulator.terminal_ui;
+
+    // White
+    const white = terminal_ui.rgb565ToRgb888(0xFFFF);
+    try std.testing.expectEqual(@as(u8, 255), white.r);
+    try std.testing.expectEqual(@as(u8, 255), white.g);
+    try std.testing.expectEqual(@as(u8, 255), white.b);
+
+    // Black
+    const black = terminal_ui.rgb565ToRgb888(0x0000);
+    try std.testing.expectEqual(@as(u8, 0), black.r);
+    try std.testing.expectEqual(@as(u8, 0), black.g);
+    try std.testing.expectEqual(@as(u8, 0), black.b);
+
+    // Roundtrip red
+    const red_565: u16 = 0xF800;
+    const red_rgb = terminal_ui.rgb565ToRgb888(red_565);
+    const red_back = terminal_ui.rgb888ToRgb565(red_rgb.r, red_rgb.g, red_rgb.b);
+    try std.testing.expectEqual(red_565, red_back);
+}
+
+// ============================================================
+// Complete System Integration Tests
+// ============================================================
+
+test "complete audio pipeline structure" {
+    // Verify audio types are properly sized
+    try std.testing.expect(@sizeOf(audio.TrackInfo) <= 64);
+
+    // Verify decoder types are all registered
+    try std.testing.expectEqual(@as(usize, 5), @typeInfo(audio.decoders.DecoderType).@"enum".fields.len);
+}
+
+test "complete ui screen dimensions" {
+    try std.testing.expectEqual(@as(u16, 320), ui.SCREEN_WIDTH);
+    try std.testing.expectEqual(@as(u16, 240), ui.SCREEN_HEIGHT);
+    try std.testing.expect(ui.MAX_VISIBLE_ITEMS >= 8);
+}
+
+test "complete power stats structure" {
+    const stats = power.PowerStats{};
+    var buf: [64]u8 = undefined;
+    const uptime = stats.getUptimeString(&buf);
+    try std.testing.expectEqualStrings("0h 0m", uptime);
 }

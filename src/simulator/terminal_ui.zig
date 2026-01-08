@@ -94,12 +94,11 @@ pub const TerminalUI = struct {
     last_render_time: i128,
     frame_count: u64,
 
-    /// Initialize terminal UI
-    pub fn init(config: TerminalUIConfig) TerminalUI {
-        const stdout = std.io.getStdOut();
+    /// Initialize terminal UI with a writer
+    pub fn init(config: TerminalUIConfig, writer: std.fs.File.Writer) TerminalUI {
         return TerminalUI{
             .config = config,
-            .writer = stdout.writer(),
+            .writer = writer,
             .last_render_time = std.time.nanoTimestamp(),
             .frame_count = 0,
         };
@@ -493,7 +492,11 @@ test "rgb888 to 256 color" {
     try std.testing.expect(gray >= 232 and gray <= 255);
 }
 
-test "terminal ui initialization" {
-    const ui = TerminalUI.init(.{});
-    try std.testing.expectEqual(@as(u64, 0), ui.frame_count);
+test "terminal ui config defaults" {
+    const config = TerminalUIConfig{};
+    try std.testing.expect(config.true_color);
+    try std.testing.expectEqual(@as(u8, 4), config.lcd_scale);
+    try std.testing.expect(config.show_status);
+    try std.testing.expect(config.show_help);
+    try std.testing.expectEqual(@as(u32, 100), config.refresh_ms);
 }
