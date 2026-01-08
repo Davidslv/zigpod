@@ -9,6 +9,9 @@ const audio = @import("../audio/audio.zig");
 // Export playlist file parser
 pub const playlist_parser = @import("playlist.zig");
 
+// Export iTunesDB parser for iTunes/Finder sync compatibility
+pub const itunesdb = @import("itunesdb.zig");
+
 // ============================================================
 // Constants
 // ============================================================
