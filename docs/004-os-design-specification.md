@@ -209,19 +209,20 @@ Main Menu
 
 ### 3.1 Library Database
 
-> **Design Decision**: We use a binary database format inspired by Apple's iTunesDB rather than SQLite.
+> **Design Decision**: ZigPod uses Apple's iTunesDB format for full iTunes/Finder compatibility.
 >
-> **Why not SQLite?**
-> - SQLite requires ~200KB+ of code (SQL parser, query planner, B-tree engine)
-> - Higher memory overhead for query processing
-> - Overkill for a music library with known, fixed queries
-> - The original iPod ran successfully for 15+ years with iTunesDB
+> **Why iTunesDB (not SQLite or custom format)?**
+> - **Full sync compatibility** with macOS Finder and iTunes/Music app
+> - **Existing music works** - no re-importing required
+> - **No custom tools needed** - users sync the same way they always have
+> - Smaller code footprint (~10KB vs ~200KB+ for SQLite)
+> - Direct memory-mapped access for fast reads
+> - Proven for 15+ years on millions of devices
 >
-> **Benefits of binary format:**
-> - Smaller code footprint (~10KB vs 200KB+)
-> - Direct memory-mapped access
-> - Predictable performance (no query planning)
-> - Compatible with existing iPod ecosystem
+> **Implementation approach:**
+> - Read-only iTunesDB parsing (Finder/iTunes handles writes)
+> - Parse on boot, build in-memory indices
+> - Support all standard iTunesDB features (playlists, play counts, ratings)
 
 #### Storage Location (iTunes-Compatible)
 ```
