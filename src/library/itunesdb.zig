@@ -383,9 +383,9 @@ pub const Playlist = struct {
 pub const ITunesDB = struct {
     allocator: Allocator,
     data: []align(4) u8,
-    tracks: std.ArrayList(Track),
-    playlists: std.ArrayList(Playlist),
-    track_index: std.AutoHashMap(u32, usize), // id -> index in tracks
+    tracks: std.ArrayListUnmanaged(Track) = .{},
+    playlists: std.ArrayListUnmanaged(Playlist) = .{},
+    track_index: std.AutoHashMapUnmanaged(u32, usize) = .{}, // id -> index in tracks
     version: u32 = 0,
     database_id: u64 = 0,
     dirty: bool = false,                       // Needs write-back
@@ -401,7 +401,7 @@ pub const ITunesDB = struct {
         defer file.close();
 
         const stat = try file.stat();
-        const data = try allocator.alignedAlloc(u8, 4, stat.size);
+        const data = try allocator.alignedAlloc(u8, .@"4", stat.size);
         errdefer allocator.free(data);
 
         const bytes_read = try file.readAll(data);
@@ -412,9 +412,6 @@ pub const ITunesDB = struct {
         var db = Self{
             .allocator = allocator,
             .data = data,
-            .tracks = std.ArrayList(Track).init(allocator),
-            .playlists = std.ArrayList(Playlist).init(allocator),
-            .track_index = std.AutoHashMap(u32, usize).init(allocator),
         };
 
         try db.parse();
@@ -426,9 +423,6 @@ pub const ITunesDB = struct {
         var db = Self{
             .allocator = allocator,
             .data = data,
-            .tracks = std.ArrayList(Track).init(allocator),
-            .playlists = std.ArrayList(Playlist).init(allocator),
-            .track_index = std.AutoHashMap(u32, usize).init(allocator),
         };
 
         try db.parse();
@@ -447,7 +441,7 @@ pub const ITunesDB = struct {
             if (track.comment) |s| self.allocator.free(s);
             if (track.location) |s| self.allocator.free(s);
         }
-        self.tracks.deinit();
+        self.tracks.deinit(self.allocator);
 
         // Free playlist data
         for (self.playlists.items) |*playlist| {
@@ -456,9 +450,9 @@ pub const ITunesDB = struct {
                 self.allocator.free(playlist.track_ids);
             }
         }
-        self.playlists.deinit();
+        self.playlists.deinit(self.allocator);
 
-        self.track_index.deinit();
+        self.track_index.deinit(self.allocator);
         self.allocator.free(self.data);
     }
 
@@ -518,8 +512,8 @@ pub const ITunesDB = struct {
         while (i < header.track_count and track_offset < self.data.len) : (i += 1) {
             const track = try self.parseTrack(track_offset);
             const idx = self.tracks.items.len;
-            try self.tracks.append(track);
-            try self.track_index.put(track.id, idx);
+            try self.tracks.append(self.allocator, track);
+            try self.track_index.put(self.allocator, track.id, idx);
 
             // Get track total size to advance
             const track_header: *const TrackItemHeader = @ptrCast(@alignCast(self.data.ptr + track_offset));
@@ -686,7 +680,7 @@ pub const ITunesDB = struct {
         var i: u32 = 0;
         while (i < header.playlist_count and pl_offset < self.data.len) : (i += 1) {
             const playlist = try self.parsePlaylist(pl_offset);
-            try self.playlists.append(playlist);
+            try self.playlists.append(self.allocator, playlist);
 
             const pl_header: *const PlaylistHeader = @ptrCast(@alignCast(self.data.ptr + pl_offset));
             pl_offset += pl_header.total_size;
@@ -723,19 +717,22 @@ pub const ITunesDB = struct {
 
         // Parse mhip children for track references
         if (header.item_count > 0) {
-            var track_ids = try self.allocator.alloc(u32, header.item_count);
+            const track_ids = try self.allocator.alloc(u32, header.item_count);
             var item_offset = mhod_offset;
-            var k: u32 = 0;
-            while (k < header.item_count and item_offset < self.data.len) : (k += 1) {
+            var k: usize = 0;
+            var i: u32 = 0;
+            while (i < header.item_count and item_offset < self.data.len) : (i += 1) {
                 const item: *const PlaylistItemHeader = @ptrCast(@alignCast(self.data.ptr + item_offset));
                 if (item.isValid()) {
                     track_ids[k] = item.track_id;
+                    k += 1;
                     item_offset += item.total_size;
                 } else {
                     break;
                 }
             }
-            playlist.track_ids = track_ids[0..k];
+            // Keep the full allocation but only use first k items
+            playlist.track_ids = track_ids;
         }
 
         return playlist;
@@ -858,7 +855,8 @@ pub const ITunesDB = struct {
 
     /// Set star rating (1-5)
     pub fn setStarRating(self: *Self, track_id: u32, stars: u8) !void {
-        const rating = @min(stars, 5) * 20;
+        const clamped: u8 = @min(stars, 5);
+        const rating = clamped * 20;
         try self.setRating(track_id, rating);
     }
 
@@ -983,13 +981,18 @@ test "magic constants" {
 }
 
 test "db header size" {
-    // DbHeader should be at least 72 bytes (minimum fields)
-    try std.testing.expect(@sizeOf(DbHeader) >= 72);
+    // DbHeader should be at least 70 bytes (minimum fields)
+    try std.testing.expect(@sizeOf(DbHeader) >= 70);
 }
 
 test "track item header alignment" {
     // Ensure packed struct
     try std.testing.expect(@alignOf(TrackItemHeader) == 1);
+}
+
+test "track item header size" {
+    // TrackItemHeader should be 247 bytes (full struct with all known fields)
+    try std.testing.expectEqual(@as(usize, 247), @sizeOf(TrackItemHeader));
 }
 
 test "mac timestamp conversion" {

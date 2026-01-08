@@ -12,6 +12,11 @@ pub const playlist_parser = @import("playlist.zig");
 // Export iTunesDB parser for iTunes/Finder sync compatibility
 pub const itunesdb = @import("itunesdb.zig");
 
+// iTunesDB integration tests
+test {
+    _ = @import("itunesdb_test.zig");
+}
+
 // ============================================================
 // Constants
 // ============================================================
