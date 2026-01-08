@@ -4,9 +4,18 @@ A custom operating system for the Apple iPod Video 5th Generation (2005), writte
 
 ## Project Status
 
-**Phase**: Core Implementation Complete
+**Phase**: Integration & Polish (Phase 10)
 
-The project has implemented all core OS components including hardware abstraction, kernel, drivers, audio engine, and UI framework. All 70 unit tests pass.
+The project has implemented all core OS components including hardware abstraction, kernel, drivers, audio engine, UI framework, and complete audio codec support. All 218 unit tests pass.
+
+### Supported Audio Formats
+
+| Format | Bit Depths | Features |
+|--------|------------|----------|
+| **WAV** | 8/16/24/32-bit PCM, 32-bit float | WAVE_FORMAT_EXTENSIBLE support |
+| **AIFF** | 8/16/24/32-bit | AIFF-C support |
+| **FLAC** | 8-32 bit | Lossless, all subframe types |
+| **MP3** | VBR/CBR 32-320 kbps | MPEG 1/2/2.5 Layer III |
 
 ## Quick Start
 

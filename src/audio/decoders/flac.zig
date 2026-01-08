@@ -386,7 +386,17 @@ pub const FlacDecoder = struct {
         self.current_block_size = @min(block_size, MAX_BLOCK_SIZE);
 
         for (0..channels) |ch| {
-            try self.decodeSubframe(&reader, ch, block_size);
+            // For stereo decorrelation modes, side channel has +1 bit
+            // Channel assignment 8: left-side stereo (ch 1 has +1 bit)
+            // Channel assignment 9: right-side stereo (ch 0 has +1 bit)
+            // Channel assignment 10: mid-side stereo (ch 1 has +1 bit)
+            const extra_bit: u8 = if (channel_assignment == 9 and ch == 0)
+                1
+            else if ((channel_assignment == 8 or channel_assignment == 10) and ch == 1)
+                1
+            else
+                0;
+            try self.decodeSubframe(&reader, ch, block_size, extra_bit);
         }
 
         // Handle stereo decorrelation
@@ -406,7 +416,7 @@ pub const FlacDecoder = struct {
     }
 
     /// Decode a subframe
-    fn decodeSubframe(self: *FlacDecoder, reader: *BitReader, channel: usize, block_size: usize) Error!void {
+    fn decodeSubframe(self: *FlacDecoder, reader: *BitReader, channel: usize, block_size: usize, extra_bit: u8) Error!void {
         // Subframe header
         _ = try reader.readBits(u1, 1); // Zero padding
         const subframe_type = try reader.readBits(u6, 6);
@@ -418,27 +428,29 @@ pub const FlacDecoder = struct {
         }
 
         const offset = channel * MAX_BLOCK_SIZE;
+        // Bits per sample for this subframe (may have +1 for side channel in stereo)
+        const bps = self.stream_info.bits_per_sample + extra_bit;
 
         if (subframe_type == 0) {
             // CONSTANT
-            const sample = try self.readSignedBits(reader, self.stream_info.bits_per_sample);
+            const sample = try self.readSignedBits(reader, bps);
             for (0..block_size) |i| {
                 self.current_block[offset + i] = sample << wasted;
             }
         } else if (subframe_type == 1) {
             // VERBATIM
             for (0..block_size) |i| {
-                const sample = try self.readSignedBits(reader, self.stream_info.bits_per_sample);
+                const sample = try self.readSignedBits(reader, bps);
                 self.current_block[offset + i] = sample << wasted;
             }
         } else if (subframe_type >= 8 and subframe_type <= 12) {
             // FIXED predictor
             const order = subframe_type - 8;
-            try self.decodeFixed(reader, offset, block_size, @intCast(order), wasted);
+            try self.decodeFixed(reader, offset, block_size, @intCast(order), wasted, bps);
         } else if (subframe_type >= 32) {
             // LPC
             const order = (subframe_type - 31);
-            try self.decodeLpc(reader, offset, block_size, @intCast(order), wasted);
+            try self.decodeLpc(reader, offset, block_size, @intCast(order), wasted, bps);
         } else {
             return Error.InvalidFrame;
         }
@@ -456,10 +468,10 @@ pub const FlacDecoder = struct {
     }
 
     /// Decode FIXED subframe
-    fn decodeFixed(self: *FlacDecoder, reader: *BitReader, offset: usize, block_size: usize, order: u4, wasted: u5) Error!void {
+    fn decodeFixed(self: *FlacDecoder, reader: *BitReader, offset: usize, block_size: usize, order: u4, wasted: u5, bps: u8) Error!void {
         // Read warmup samples
         for (0..order) |i| {
-            const sample = try self.readSignedBits(reader, self.stream_info.bits_per_sample);
+            const sample = try self.readSignedBits(reader, bps);
             self.current_block[offset + i] = sample << wasted;
         }
 
@@ -500,16 +512,21 @@ pub const FlacDecoder = struct {
     }
 
     /// Decode LPC subframe
-    fn decodeLpc(self: *FlacDecoder, reader: *BitReader, offset: usize, block_size: usize, order: u6, wasted: u5) Error!void {
+    fn decodeLpc(self: *FlacDecoder, reader: *BitReader, offset: usize, block_size: usize, order: u6, wasted: u5, bps: u8) Error!void {
         // Read warmup samples
         for (0..order) |i| {
-            const sample = try self.readSignedBits(reader, self.stream_info.bits_per_sample);
+            const sample = try self.readSignedBits(reader, bps);
             self.current_block[offset + i] = sample << wasted;
         }
 
-        // LPC precision (4 bits) and shift (5 bits)
+        // LPC precision (4 bits) and shift (5 bits, signed)
         const precision = (try reader.readBits(u4, 4)) + 1;
-        const shift = try reader.readBits(i5, 5);
+        const shift_unsigned = try reader.readBits(u5, 5);
+        // Sign extend: if bit 4 is set, it's negative
+        const shift: i6 = if (shift_unsigned & 0x10 != 0)
+            @as(i6, @bitCast(@as(u6, shift_unsigned) | 0x20)) // Sign extend to i6
+        else
+            @intCast(shift_unsigned);
 
         // Read LPC coefficients (signed, need proper sign extension)
         var coefficients: [32]i32 = undefined;
@@ -550,6 +567,9 @@ pub const FlacDecoder = struct {
         const partition_order = try reader.readBits(u4, 4);
         const num_partitions: usize = @as(usize, 1) << partition_order;
 
+        // Escape value depends on method (15 for method 0, 31 for method 1)
+        const escape_value: u5 = if (method == 0) 15 else 31;
+
         var sample_idx: usize = predictor_order;
 
         for (0..num_partitions) |p| {
@@ -565,7 +585,7 @@ pub const FlacDecoder = struct {
             else
                 block_size >> partition_order;
 
-            if (rice_param == (if (method == 0) 15 else 31)) {
+            if (rice_param == escape_value) {
                 // Escape: read raw bits
                 const bits = try reader.readBits(u5, 5);
                 for (0..partition_samples) |_| {

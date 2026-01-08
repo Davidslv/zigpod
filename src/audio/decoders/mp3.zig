@@ -145,8 +145,8 @@ pub const GranuleInfo = struct {
     mixed_block: bool = false,
     table_select: [3]u5 = .{ 0, 0, 0 }, // Huffman table selection
     subblock_gain: [3]u3 = .{ 0, 0, 0 }, // Gain for short blocks
-    region0_count: u4 = 0, // Region boundaries
-    region1_count: u3 = 0,
+    region0_count: u5 = 0, // Region boundaries (needs u5 for computed values up to 20)
+    region1_count: u5 = 0, // Region boundaries (needs u5 for computed values up to 13)
     preflag: bool = false, // Use pretab
     scalefac_scale: bool = false, // Scale factor multiplier
     count1table_select: bool = false, // Quad table selection
@@ -200,8 +200,14 @@ const BitReader = struct {
 
             result = (result << @intCast(bits_to_read)) | value;
 
-            self.bit_pos +%= @intCast(bits_to_read);
-            if (self.bit_pos == 0) self.byte_pos += 1;
+            // Update position - handle wrapping when reading whole bytes
+            const new_bit_pos = @as(u8, self.bit_pos) + bits_to_read;
+            if (new_bit_pos >= 8) {
+                self.byte_pos += 1;
+                self.bit_pos = @intCast(new_bit_pos - 8);
+            } else {
+                self.bit_pos = @intCast(new_bit_pos);
+            }
             bits_remaining -= bits_to_read;
         }
 
@@ -274,6 +280,9 @@ pub const Mp3Decoder = struct {
 
     /// Initialize decoder with MP3 file data
     pub fn init(data: []const u8) Error!Mp3Decoder {
+        // Initialize lookup tables (one-time)
+        tables.initPow43Table();
+
         var decoder = Mp3Decoder{
             .data = data,
             .position = 0,
@@ -796,18 +805,19 @@ pub const Mp3Decoder = struct {
 
         while (idx + 2 <= end) {
             // Simplified Huffman decode - use linear decode for now
-            var x = reader.read(i8, 4) catch break;
-            var y = reader.read(i8, 4) catch break;
+            // Use i32 to handle linbits extension which can produce large values
+            var x: i32 = reader.read(u4, 4) catch break;
+            var y: i32 = reader.read(u4, 4) catch break;
 
             // Handle linbits extension for large values
             if (linbits > 0) {
                 if (x == 15) {
-                    const ext = reader.read(u16, @intCast(linbits)) catch 0;
-                    x += @intCast(ext);
+                    const ext: i32 = reader.read(u16, @intCast(linbits)) catch 0;
+                    x += ext;
                 }
                 if (y == 15) {
-                    const ext = reader.read(u16, @intCast(linbits)) catch 0;
-                    y += @intCast(ext);
+                    const ext: i32 = reader.read(u16, @intCast(linbits)) catch 0;
+                    y += ext;
                 }
             }
 
@@ -874,9 +884,9 @@ pub const Mp3Decoder = struct {
             // Apply gain (simplified - should use pow2 table)
             var result = pow43;
             if (exp > 0) {
-                result <<= @intCast(@min(exp / 4, 24));
+                result <<= @intCast(@min(@divTrunc(exp, 4), 24));
             } else if (exp < 0) {
-                result >>= @intCast(@min(-exp / 4, 24));
+                result >>= @intCast(@min(@divTrunc(-exp, 4), 24));
             }
 
             // Apply sign

@@ -16,3 +16,5 @@ zig-out/
 *.bin
 *.elf
 *.hex
+
+audio-samples/
