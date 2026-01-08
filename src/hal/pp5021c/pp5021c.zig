@@ -322,13 +322,153 @@ fn hwTimerStop(timer_id: u2) void {
 }
 
 // ============================================================
-// ATA Functions (Stubs - full implementation needed)
+// ATA Functions - PIO Mode Implementation
 // ============================================================
 
+// ATA drive state
+var ata_supports_lba48: bool = false;
+var ata_total_sectors: u64 = 0;
+
+/// Wait for BSY flag to clear with timeout
+fn ataWaitNotBusy() HalError!void {
+    const start = hwGetTicksUs();
+    while (true) {
+        const status = reg.readReg(u8, reg.ATA_ALTSTATUS);
+        if ((status & reg.ATA_STATUS_BSY) == 0) {
+            return;
+        }
+        if (hwGetTicksUs() - start > reg.ATA_TIMEOUT_BSY_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+/// Wait for DRDY flag to be set
+fn ataWaitReady() HalError!void {
+    const start = hwGetTicksUs();
+    while (true) {
+        const status = reg.readReg(u8, reg.ATA_ALTSTATUS);
+        if ((status & reg.ATA_STATUS_BSY) == 0 and (status & reg.ATA_STATUS_DRDY) != 0) {
+            return;
+        }
+        if (hwGetTicksUs() - start > reg.ATA_TIMEOUT_BSY_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+/// Wait for DRQ flag to be set (data ready)
+fn ataWaitDrq() HalError!void {
+    const start = hwGetTicksUs();
+    while (true) {
+        const status = reg.readReg(u8, reg.ATA_ALTSTATUS);
+        if ((status & reg.ATA_STATUS_BSY) == 0) {
+            if ((status & reg.ATA_STATUS_DRQ) != 0) {
+                return;
+            }
+            if ((status & reg.ATA_STATUS_ERR) != 0) {
+                return HalError.IOError;
+            }
+        }
+        if (hwGetTicksUs() - start > reg.ATA_TIMEOUT_DRQ_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+/// Check for errors after command completion
+fn ataCheckError() HalError!void {
+    const status = reg.readReg(u8, reg.ATA_STATUS);
+    if ((status & reg.ATA_STATUS_ERR) != 0) {
+        return HalError.IOError;
+    }
+    if ((status & reg.ATA_STATUS_DF) != 0) {
+        return HalError.DeviceError;
+    }
+}
+
+/// Perform software reset of ATA controller
+fn ataReset() void {
+    // Set SRST bit
+    reg.writeReg(u8, reg.ATA_CONTROL, reg.ATA_CTL_SRST | reg.ATA_CTL_NIEN);
+    hwDelayUs(5);
+    // Clear SRST bit
+    reg.writeReg(u8, reg.ATA_CONTROL, reg.ATA_CTL_NIEN);
+    hwDelayMs(2);
+}
+
+/// Setup LBA28 address in task file registers
+fn ataSetupLba28(lba: u32, count: u8) void {
+    reg.writeReg(u8, reg.ATA_NSECTOR, count);
+    reg.writeReg(u8, reg.ATA_SECTOR, @truncate(lba & 0xFF));
+    reg.writeReg(u8, reg.ATA_LCYL, @truncate((lba >> 8) & 0xFF));
+    reg.writeReg(u8, reg.ATA_HCYL, @truncate((lba >> 16) & 0xFF));
+    reg.writeReg(u8, reg.ATA_SELECT, reg.ATA_DEV_LBA | @as(u8, @truncate((lba >> 24) & 0x0F)));
+}
+
+/// Setup LBA48 address in task file registers
+fn ataSetupLba48(lba: u64, count: u16) void {
+    // Write high bytes first (for LBA48)
+    reg.writeReg(u8, reg.ATA_NSECTOR, @truncate((count >> 8) & 0xFF));
+    reg.writeReg(u8, reg.ATA_SECTOR, @truncate((lba >> 24) & 0xFF));
+    reg.writeReg(u8, reg.ATA_LCYL, @truncate((lba >> 32) & 0xFF));
+    reg.writeReg(u8, reg.ATA_HCYL, @truncate((lba >> 40) & 0xFF));
+
+    // Write low bytes
+    reg.writeReg(u8, reg.ATA_NSECTOR, @truncate(count & 0xFF));
+    reg.writeReg(u8, reg.ATA_SECTOR, @truncate(lba & 0xFF));
+    reg.writeReg(u8, reg.ATA_LCYL, @truncate((lba >> 8) & 0xFF));
+    reg.writeReg(u8, reg.ATA_HCYL, @truncate((lba >> 16) & 0xFF));
+
+    // Select device with LBA mode
+    reg.writeReg(u8, reg.ATA_SELECT, reg.ATA_DEV_LBA);
+}
+
+/// Read one sector (256 words) from data register
+fn ataReadSectorData(buffer: []u8) void {
+    const words = @min(buffer.len / 2, 256);
+    var i: usize = 0;
+    while (i < words) : (i += 1) {
+        const word = reg.readReg(u16, reg.ATA_DATA);
+        buffer[i * 2] = @truncate(word & 0xFF);
+        buffer[i * 2 + 1] = @truncate((word >> 8) & 0xFF);
+    }
+}
+
+/// Write one sector (256 words) to data register
+fn ataWriteSectorData(data: []const u8) void {
+    const words = @min(data.len / 2, 256);
+    var i: usize = 0;
+    while (i < words) : (i += 1) {
+        const word: u16 = @as(u16, data[i * 2]) | (@as(u16, data[i * 2 + 1]) << 8);
+        reg.writeReg(u16, reg.ATA_DATA, word);
+    }
+}
+
 fn hwAtaInit() HalError!void {
-    // Enable ATA controller
+    // Enable ATA controller clock
     reg.modifyReg(reg.DEV_EN, 0, reg.DEV_ATA);
-    hwDelayMs(50); // Wait for controller
+    hwDelayMs(10);
+
+    // Reset IDE controller
+    var cfg = reg.readReg(u32, reg.IDE0_CFG);
+    cfg |= reg.IDE_CFG_RESET;
+    reg.writeReg(u32, reg.IDE0_CFG, cfg);
+    hwDelayMs(1);
+    cfg &= ~reg.IDE_CFG_RESET;
+    reg.writeReg(u32, reg.IDE0_CFG, cfg);
+    hwDelayMs(10);
+
+    // Perform software reset
+    ataReset();
+
+    // Wait for drive to be ready
+    ataWaitNotBusy() catch |err| {
+        return err;
+    };
+
+    // Disable interrupts (we use polling)
+    reg.writeReg(u8, reg.ATA_CONTROL, reg.ATA_CTL_NIEN);
 
     ata_initialized = true;
 }
@@ -336,8 +476,27 @@ fn hwAtaInit() HalError!void {
 fn hwAtaIdentify() HalError!AtaDeviceInfo {
     if (!ata_initialized) return HalError.DeviceNotReady;
 
-    // TODO: Implement full ATA IDENTIFY command
-    return AtaDeviceInfo{
+    try ataWaitReady();
+
+    // Select device 0 (master)
+    reg.writeReg(u8, reg.ATA_SELECT, reg.ATA_DEV_LBA);
+    hwDelayUs(1);
+
+    // Issue IDENTIFY command
+    reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_IDENTIFY);
+
+    // Wait for data
+    try ataWaitDrq();
+
+    // Read 512 bytes of identify data
+    var identify_data: [512]u8 = undefined;
+    ataReadSectorData(&identify_data);
+
+    // Check for errors
+    try ataCheckError();
+
+    // Parse identify data
+    var info = AtaDeviceInfo{
         .model = [_]u8{' '} ** 40,
         .serial = [_]u8{' '} ** 20,
         .firmware = [_]u8{' '} ** 8,
@@ -346,34 +505,168 @@ fn hwAtaIdentify() HalError!AtaDeviceInfo {
         .supports_lba48 = false,
         .supports_dma = false,
     };
+
+    // Serial number: words 10-19 (bytes 20-39), byte-swapped
+    var i: usize = 0;
+    while (i < 20) : (i += 2) {
+        info.serial[i] = identify_data[20 + i + 1];
+        info.serial[i + 1] = identify_data[20 + i];
+    }
+
+    // Firmware revision: words 23-26 (bytes 46-53), byte-swapped
+    i = 0;
+    while (i < 8) : (i += 2) {
+        info.firmware[i] = identify_data[46 + i + 1];
+        info.firmware[i + 1] = identify_data[46 + i];
+    }
+
+    // Model number: words 27-46 (bytes 54-93), byte-swapped
+    i = 0;
+    while (i < 40) : (i += 2) {
+        info.model[i] = identify_data[54 + i + 1];
+        info.model[i + 1] = identify_data[54 + i];
+    }
+
+    // Capabilities: word 49 (bytes 98-99)
+    const capabilities = @as(u16, identify_data[98]) | (@as(u16, identify_data[99]) << 8);
+    info.supports_dma = (capabilities & 0x0100) != 0; // DMA supported
+
+    // Command set support: word 83 (bytes 166-167)
+    const cmd_set = @as(u16, identify_data[166]) | (@as(u16, identify_data[167]) << 8);
+    info.supports_lba48 = (cmd_set & 0x0400) != 0; // 48-bit LBA supported
+
+    // Total sectors (LBA28): words 60-61 (bytes 120-123)
+    const lba28_sectors = @as(u32, identify_data[120]) |
+        (@as(u32, identify_data[121]) << 8) |
+        (@as(u32, identify_data[122]) << 16) |
+        (@as(u32, identify_data[123]) << 24);
+
+    if (info.supports_lba48) {
+        // Total sectors (LBA48): words 100-103 (bytes 200-207)
+        const lba48_sectors = @as(u64, identify_data[200]) |
+            (@as(u64, identify_data[201]) << 8) |
+            (@as(u64, identify_data[202]) << 16) |
+            (@as(u64, identify_data[203]) << 24) |
+            (@as(u64, identify_data[204]) << 32) |
+            (@as(u64, identify_data[205]) << 40) |
+            (@as(u64, identify_data[206]) << 48) |
+            (@as(u64, identify_data[207]) << 56);
+        info.total_sectors = lba48_sectors;
+    } else {
+        info.total_sectors = lba28_sectors;
+    }
+
+    // Store for internal use
+    ata_supports_lba48 = info.supports_lba48;
+    ata_total_sectors = info.total_sectors;
+
+    return info;
 }
 
 fn hwAtaReadSectors(lba: u64, count: u16, buffer: []u8) HalError!void {
     if (!ata_initialized) return HalError.DeviceNotReady;
-    _ = lba;
-    _ = count;
-    _ = buffer;
-    // TODO: Implement sector read
-    return HalError.NotSupported;
+    if (count == 0) return;
+    if (buffer.len < @as(usize, count) * reg.ATA_SECTOR_SIZE) return HalError.InvalidParameter;
+
+    try ataWaitReady();
+
+    const use_lba48 = ata_supports_lba48 and (lba >= 0x10000000 or count > 256);
+
+    if (use_lba48) {
+        ataSetupLba48(lba, count);
+        reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_READ_SECTORS_EXT);
+    } else {
+        if (lba >= 0x10000000) return HalError.InvalidParameter;
+        if (count > 256) return HalError.InvalidParameter;
+        const count8: u8 = if (count == 256) 0 else @truncate(count);
+        ataSetupLba28(@truncate(lba), count8);
+        reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_READ_SECTORS);
+    }
+
+    // Read each sector
+    var sector: u16 = 0;
+    while (sector < count) : (sector += 1) {
+        try ataWaitDrq();
+
+        const offset = @as(usize, sector) * reg.ATA_SECTOR_SIZE;
+        ataReadSectorData(buffer[offset..][0..reg.ATA_SECTOR_SIZE]);
+    }
+
+    // Check final status
+    try ataWaitNotBusy();
+    try ataCheckError();
 }
 
 fn hwAtaWriteSectors(lba: u64, count: u16, data: []const u8) HalError!void {
     if (!ata_initialized) return HalError.DeviceNotReady;
-    _ = lba;
-    _ = count;
-    _ = data;
-    // TODO: Implement sector write
-    return HalError.NotSupported;
+    if (count == 0) return;
+    if (data.len < @as(usize, count) * reg.ATA_SECTOR_SIZE) return HalError.InvalidParameter;
+
+    try ataWaitReady();
+
+    const use_lba48 = ata_supports_lba48 and (lba >= 0x10000000 or count > 256);
+
+    if (use_lba48) {
+        ataSetupLba48(lba, count);
+        reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_WRITE_SECTORS_EXT);
+    } else {
+        if (lba >= 0x10000000) return HalError.InvalidParameter;
+        if (count > 256) return HalError.InvalidParameter;
+        const count8: u8 = if (count == 256) 0 else @truncate(count);
+        ataSetupLba28(@truncate(lba), count8);
+        reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_WRITE_SECTORS);
+    }
+
+    // Write each sector
+    var sector: u16 = 0;
+    while (sector < count) : (sector += 1) {
+        try ataWaitDrq();
+
+        const offset = @as(usize, sector) * reg.ATA_SECTOR_SIZE;
+        ataWriteSectorData(data[offset..][0..reg.ATA_SECTOR_SIZE]);
+    }
+
+    // Wait for command completion
+    try ataWaitNotBusy();
+    try ataCheckError();
 }
 
 fn hwAtaFlush() HalError!void {
     if (!ata_initialized) return HalError.DeviceNotReady;
-    // TODO: Implement cache flush
+
+    try ataWaitReady();
+
+    // Use extended flush for LBA48 drives
+    if (ata_supports_lba48) {
+        reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_FLUSH_CACHE_EXT);
+    } else {
+        reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_FLUSH_CACHE);
+    }
+
+    // Flush can take a while
+    const start = hwGetTicksUs();
+    while (true) {
+        const status = reg.readReg(u8, reg.ATA_ALTSTATUS);
+        if ((status & reg.ATA_STATUS_BSY) == 0) {
+            break;
+        }
+        if (hwGetTicksUs() - start > 30_000_000) { // 30 second timeout for flush
+            return HalError.Timeout;
+        }
+    }
+
+    try ataCheckError();
 }
 
 fn hwAtaStandby() HalError!void {
     if (!ata_initialized) return HalError.DeviceNotReady;
-    // TODO: Implement standby command
+
+    try ataWaitReady();
+
+    reg.writeReg(u8, reg.ATA_COMMAND, reg.ATA_CMD_STANDBY_IMMEDIATE);
+
+    try ataWaitNotBusy();
+    try ataCheckError();
 }
 
 // ============================================================

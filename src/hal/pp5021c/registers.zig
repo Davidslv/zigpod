@@ -257,6 +257,7 @@ pub const IIS_RX_FULL_SHIFT: u5 = 19;
 // IDE/ATA Controller
 // ============================================================
 
+// IDE controller configuration registers
 pub const IDE0_CFG: usize = 0xC3000000;
 pub const IDE0_CNTRLR: usize = 0xC3000004;
 pub const IDE0_STAT: usize = 0xC300000C;
@@ -264,20 +265,78 @@ pub const IDE1_CFG: usize = 0xC3000010;
 pub const IDE1_CNTRLR: usize = 0xC3000014;
 pub const IDE1_STAT: usize = 0xC300001C;
 
+// ATA Task File Registers (memory-mapped)
+// Based on Rockbox firmware/target/arm/pp/ata-target.h
+pub const ATA_IOBASE: usize = 0xC30001E0;
+pub const ATA_CONTROL: usize = 0xC30003F6;
+
+// Task file register offsets from ATA_IOBASE
+pub const ATA_DATA: usize = ATA_IOBASE + 0x00; // 16-bit data register
+pub const ATA_ERROR: usize = ATA_IOBASE + 0x01; // Error register (read)
+pub const ATA_FEATURES: usize = ATA_IOBASE + 0x01; // Features register (write)
+pub const ATA_NSECTOR: usize = ATA_IOBASE + 0x02; // Sector count
+pub const ATA_SECTOR: usize = ATA_IOBASE + 0x03; // Sector number / LBA[0:7]
+pub const ATA_LCYL: usize = ATA_IOBASE + 0x04; // Cylinder low / LBA[8:15]
+pub const ATA_HCYL: usize = ATA_IOBASE + 0x05; // Cylinder high / LBA[16:23]
+pub const ATA_SELECT: usize = ATA_IOBASE + 0x06; // Device/head / LBA[24:27]
+pub const ATA_COMMAND: usize = ATA_IOBASE + 0x07; // Command register (write)
+pub const ATA_STATUS: usize = ATA_IOBASE + 0x07; // Status register (read)
+pub const ATA_ALTSTATUS: usize = ATA_CONTROL; // Alternate status (read)
+
 // ATA Commands
 pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
 pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
 pub const ATA_CMD_READ_SECTORS_EXT: u8 = 0x24;
 pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 pub const ATA_CMD_WRITE_SECTORS_EXT: u8 = 0x34;
+pub const ATA_CMD_READ_DMA: u8 = 0xC8;
+pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
+pub const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+pub const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
 pub const ATA_CMD_STANDBY_IMMEDIATE: u8 = 0xE0;
+pub const ATA_CMD_IDLE_IMMEDIATE: u8 = 0xE1;
 pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+pub const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
+pub const ATA_CMD_SET_FEATURES: u8 = 0xEF;
+pub const ATA_CMD_SLEEP: u8 = 0xE6;
 
 // ATA Status bits
-pub const ATA_STATUS_BSY: u8 = 0x80;
-pub const ATA_STATUS_DRDY: u8 = 0x40;
-pub const ATA_STATUS_DRQ: u8 = 0x08;
-pub const ATA_STATUS_ERR: u8 = 0x01;
+pub const ATA_STATUS_BSY: u8 = 0x80; // Busy
+pub const ATA_STATUS_DRDY: u8 = 0x40; // Drive ready
+pub const ATA_STATUS_DF: u8 = 0x20; // Drive fault
+pub const ATA_STATUS_DSC: u8 = 0x10; // Seek complete
+pub const ATA_STATUS_DRQ: u8 = 0x08; // Data request
+pub const ATA_STATUS_CORR: u8 = 0x04; // Corrected data
+pub const ATA_STATUS_IDX: u8 = 0x02; // Index
+pub const ATA_STATUS_ERR: u8 = 0x01; // Error
+
+// ATA Error register bits
+pub const ATA_ERROR_BBK: u8 = 0x80; // Bad block
+pub const ATA_ERROR_UNC: u8 = 0x40; // Uncorrectable data
+pub const ATA_ERROR_MC: u8 = 0x20; // Media changed
+pub const ATA_ERROR_IDNF: u8 = 0x10; // ID not found
+pub const ATA_ERROR_MCR: u8 = 0x08; // Media change request
+pub const ATA_ERROR_ABRT: u8 = 0x04; // Aborted command
+pub const ATA_ERROR_TK0NF: u8 = 0x02; // Track 0 not found
+pub const ATA_ERROR_AMNF: u8 = 0x01; // Address mark not found
+
+// ATA Device/Head register bits
+pub const ATA_DEV_LBA: u8 = 0x40; // LBA mode
+pub const ATA_DEV_DEV: u8 = 0x10; // Device select (0 = master, 1 = slave)
+pub const ATA_DEV_HEAD_MASK: u8 = 0x0F; // Head number / LBA[24:27]
+
+// ATA Control register bits
+pub const ATA_CTL_SRST: u8 = 0x04; // Software reset
+pub const ATA_CTL_NIEN: u8 = 0x02; // Disable interrupts
+
+// IDE controller configuration bits
+pub const IDE_CFG_INTRQ: u32 = 0x00000200;
+pub const IDE_CFG_RESET: u32 = 0x00000001;
+
+// Timing constants
+pub const ATA_TIMEOUT_BSY_US: u32 = 5_000_000; // 5 seconds for BSY clear
+pub const ATA_TIMEOUT_DRQ_US: u32 = 1_000_000; // 1 second for DRQ
+pub const ATA_SECTOR_SIZE: usize = 512;
 
 // ============================================================
 // LCD Controller (BCM2722)
