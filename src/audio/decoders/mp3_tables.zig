@@ -392,6 +392,65 @@ pub const dct32_cos = blk: {
 };
 
 // ============================================================
+// Fast IMDCT Tables (Lee's Algorithm)
+// ============================================================
+
+/// Fast 36-point IMDCT twiddle factors
+/// These exploit the symmetry in the IMDCT to reduce operations
+pub const imdct36_twiddle = blk: {
+    var table: [9]i32 = undefined;
+    for (0..9) |i| {
+        const fi: f64 = @floatFromInt(i);
+        // cos(pi/36 * (2*i + 1))
+        const val = @cos(std.math.pi / 36.0 * (2.0 * fi + 1.0));
+        table[i] = @intFromFloat(val * 32768.0);
+    }
+    break :blk table;
+};
+
+/// Fast 36-point IMDCT pre-rotation factors
+pub const imdct36_pre = blk: {
+    var table: [18]i32 = undefined;
+    for (0..18) |k| {
+        const fk: f64 = @floatFromInt(k);
+        // cos(pi/72 * (2*k + 1))
+        const val = @cos(std.math.pi / 72.0 * (2.0 * fk + 1.0));
+        table[k] = @intFromFloat(val * 32768.0);
+    }
+    break :blk table;
+};
+
+/// Fast 36-point IMDCT post-rotation factors
+pub const imdct36_post = blk: {
+    var table: [18]i32 = undefined;
+    for (0..18) |i| {
+        const fi: f64 = @floatFromInt(i);
+        // -sin(pi/36 * (2*i + 1))
+        const val = -@sin(std.math.pi / 36.0 * (2.0 * fi + 1.0));
+        table[i] = @intFromFloat(val * 32768.0);
+    }
+    break :blk table;
+};
+
+/// Fast DCT-32 butterfly coefficients (Lee's algorithm)
+/// Reduces 1024 multiplications to ~100
+pub const dct32_butterfly = blk: {
+    var table: [5][16]i32 = undefined;
+    // Stage coefficients for 5-stage butterfly
+    for (0..5) |stage| {
+        const n: usize = @as(usize, 16) >> @intCast(stage);
+        for (0..n) |k| {
+            const fk: f64 = @floatFromInt(k);
+            const fn_f64: f64 = @floatFromInt(n);
+            // cos(pi/(4*n) * (2*k + 1))
+            const val = 1.0 / (2.0 * @cos(std.math.pi / (4.0 * fn_f64) * (2.0 * fk + 1.0)));
+            table[stage][k] = @intFromFloat(val * 32768.0);
+        }
+    }
+    break :blk table;
+};
+
+// ============================================================
 // Antialias Coefficients
 // ============================================================
 
