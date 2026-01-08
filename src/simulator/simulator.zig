@@ -23,6 +23,13 @@ pub const cpu = struct {
     pub const arm7tdmi = @import("cpu/arm7tdmi.zig");
 };
 
+// Export storage simulation modules
+pub const storage = struct {
+    pub const disk_image = @import("storage/disk_image.zig");
+    pub const identify = @import("storage/identify.zig");
+    pub const ata_controller = @import("storage/ata_controller.zig");
+};
+
 // ============================================================
 // Simulator Configuration
 // ============================================================
@@ -38,6 +45,10 @@ pub const SimulatorConfig = struct {
     speed_multiplier: f32 = 1.0,
     /// Enable debug logging
     debug_logging: bool = false,
+    /// Disk image path (null for no disk or in-memory)
+    disk_image_path: ?[]const u8 = null,
+    /// In-memory disk size in sectors (if disk_image_path is null)
+    memory_disk_sectors: u64 = 60 * 1024 * 1024 / 512, // 60MB default
 };
 
 // ============================================================
@@ -80,6 +91,10 @@ pub const SimulatorState = struct {
     interrupt_mask: u32 = 0,
     irq_enabled: bool = false,
 
+    // ATA/Storage state
+    disk_image: ?storage.disk_image.DiskImage = null,
+    ata_controller: ?storage.ata_controller.AtaController = null,
+
     // Allocator
     allocator: std.mem.Allocator = undefined,
 
@@ -116,6 +131,19 @@ pub const SimulatorState = struct {
         // Initialize audio buffer
         self.audio_buffer = .{};
 
+        // Initialize disk image and ATA controller
+        if (config.disk_image_path) |path| {
+            // Open existing disk image file
+            self.disk_image = storage.disk_image.DiskImage.open(path, false) catch null;
+        } else if (config.memory_disk_sectors > 0) {
+            // Create in-memory disk for testing
+            self.disk_image = storage.disk_image.DiskImage.createInMemory(allocator, config.memory_disk_sectors) catch null;
+        }
+
+        if (self.disk_image) |*disk| {
+            self.ata_controller = storage.ata_controller.AtaController.init(disk);
+        }
+
         // Clear memory
         @memset(&self.iram, 0);
         @memset(&self.sdram, 0);
@@ -127,6 +155,14 @@ pub const SimulatorState = struct {
     pub fn deinit(self: *SimulatorState) void {
         self.i2c_devices.deinit();
         self.audio_buffer.deinit(self.allocator);
+
+        // Clean up ATA/storage
+        self.ata_controller = null;
+        if (self.disk_image) |*disk| {
+            disk.close();
+            self.disk_image = null;
+        }
+
         self.allocator.destroy(self);
     }
 
@@ -421,24 +457,99 @@ fn simTimerStart(_: u2, _: u32, _: ?*const fn () void) hal.HalError!void {
 fn simTimerStop(_: u2) void {}
 
 fn simAtaInit() hal.HalError!void {
+    if (sim_state) |state| {
+        if (state.ata_controller != null) {
+            return; // Already initialized
+        }
+    }
     return hal.HalError.DeviceNotReady;
 }
 
 fn simAtaIdentify() hal.HalError!hal.AtaDeviceInfo {
+    if (sim_state) |state| {
+        if (state.ata_controller) |*controller| {
+            if (state.disk_image) |disk| {
+                var info: hal.AtaDeviceInfo = undefined;
+
+                // Copy model/serial/firmware
+                @memcpy(&info.model, &disk.model);
+                @memcpy(&info.serial, &disk.serial);
+                @memcpy(&info.firmware, &disk.firmware);
+
+                info.total_sectors = disk.total_sectors;
+                info.sector_size = 512;
+                info.supports_lba48 = disk.requiresLba48();
+                info.supports_dma = true;
+
+                // Run identify command to verify controller works
+                controller.writeCommand(@intFromEnum(storage.ata_controller.AtaCommand.identify));
+
+                return info;
+            }
+        }
+    }
     return hal.HalError.DeviceNotReady;
 }
 
-fn simAtaReadSectors(_: u64, _: u16, _: []u8) hal.HalError!void {
+fn simAtaReadSectors(lba: u64, count: u16, buffer: []u8) hal.HalError!void {
+    if (sim_state) |state| {
+        if (state.ata_controller) |*controller| {
+            controller.setLba(lba, count, lba > 0x0FFFFFFF);
+            controller.writeCommand(@intFromEnum(storage.ata_controller.AtaCommand.read_sectors));
+
+            // Read all sectors
+            var offset: usize = 0;
+            for (0..count) |_| {
+                const bytes_read = controller.readData(buffer[offset..][0..512]);
+                if (bytes_read != 512) {
+                    return hal.HalError.TransferError;
+                }
+                offset += 512;
+            }
+            return;
+        }
+    }
     return hal.HalError.DeviceNotReady;
 }
 
-fn simAtaWriteSectors(_: u64, _: u16, _: []const u8) hal.HalError!void {
+fn simAtaWriteSectors(lba: u64, count: u16, data: []const u8) hal.HalError!void {
+    if (sim_state) |state| {
+        if (state.ata_controller) |*controller| {
+            controller.setLba(lba, count, lba > 0x0FFFFFFF);
+            controller.writeCommand(@intFromEnum(storage.ata_controller.AtaCommand.write_sectors));
+
+            // Write all sectors
+            var offset: usize = 0;
+            for (0..count) |_| {
+                const bytes_written = controller.writeData(data[offset..][0..512]);
+                if (bytes_written != 512) {
+                    return hal.HalError.TransferError;
+                }
+                offset += 512;
+            }
+            return;
+        }
+    }
     return hal.HalError.DeviceNotReady;
 }
 
-fn simAtaFlush() hal.HalError!void {}
+fn simAtaFlush() hal.HalError!void {
+    if (sim_state) |state| {
+        if (state.ata_controller) |*controller| {
+            controller.writeCommand(@intFromEnum(storage.ata_controller.AtaCommand.flush_cache));
+            return;
+        }
+    }
+}
 
-fn simAtaStandby() hal.HalError!void {}
+fn simAtaStandby() hal.HalError!void {
+    if (sim_state) |state| {
+        if (state.ata_controller) |*controller| {
+            controller.writeCommand(@intFromEnum(storage.ata_controller.AtaCommand.standby_immediate));
+            return;
+        }
+    }
+}
 
 fn simLcdInit() hal.HalError!void {
     if (sim_state) |state| {
@@ -670,7 +781,41 @@ test "simulator I2C" {
     try std.testing.expectError(hal.HalError.Nack, simI2cWrite(0x50, &[_]u8{0x00}));
 }
 
+test "simulator ATA" {
+    const allocator = std.testing.allocator;
+
+    // Initialize simulator with in-memory disk
+    try initSimulator(allocator, .{ .memory_disk_sectors = 1000 });
+    defer shutdownSimulator();
+
+    // Initialize ATA
+    try simAtaInit();
+
+    // Get device info
+    const info = try simAtaIdentify();
+    try std.testing.expectEqual(@as(u64, 1000), info.total_sectors);
+    try std.testing.expectEqual(@as(u16, 512), info.sector_size);
+
+    // Write a sector
+    var write_buf: [512]u8 = undefined;
+    @memset(&write_buf, 0xDD);
+    write_buf[0] = 0xEE;
+    try simAtaWriteSectors(5, 1, &write_buf);
+
+    // Read it back
+    var read_buf: [512]u8 = undefined;
+    try simAtaReadSectors(5, 1, &read_buf);
+    try std.testing.expectEqual(@as(u8, 0xEE), read_buf[0]);
+    try std.testing.expectEqual(@as(u8, 0xDD), read_buf[1]);
+
+    // Flush and standby should work
+    try simAtaFlush();
+    try simAtaStandby();
+}
+
 test {
     // Reference CPU emulation modules to include their tests
     std.testing.refAllDecls(cpu);
+    // Reference storage modules to include their tests
+    std.testing.refAllDecls(storage);
 }
