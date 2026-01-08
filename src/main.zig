@@ -4,8 +4,16 @@
 //! It initializes all subsystems and enters the main application loop.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const kernel = @import("kernel/kernel.zig");
 const hal = @import("hal/hal.zig");
+
+// Ensure boot code is included for ARM freestanding target
+comptime {
+    if (builtin.cpu.arch == .arm and builtin.os.tag == .freestanding) {
+        _ = kernel.boot;
+    }
+}
 const audio = @import("audio/audio.zig");
 const ui = @import("ui/ui.zig");
 const lcd = @import("drivers/display/lcd.zig");

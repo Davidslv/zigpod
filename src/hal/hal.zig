@@ -44,6 +44,10 @@ pub const HalError = error{
     BufferOverflow,
     /// Hardware error
     HardwareError,
+    /// I/O error (disk, storage, etc.)
+    IOError,
+    /// Device error (generic device failure)
+    DeviceError,
 };
 
 /// GPIO pin direction

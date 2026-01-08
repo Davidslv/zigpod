@@ -175,6 +175,12 @@ pub fn resetState() void {
     mock_state = MockState.init(std.heap.page_allocator);
 }
 
+/// Get the LCD framebuffer for external display
+pub fn getFramebuffer() *[320 * 240]u16 {
+    const state = getState();
+    return &state.framebuffer;
+}
+
 // ============================================================
 // Mock HAL Implementation
 // ============================================================

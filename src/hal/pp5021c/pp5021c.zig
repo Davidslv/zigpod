@@ -815,10 +815,9 @@ fn hwLcdInit() HalError!void {
     hwDelayMs(reg.BCM_INIT_DELAY_US / 1000);
 
     // Verify BCM is responding by getting dimensions
-    const width = bcmCommand(reg.BCMCMD_GET_WIDTH) catch |err| {
+    const width = bcmCommand(reg.BCMCMD_GET_WIDTH) catch {
         // BCM not responding - this is expected if firmware isn't loaded
         // On real hardware, the ROM bootloader loads BCM firmware
-        _ = err;
         lcd_initialized = true;
         return;
     };
@@ -1266,7 +1265,7 @@ fn hwUsbWriteEndpoint(ep: u8, data: []const u8) HalError!usize {
     }
 
     // Set TX length and trigger transfer
-    reg.writeReg(u32, ep_base + reg.USB_EP_TXLEN, @truncate(len));
+    reg.writeReg(u32, ep_base + reg.USB_EP_TXLEN, @as(u32, @intCast(len)));
 
     return len;
 }
@@ -1586,9 +1585,8 @@ fn hwPmuInit() HalError!void {
     }
 
     // Read chip ID to verify communication
-    const id = pcfReadReg(reg.PCF_ID) catch |err| {
+    const id = pcfReadReg(reg.PCF_ID) catch {
         // PMU not responding - might be different chip or not present
-        _ = err;
         pmu_initialized = false;
         return HalError.DeviceNotReady;
     };

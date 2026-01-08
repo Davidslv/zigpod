@@ -127,20 +127,17 @@ comptime {
 
 fn _start_arm() callconv(.naked) noreturn {
     // Disable interrupts, set up stack, and jump to init
+    // kernelInit is noreturn so we don't need anything after
     asm volatile (
         \\cpsid if
         \\ldr sp, =__stack_top
-        \\bl kernelInit
+        \\b kernelInit
     );
-    unreachable;
 }
 
 fn undefinedHandler_arm() callconv(.naked) noreturn {
-    asm volatile (
-        \\1: wfi
-        \\b 1b
-    );
-    unreachable;
+    // Infinite loop on undefined instruction (ARM7TDMI has no WFI)
+    asm volatile ("1: b 1b");
 }
 
 fn swiHandler_arm() callconv(.naked) void {
@@ -148,19 +145,13 @@ fn swiHandler_arm() callconv(.naked) void {
 }
 
 fn prefetchAbortHandler_arm() callconv(.naked) noreturn {
-    asm volatile (
-        \\1: wfi
-        \\b 1b
-    );
-    unreachable;
+    // Infinite loop on prefetch abort
+    asm volatile ("1: b 1b");
 }
 
 fn dataAbortHandler_arm() callconv(.naked) noreturn {
-    asm volatile (
-        \\1: wfi
-        \\b 1b
-    );
-    unreachable;
+    // Infinite loop on data abort
+    asm volatile ("1: b 1b");
 }
 
 fn irqHandler_arm() callconv(.naked) void {
@@ -288,16 +279,24 @@ pub fn copyIram() void {
 /// Initialize all stacks for different CPU modes (ARM only)
 pub fn initStacks() void {
     if (is_arm) {
+        // Get stack addresses from linker symbols
+        const irq_stack = @intFromPtr(&extern_symbols.__irq_stack_top);
+        const fiq_stack = @intFromPtr(&extern_symbols.__fiq_stack_top);
+
         // Switch to IRQ mode and set stack
         asm volatile (
             \\msr cpsr_c, #0xD2
-            \\ldr sp, =__irq_stack_top
+            \\mov sp, %[irq_sp]
+            :
+            : [irq_sp] "r" (irq_stack),
         );
 
         // Switch to FIQ mode and set stack
         asm volatile (
             \\msr cpsr_c, #0xD1
-            \\ldr sp, =__fiq_stack_top
+            \\mov sp, %[fiq_sp]
+            :
+            : [fiq_sp] "r" (fiq_stack),
         );
 
         // Return to supervisor mode
@@ -315,10 +314,9 @@ pub fn initStacks() void {
 /// Infinite halt loop
 fn haltLoop() noreturn {
     while (true) {
-        if (is_arm) {
-            asm volatile ("wfi");
-        } else {
-            // On host, just spin
+        // ARM7TDMI has no WFI, just spin
+        // On host, use spin loop hint
+        if (!is_arm) {
             std.atomic.spinLoopHint();
         }
     }

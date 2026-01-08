@@ -9,11 +9,49 @@ pub fn build(b: *std.Build) void {
     const default_target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ARM7TDMI target for iPod hardware
+    const arm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .arm,
+        .os_tag = .freestanding,
+        .abi = .eabi,
+        .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm7tdmi },
+    });
+
     // ============================================================
     // Build Options
     // ============================================================
 
     const enable_sdl2 = b.option(bool, "sdl2", "Enable SDL2 GUI (requires SDL2 installed)") orelse false;
+
+    // ============================================================
+    // ZigPod Firmware (ARM target)
+    // ============================================================
+
+    const firmware = b.addExecutable(.{
+        .name = "zigpod",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = arm_target,
+            .optimize = if (optimize == .Debug) .ReleaseSafe else optimize,
+        }),
+    });
+
+    // Use the PP5021C linker script
+    firmware.setLinkerScript(b.path("linker/pp5021c.ld"));
+
+    // Generate raw binary for flashing
+    const firmware_bin = firmware.addObjCopy(.{
+        .basename = "zigpod.bin",
+        .format = .bin,
+    });
+
+    // Install both ELF and binary
+    b.installArtifact(firmware);
+
+    const install_bin = b.addInstallFile(firmware_bin.getOutput(), "bin/zigpod.bin");
+
+    const firmware_step = b.step("firmware", "Build ZigPod firmware for iPod hardware");
+    firmware_step.dependOn(&install_bin.step);
 
     // ============================================================
     // Simulator Executable
@@ -63,6 +101,37 @@ pub fn build(b: *std.Build) void {
 
     const sim_step = b.step("sim", "Run the PP5021C simulator");
     sim_step.dependOn(&run_sim.step);
+
+    // ============================================================
+    // UI Demo (Native with SDL2)
+    // ============================================================
+
+    if (enable_sdl2) {
+        const demo_module = b.createModule(.{
+            .root_source_file = b.path("src/demo/ui_demo.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigpod", .module = root_module },
+            },
+        });
+
+        const demo_exe = b.addExecutable(.{
+            .name = "zigpod-demo",
+            .root_module = demo_module,
+        });
+
+        demo_exe.linkSystemLibrary("SDL2");
+        demo_exe.linkLibC();
+
+        b.installArtifact(demo_exe);
+
+        const run_demo = b.addRunArtifact(demo_exe);
+        run_demo.step.dependOn(&demo_exe.step);
+
+        const demo_step = b.step("demo", "Run the ZigPod UI demo (requires SDL2)");
+        demo_step.dependOn(&run_demo.step);
+    }
 
     // ============================================================
     // Unit Tests
