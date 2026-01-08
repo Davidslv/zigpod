@@ -1944,3 +1944,269 @@ test "dsf: FLAC 16-bit 96kHz" {
 test "dsf: FLAC 24-bit 96kHz" {
     try testDsfFlac(std.testing.allocator, "flac-24bit-96000.flac", 24);
 }
+
+// ============================================================
+// CPU State Machine Tests
+// ============================================================
+
+const arm7tdmi = @import("../simulator/cpu/arm7tdmi.zig");
+
+test "cpu: initial state after creation" {
+    var cpu = arm7tdmi.Arm7Tdmi.init();
+
+    // CPU should start in supervisor mode
+    try std.testing.expectEqual(arm7tdmi.Mode.supervisor, cpu.regs.getMode());
+
+    // CPU should be running
+    try std.testing.expectEqual(arm7tdmi.CpuState.running, cpu.state);
+
+    // No interrupts pending
+    try std.testing.expect(!cpu.irq_pending);
+    try std.testing.expect(!cpu.fiq_pending);
+
+    // No cycles executed
+    try std.testing.expectEqual(@as(u64, 0), cpu.cycles);
+    try std.testing.expectEqual(@as(u64, 0), cpu.instructions);
+}
+
+test "cpu: IRQ assertion wakes from halt" {
+    var cpu = arm7tdmi.Arm7Tdmi.init();
+
+    // Halt the CPU
+    cpu.state = .halted;
+    try std.testing.expectEqual(arm7tdmi.CpuState.halted, cpu.state);
+
+    // Assert IRQ
+    cpu.assertIrq(true);
+
+    // CPU should wake up
+    try std.testing.expectEqual(arm7tdmi.CpuState.running, cpu.state);
+    try std.testing.expect(cpu.irq_pending);
+}
+
+test "cpu: FIQ assertion wakes from halt" {
+    var cpu = arm7tdmi.Arm7Tdmi.init();
+
+    // Halt the CPU
+    cpu.state = .halted;
+
+    // Assert FIQ
+    cpu.assertFiq(true);
+
+    // CPU should wake up
+    try std.testing.expectEqual(arm7tdmi.CpuState.running, cpu.state);
+    try std.testing.expect(cpu.fiq_pending);
+}
+
+test "cpu: breakpoint management" {
+    var cpu = arm7tdmi.Arm7Tdmi.init();
+
+    // Add breakpoints
+    try std.testing.expect(cpu.addBreakpoint(0x1000));
+    try std.testing.expect(cpu.addBreakpoint(0x2000));
+    try std.testing.expect(cpu.addBreakpoint(0x3000));
+    try std.testing.expectEqual(@as(u8, 3), cpu.breakpoint_count);
+
+    // Adding duplicate should succeed (already exists)
+    try std.testing.expect(cpu.addBreakpoint(0x1000));
+    try std.testing.expectEqual(@as(u8, 3), cpu.breakpoint_count);
+
+    // Remove breakpoint
+    try std.testing.expect(cpu.removeBreakpoint(0x2000));
+    try std.testing.expectEqual(@as(u8, 2), cpu.breakpoint_count);
+
+    // Remove non-existent should fail
+    try std.testing.expect(!cpu.removeBreakpoint(0x9999));
+}
+
+// ============================================================
+// ATA Controller State Tests
+// ============================================================
+
+const ata_controller = @import("../simulator/storage/ata_controller.zig");
+
+test "ata: initial state without disk" {
+    const ata = ata_controller.AtaController.initNoDisk();
+
+    // No disk attached
+    try std.testing.expect(!ata.hasDisk());
+
+    // State should be idle
+    try std.testing.expectEqual(ata_controller.ControllerState.idle, ata.state);
+}
+
+test "ata: command without disk sets error" {
+    var ata = ata_controller.AtaController.initNoDisk();
+
+    // Try to execute command without disk
+    ata.writeCommand(0xEC); // IDENTIFY
+
+    // Should set error
+    try std.testing.expect(ata.status & ata_controller.AtaStatus.ERR != 0);
+    try std.testing.expect(ata.err & ata_controller.AtaError.ABRT != 0);
+}
+
+test "ata: command enum conversion" {
+    // Test command byte to enum conversion
+    try std.testing.expectEqual(ata_controller.AtaCommand.identify, ata_controller.AtaCommand.fromByte(0xEC));
+    try std.testing.expectEqual(ata_controller.AtaCommand.read_sectors, ata_controller.AtaCommand.fromByte(0x20));
+    try std.testing.expectEqual(ata_controller.AtaCommand.write_sectors, ata_controller.AtaCommand.fromByte(0x30));
+    try std.testing.expectEqual(ata_controller.AtaCommand.standby_immediate, ata_controller.AtaCommand.fromByte(0xE0));
+    try std.testing.expectEqual(ata_controller.AtaCommand.flush_cache, ata_controller.AtaCommand.fromByte(0xE7));
+}
+
+test "ata: status register bits" {
+    // Verify status bit values match ATA spec
+    try std.testing.expectEqual(@as(u8, 0x80), ata_controller.AtaStatus.BSY);
+    try std.testing.expectEqual(@as(u8, 0x40), ata_controller.AtaStatus.DRDY);
+    try std.testing.expectEqual(@as(u8, 0x08), ata_controller.AtaStatus.DRQ);
+    try std.testing.expectEqual(@as(u8, 0x01), ata_controller.AtaStatus.ERR);
+}
+
+// ============================================================
+// Interrupt Controller Integration Tests
+// ============================================================
+
+const interrupt_controller = @import("../simulator/interrupts/interrupt_controller.zig");
+
+test "interrupt: initial state" {
+    var ic = interrupt_controller.InterruptController.init();
+
+    // Global interrupts should be disabled
+    try std.testing.expect(!ic.global_enable);
+
+    // CPU interrupt state should be empty
+    try std.testing.expectEqual(@as(u32, 0), ic.cpu.status);
+    try std.testing.expectEqual(@as(u32, 0), ic.cpu.enable);
+
+    // No interrupt should be active
+    try std.testing.expect(!ic.hasPendingIrq());
+}
+
+test "interrupt: enable and raise" {
+    var ic = interrupt_controller.InterruptController.init();
+    ic.enableGlobal();
+
+    // Enable timer1 interrupt
+    ic.cpu.enableInt(.timer1);
+
+    // Raise timer1 interrupt
+    ic.raiseInterrupt(.timer1);
+    try std.testing.expect(ic.cpu.isPending(.timer1));
+    try std.testing.expect(ic.hasPendingIrq());
+
+    // Clear
+    ic.clearInterrupt(.timer1);
+    try std.testing.expect(!ic.cpu.isPending(.timer1));
+    try std.testing.expect(!ic.hasPendingIrq());
+}
+
+test "interrupt: disabled interrupt doesn't trigger hasPendingIrq" {
+    var ic = interrupt_controller.InterruptController.init();
+    ic.enableGlobal();
+
+    // Raise interrupt without enabling it
+    ic.raiseInterrupt(.timer1);
+
+    // Interrupt is in status but not enabled, so no IRQ
+    try std.testing.expect((ic.cpu.status & interrupt_controller.InterruptSource.timer1.mask()) != 0);
+    try std.testing.expect(!ic.hasPendingIrq()); // Not enabled, so no active interrupt
+}
+
+test "interrupt: multiple simultaneous interrupts" {
+    var ic = interrupt_controller.InterruptController.init();
+    ic.enableGlobal();
+
+    // Enable and raise multiple interrupts
+    ic.cpu.enableInt(.timer1);
+    ic.cpu.enableInt(.timer2);
+    ic.cpu.enableInt(.i2s);
+
+    ic.raiseInterrupt(.timer1);
+    ic.raiseInterrupt(.timer2);
+    ic.raiseInterrupt(.i2s);
+
+    // Should have interrupt
+    try std.testing.expect(ic.hasPendingIrq());
+
+    // Clear one, still have others
+    ic.clearInterrupt(.timer1);
+    try std.testing.expect(ic.hasPendingIrq());
+
+    // Clear all
+    ic.clearInterrupt(.timer2);
+    ic.clearInterrupt(.i2s);
+    try std.testing.expect(!ic.hasPendingIrq());
+}
+
+// ============================================================
+// Timer Simulation Tests
+// ============================================================
+
+const timer_sim = @import("../simulator/interrupts/timer_sim.zig");
+
+test "timer: configuration with TimerSystem" {
+    var ts = timer_sim.TimerSystem.init();
+
+    // Configure timer 1 for 1000us interval with repeat
+    ts.configureTimer1(timer_sim.TimerConfig.ENABLE | timer_sim.TimerConfig.REPEAT | 1000);
+
+    try std.testing.expect(ts.timer1.isEnabled());
+    try std.testing.expectEqual(@as(u32, 1000), ts.timer1.value);
+}
+
+test "timer: tick generates interrupt" {
+    var ts = timer_sim.TimerSystem.init();
+    var ic = interrupt_controller.InterruptController.init();
+    ts.connectInterruptController(&ic);
+    ic.enableGlobal();
+
+    // Enable timer interrupt in controller
+    ic.cpu.enableInt(.timer1);
+
+    // Configure timer 1 for 100us interval with IRQ enabled
+    ts.configureTimer1(timer_sim.TimerConfig.ENABLE | timer_sim.TimerConfig.IRQ_ENABLE | 100);
+
+    // Tick 50us (50,000ns) - no interrupt yet
+    ts.tick(50_000);
+    try std.testing.expect(!ic.cpu.isPending(.timer1));
+
+    // Tick another 60us - should trigger (110us total > 100us interval)
+    ts.tick(60_000);
+    try std.testing.expect(ic.cpu.isPending(.timer1));
+}
+
+// ============================================================
+// Boot Sequence Simulation Tests
+// ============================================================
+
+test "boot: memory map validation" {
+    // Verify PP5021C memory map constants
+    const IRAM_BASE: u32 = 0x40000000;
+    const IRAM_SIZE: u32 = 96 * 1024; // 96KB
+    const SDRAM_BASE: u32 = 0x10000000;
+
+    // Validate alignment
+    try std.testing.expectEqual(@as(u32, 0), IRAM_BASE % 4096); // Page aligned
+    try std.testing.expectEqual(@as(u32, 0), SDRAM_BASE % 4096);
+    try std.testing.expect(IRAM_SIZE >= 64 * 1024); // At least 64KB
+}
+
+test "boot: exception vector addresses" {
+    // ARM7TDMI exception vectors
+    const RESET_VECTOR: u32 = 0x00000000;
+    const UNDEF_VECTOR: u32 = 0x00000004;
+    const SWI_VECTOR: u32 = 0x00000008;
+    const PREFETCH_ABORT: u32 = 0x0000000C;
+    const DATA_ABORT: u32 = 0x00000010;
+    const IRQ_VECTOR: u32 = 0x00000018;
+    const FIQ_VECTOR: u32 = 0x0000001C;
+
+    // Verify vectors are properly spaced (4 bytes each)
+    try std.testing.expectEqual(@as(u32, 4), UNDEF_VECTOR - RESET_VECTOR);
+    try std.testing.expectEqual(@as(u32, 4), SWI_VECTOR - UNDEF_VECTOR);
+    try std.testing.expectEqual(@as(u32, 4), PREFETCH_ABORT - SWI_VECTOR);
+    try std.testing.expectEqual(@as(u32, 4), DATA_ABORT - PREFETCH_ABORT);
+    // Note: 0x14 is reserved, so IRQ is at 0x18
+    try std.testing.expectEqual(@as(u32, 4), FIQ_VECTOR - IRQ_VECTOR);
+}
