@@ -91,6 +91,13 @@ pub const ui = @import("ui/ui.zig");
 pub const app = @import("app/app.zig");
 
 // ============================================================
+// Library
+// ============================================================
+
+/// Music library and playlist management
+pub const library = @import("library/library.zig");
+
+// ============================================================
 // Utility Library
 // ============================================================
 

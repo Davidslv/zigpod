@@ -50,7 +50,7 @@ pub const StreamInfo = struct {
 const BitReader = struct {
     data: []const u8,
     byte_pos: usize,
-    bit_pos: u3,
+    bit_pos: u8, // 0-7
 
     fn init(data: []const u8) BitReader {
         return .{
@@ -63,30 +63,31 @@ const BitReader = struct {
     fn readBits(self: *BitReader, comptime T: type, n: u6) !T {
         if (n == 0) return 0;
 
-        var result: T = 0;
-        var bits_remaining: u6 = n;
+        var result: u64 = 0;
+        var bits_remaining: u8 = n;
 
         while (bits_remaining > 0) {
             if (self.byte_pos >= self.data.len) return error.EndOfData;
 
-            const bits_available: u4 = @intCast(8 - @as(u4, self.bit_pos));
-            const bits_to_read: u4 = @intCast(@min(bits_remaining, bits_available));
+            const bits_available: u8 = 8 - self.bit_pos;
+            const bits_to_read: u8 = @min(bits_remaining, bits_available);
 
             const byte = self.data[self.byte_pos];
             const shift: u3 = @intCast(bits_available - bits_to_read);
-            const mask: u8 = (@as(u8, 1) << bits_to_read) - 1;
-            const value: T = @intCast((byte >> shift) & mask);
+            const mask: u8 = @as(u8, 0xFF) >> @intCast(8 - bits_to_read);
+            const value: u64 = (byte >> shift) & mask;
 
-            result = (result << bits_to_read) | value;
+            result = (result << @intCast(bits_to_read)) | value;
 
-            self.bit_pos +%= bits_to_read;
-            if (self.bit_pos == 0) {
+            self.bit_pos += bits_to_read;
+            if (self.bit_pos >= 8) {
+                self.bit_pos = 0;
                 self.byte_pos += 1;
             }
             bits_remaining -= bits_to_read;
         }
 
-        return result;
+        return @intCast(result);
     }
 
     fn readUnary(self: *BitReader) !u32 {

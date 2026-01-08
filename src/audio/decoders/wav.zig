@@ -161,8 +161,8 @@ pub const WavDecoder = struct {
         return switch (self.format.bits_per_sample) {
             8 => {
                 // 8-bit unsigned to 16-bit signed
-                const unsigned = data[0];
-                return @as(i16, @intCast(unsigned)) * 256 - 32768;
+                const unsigned: i32 = data[0];
+                return @intCast((unsigned - 128) * 256);
             },
             16 => {
                 // 16-bit signed little-endian
@@ -309,9 +309,9 @@ test "wav decoder - 8-bit mono conversion" {
     const samples = decoder.decode(&output);
     try std.testing.expectEqual(@as(usize, 2), samples);
 
-    // 0x80 (128) -> (128 * 256) - 32768 = 0
+    // 0x80 (128) -> (128 - 128) * 256 = 0
     try std.testing.expectEqual(@as(i16, 0), output[0]);
-    // 0xFF (255) -> (255 * 256) - 32768 = 32512
+    // 0xFF (255) -> (255 - 128) * 256 = 32512
     try std.testing.expectEqual(@as(i16, 32512), output[1]);
 }
 
