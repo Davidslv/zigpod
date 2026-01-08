@@ -1,0 +1,91 @@
+name: ZigPod CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  ZIG_VERSION: "0.15.0"
+
+jobs:
+  # Build and run unit tests
+  build-and-test:
+    name: Build and Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig fmt --check src/
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Build for host
+        run: zig build
+
+      - name: Build for ARM target
+        run: zig build -Dtarget=arm-freestanding-eabi
+        continue-on-error: true  # ARM build may have additional requirements
+
+  # Cross-compilation check
+  cross-compile:
+    name: Cross Compile ARM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build ARM binary
+        run: zig build -Dtarget=arm-freestanding-eabi
+
+      - name: Check binary size
+        run: |
+          if [ -f zig-out/bin/zigpod ]; then
+            ls -lh zig-out/bin/zigpod
+            SIZE=$(stat -c%s zig-out/bin/zigpod 2>/dev/null || stat -f%z zig-out/bin/zigpod)
+            if [ "$SIZE" -gt 1048576 ]; then
+              echo "Warning: Binary size exceeds 1MB target"
+            fi
+          fi
+
+      - name: Upload ARM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zigpod-arm
+          path: zig-out/
+          if-no-files-found: ignore
+
+  # Documentation generation
+  docs:
+    name: Generate Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Generate docs
+        run: zig build docs 2>/dev/null || echo "Docs generation not configured"
+        continue-on-error: true

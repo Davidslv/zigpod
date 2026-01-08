@@ -8,6 +8,11 @@ const hal = @import("../hal/hal.zig");
 const lcd = @import("../drivers/display/lcd.zig");
 const clickwheel = @import("../drivers/input/clickwheel.zig");
 
+// Export UI modules
+pub const now_playing = @import("now_playing.zig");
+pub const file_browser = @import("file_browser.zig");
+pub const settings = @import("settings.zig");
+
 // ============================================================
 // UI Constants
 // ============================================================

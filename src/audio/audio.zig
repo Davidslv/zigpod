@@ -1,7 +1,7 @@
 //! Audio Playback Engine
 //!
 //! High-level audio playback system that coordinates codec, I2S, and file reading.
-//! Supports WAV and AIFF formats initially, with room for adding more codecs.
+//! Supports WAV and FLAC formats with room for adding more codecs.
 
 const std = @import("std");
 const hal = @import("../hal/hal.zig");
@@ -9,6 +9,9 @@ const RingBuffer = @import("../lib/ring_buffer.zig").RingBuffer;
 const fixed = @import("../lib/fixed_point.zig");
 const codec = @import("../drivers/audio/codec.zig");
 const i2s = @import("../drivers/audio/i2s.zig");
+
+// Export decoders
+pub const decoders = @import("decoders/decoders.zig");
 
 // ============================================================
 // Audio Constants
