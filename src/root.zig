@@ -94,6 +94,13 @@ pub const fixed = @import("lib/fixed_point.zig");
 pub const crc = @import("lib/crc.zig");
 
 // ============================================================
+// Simulator
+// ============================================================
+
+/// PP5021C simulator for host-based testing
+pub const simulator = @import("simulator/simulator.zig");
+
+// ============================================================
 // Platform Detection
 // ============================================================
 
