@@ -48,9 +48,13 @@ This document outlines what's needed to run ZigPod on real iPod Classic (6th/7th
 
 ### Known Issues (To Be Addressed)
 
-| Issue | Location | Priority |
-|-------|----------|----------|
-| Audio static at higher volumes | `src/simulator/audio/` | High |
+*No known issues at this time.*
+
+### Recently Fixed Issues
+
+| Issue | Location | Fix |
+|-------|----------|-----|
+| Audio static at higher volumes | `src/simulator/audio/audio_player.zig` | Implemented linear interpolation for resampling |
 
 ---
 
