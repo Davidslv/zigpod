@@ -341,7 +341,14 @@ pub const ATA_SECTOR_SIZE: usize = 512;
 // ============================================================
 // LCD Controller (BCM2722)
 // ============================================================
+//
+// The BCM2722 is a Broadcom VideoCore GPU used for LCD control.
+// It communicates via a serial interface and requires firmware
+// to be loaded before use.
+//
+// Based on Rockbox firmware/target/arm/ipod/video/lcd-video.c
 
+// BCM2722 Register Addresses (memory-mapped serial interface)
 pub const BCM_DATA: usize = 0x30000000;
 pub const BCM_WR_ADDR: usize = 0x30010000;
 pub const BCM_RD_ADDR: usize = 0x30020000;
@@ -352,20 +359,53 @@ pub const BCM_ALT_WR_ADDR: usize = 0x30050000;
 pub const BCM_ALT_RD_ADDR: usize = 0x30060000;
 pub const BCM_ALT_CONTROL: usize = 0x30070000;
 
-// BCM command encoding
+// BCM Control register bits
+pub const BCM_CTRL_WRITE_READY: u32 = 0x02;
+pub const BCM_CTRL_READ_READY: u32 = 0x01;
+
+// BCM command encoding - commands are sent as 32-bit values
+// with inverted bits in upper 16 bits for error checking
 pub inline fn bcmCmd(x: u16) u32 {
     return (~@as(u32, x) << 16) | x;
 }
 
-pub const BCMCMD_LCD_UPDATE: u32 = bcmCmd(0x00);
-pub const BCMCMD_LCD_UPDATERECT: u32 = bcmCmd(0x05);
-pub const BCMCMD_LCD_SLEEP: u32 = bcmCmd(0x08);
-pub const BCMCMD_SELFTEST: u32 = bcmCmd(0x01);
+// BCM Commands (from Rockbox)
+pub const BCMCMD_LCD_UPDATE: u32 = bcmCmd(0x00);      // Full screen update
+pub const BCMCMD_SELFTEST: u32 = bcmCmd(0x01);        // Self test
+pub const BCMCMD_GET_WIDTH: u32 = bcmCmd(0x02);       // Get LCD width
+pub const BCMCMD_GET_HEIGHT: u32 = bcmCmd(0x03);      // Get LCD height
+pub const BCMCMD_FINALIZE: u32 = bcmCmd(0x04);        // Finalize transfer
+pub const BCMCMD_LCD_UPDATERECT: u32 = bcmCmd(0x05);  // Partial update
+pub const BCMCMD_LCD_SLEEP: u32 = bcmCmd(0x08);       // Enter sleep mode
+pub const BCMCMD_LCD_WAKE: u32 = bcmCmd(0x09);        // Wake from sleep
+pub const BCMCMD_LCD_POWER: u32 = bcmCmd(0x0A);       // Power control
+pub const BCMCMD_GETMEMADDR: u32 = bcmCmd(0x0B);      // Get memory address
+pub const BCMCMD_SETMEMADDR: u32 = bcmCmd(0x0C);      // Set memory address
+
+// BCM Address constants for commands
+pub const BCM_WR_CMD: u32 = 0x80000000;               // Write command address
+pub const BCM_RD_CMD: u32 = 0x80000000;               // Read command address
+
+// Timing constants
+pub const BCM_INIT_DELAY_US: u32 = 10000;             // 10ms init delay
+pub const BCM_CMD_TIMEOUT_US: u32 = 1_000_000;        // 1 second timeout
 
 // LCD dimensions
 pub const LCD_WIDTH: u16 = 320;
 pub const LCD_HEIGHT: u16 = 240;
 pub const LCD_BPP: u8 = 16;
+pub const LCD_STRIDE: usize = LCD_WIDTH * 2;          // Bytes per line
+pub const LCD_FRAMEBUFFER_SIZE: usize = @as(usize, LCD_WIDTH) * LCD_HEIGHT * 2;
+
+// Backlight control (via GPIO)
+// iPod Video/Classic uses PWM for backlight brightness
+pub const BACKLIGHT_GPIO_PORT: u4 = GPIO_PORT_B;
+pub const BACKLIGHT_GPIO_PIN: u5 = 3;
+
+// GPIO Output Enable for LCD
+pub const LCD_GPIO_PORT: u4 = GPIO_PORT_I;
+pub const LCD_ENABLE_PIN: u5 = 7;
+pub const LCD_RESET_PIN: u5 = 5;
 
 // ============================================================
 // USB Controller
