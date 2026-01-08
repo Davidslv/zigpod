@@ -225,24 +225,43 @@ pub const I2C_READ_BIT: u8 = 0x01;
 // ============================================================
 // I2S Audio Interface
 // ============================================================
+//
+// The PP5021C has an I2S controller for digital audio output
+// to external codecs (WM8758 in iPod Video/Classic).
 
 pub const IISDIV: usize = 0x60006080;
 pub const IISCONFIG: usize = 0x70002800;
+pub const IISCLKDIV: usize = 0x70002804;
+pub const IISSTATUS: usize = 0x70002808;
 pub const IISFIFO_CFG: usize = 0x7000280C;
 pub const IISFIFO_WR: usize = 0x70002840;
 pub const IISFIFO_RD: usize = 0x70002880;
 
+// I2S Clock divider register
+pub const IISDIV_BASE: usize = 0x60006080;
+
 // IISCONFIG bits
 pub const IIS_RESET: u32 = 0x80000000;
+pub const IIS_ENABLE: u32 = 0x40000000;
 pub const IIS_TXFIFOEN: u32 = 0x20000000;
 pub const IIS_RXFIFOEN: u32 = 0x10000000;
 pub const IIS_MASTER: u32 = 0x00001000;
+pub const IIS_SLAVE: u32 = 0x00000000;
+pub const IIS_IRQTX_EMPTY: u32 = 0x00000400;
 pub const IIS_IRQTX: u32 = 0x00000200;
 pub const IIS_IRQRX: u32 = 0x00000100;
+pub const IIS_DMA_TX_EN: u32 = 0x00000080;
+pub const IIS_DMA_RX_EN: u32 = 0x00000040;
 
-// I2S format
-pub const IIS_FORMAT_IIS: u32 = 0x00000000;
-pub const IIS_FORMAT_LJUST: u32 = 0x00400000;
+// I2S format configuration
+pub const IIS_FORMAT_MASK: u32 = 0x00C00000;
+pub const IIS_FORMAT_IIS: u32 = 0x00000000;    // Standard I2S
+pub const IIS_FORMAT_LJUST: u32 = 0x00400000;  // Left justified
+pub const IIS_FORMAT_RJUST: u32 = 0x00800000;  // Right justified
+pub const IIS_FORMAT_DSP: u32 = 0x00C00000;    // DSP mode
+
+// Sample size configuration
+pub const IIS_SIZE_MASK: u32 = 0x00060000;
 pub const IIS_SIZE_16BIT: u32 = 0x00000000;
 pub const IIS_SIZE_24BIT: u32 = 0x00020000;
 pub const IIS_SIZE_32BIT: u32 = 0x00040000;
@@ -252,6 +271,21 @@ pub const IIS_TX_FREE_MASK: u32 = 0x0001E000;
 pub const IIS_TX_FREE_SHIFT: u5 = 13;
 pub const IIS_RX_FULL_MASK: u32 = 0x00780000;
 pub const IIS_RX_FULL_SHIFT: u5 = 19;
+pub const IIS_TX_EMPTY: u32 = 0x00000010;
+pub const IIS_RX_FULL: u32 = 0x00000020;
+
+// FIFO depths
+pub const IIS_TX_FIFO_DEPTH: usize = 16;  // 16 stereo samples
+pub const IIS_RX_FIFO_DEPTH: usize = 16;
+
+// Sample rate dividers (for MCLK = 11.2896MHz or 12.288MHz)
+// Divider = MCLK / (sample_rate * 256)
+pub const IIS_DIV_44100: u32 = 1;   // 11.2896MHz / (44100 * 256) = ~1
+pub const IIS_DIV_48000: u32 = 1;   // 12.288MHz / (48000 * 256) = ~1
+pub const IIS_DIV_22050: u32 = 2;
+pub const IIS_DIV_24000: u32 = 2;
+pub const IIS_DIV_11025: u32 = 4;
+pub const IIS_DIV_12000: u32 = 4;
 
 // ============================================================
 // IDE/ATA Controller
@@ -408,11 +442,205 @@ pub const LCD_ENABLE_PIN: u5 = 7;
 pub const LCD_RESET_PIN: u5 = 5;
 
 // ============================================================
+// Click Wheel Controller
+// ============================================================
+//
+// The iPod click wheel uses a capacitive sensor with an optical
+// encoder for position tracking. On PP5020/PP5021C, it communicates
+// via a dedicated serial interface.
+//
+// Based on Rockbox firmware/target/arm/ipod/button-clickwheel.c
+
+// Click wheel controller registers
+pub const WHEEL_BASE: usize = 0x7000C100;
+pub const WHEEL_DATA: usize = WHEEL_BASE + 0x00;      // Wheel packet data
+pub const WHEEL_CFG: usize = WHEEL_BASE + 0x04;       // Configuration
+pub const WHEEL_PERIOD: usize = WHEEL_BASE + 0x08;    // Sample period
+pub const WHEEL_STATUS: usize = WHEEL_BASE + 0x0C;    // Status register
+
+// Wheel data packet format (32-bit):
+// Bits 31-24: Touch status (0xFF = touched, 0x00 = not touched)
+// Bits 23-16: Button state
+// Bits 15-8:  Wheel position (0-95)
+// Bits 7-0:   Checksum/reserved
+
+pub const WHEEL_TOUCH_MASK: u32 = 0xFF000000;
+pub const WHEEL_TOUCH_SHIFT: u5 = 24;
+pub const WHEEL_BUTTON_MASK: u32 = 0x00FF0000;
+pub const WHEEL_BUTTON_SHIFT: u5 = 16;
+pub const WHEEL_POSITION_MASK: u32 = 0x0000FF00;
+pub const WHEEL_POSITION_SHIFT: u5 = 8;
+
+// Button bits in wheel packet
+pub const WHEEL_BTN_SELECT: u8 = 0x01;
+pub const WHEEL_BTN_RIGHT: u8 = 0x02;
+pub const WHEEL_BTN_LEFT: u8 = 0x04;
+pub const WHEEL_BTN_PLAY: u8 = 0x08;
+pub const WHEEL_BTN_MENU: u8 = 0x10;
+
+// Hold switch is read from GPIO
+pub const HOLD_GPIO_PORT: u4 = GPIO_PORT_G;
+pub const HOLD_GPIO_PIN: u5 = 0;
+
+// Wheel configuration bits
+pub const WHEEL_CFG_ENABLE: u32 = 0x80000000;
+pub const WHEEL_CFG_RATE_MASK: u32 = 0x0000FF00;
+pub const WHEEL_CFG_INT_EN: u32 = 0x00000001;
+
+// Wheel status bits
+pub const WHEEL_STATUS_READY: u32 = 0x80000000;
+pub const WHEEL_STATUS_DATA: u32 = 0x00000001;
+
+// Wheel constants
+pub const WHEEL_POSITIONS: u8 = 96;               // 0-95 positions
+pub const WHEEL_SAMPLE_RATE_MS: u32 = 10;         // 10ms sample period
+
+// ============================================================
 // USB Controller
 // ============================================================
+//
+// The PP5021C has an integrated USB 2.0 Full Speed controller.
+// Based on Rockbox firmware/target/arm/pp/usb-drv-pp.c
+//
+// The USB controller supports:
+// - Device mode (peripheral)
+// - 3 endpoints (EP0 control + 2 bulk/interrupt)
+// - Full Speed (12 Mbps)
 
 pub const USB_BASE: usize = 0xC5000000;
 pub const USB_NUM_ENDPOINTS: u8 = 3;
+
+// USB Core Registers
+pub const USB_DEV_CTRL: usize = USB_BASE + 0x00;       // Device control
+pub const USB_DEV_INFO: usize = USB_BASE + 0x04;       // Device info
+pub const USB_PHY_CTRL: usize = USB_BASE + 0x08;       // PHY control
+pub const USB_INT_STAT: usize = USB_BASE + 0x10;       // Interrupt status
+pub const USB_INT_EN: usize = USB_BASE + 0x14;         // Interrupt enable
+pub const USB_FRAME_NUM: usize = USB_BASE + 0x18;      // Frame number
+pub const USB_DEV_ADDR: usize = USB_BASE + 0x1C;       // Device address
+pub const USB_TESTMODE: usize = USB_BASE + 0x20;       // Test mode
+
+// USB Endpoint Control Registers (per endpoint)
+// EP0 is at offset 0x40, EP1 at 0x60, EP2 at 0x80
+pub const USB_EP0_BASE: usize = USB_BASE + 0x40;
+pub const USB_EP1_BASE: usize = USB_BASE + 0x60;
+pub const USB_EP2_BASE: usize = USB_BASE + 0x80;
+
+// Per-endpoint register offsets
+pub const USB_EP_CTRL: usize = 0x00;      // Endpoint control
+pub const USB_EP_STAT: usize = 0x04;      // Endpoint status
+pub const USB_EP_TXLEN: usize = 0x08;     // TX packet length
+pub const USB_EP_RXLEN: usize = 0x0C;     // RX packet length
+pub const USB_EP_MAXPKT: usize = 0x10;    // Max packet size
+pub const USB_EP_BUFADDR: usize = 0x14;   // Buffer address
+
+// USB FIFO Registers
+pub const USB_FIFO_BASE: usize = USB_BASE + 0x100;
+pub const USB_EP0_FIFO: usize = USB_FIFO_BASE + 0x00;
+pub const USB_EP1_FIFO: usize = USB_FIFO_BASE + 0x40;
+pub const USB_EP2_FIFO: usize = USB_FIFO_BASE + 0x80;
+
+/// Get endpoint base address
+pub inline fn usbEpBase(ep: u8) usize {
+    return switch (ep) {
+        0 => USB_EP0_BASE,
+        1 => USB_EP1_BASE,
+        2 => USB_EP2_BASE,
+        else => USB_EP0_BASE,
+    };
+}
+
+/// Get endpoint FIFO address
+pub inline fn usbEpFifo(ep: u8) usize {
+    return switch (ep) {
+        0 => USB_EP0_FIFO,
+        1 => USB_EP1_FIFO,
+        2 => USB_EP2_FIFO,
+        else => USB_EP0_FIFO,
+    };
+}
+
+// USB Device Control bits
+pub const USB_DEV_EN: u32 = 0x80000000;             // Device enable
+pub const USB_DEV_SOFT_RESET: u32 = 0x40000000;    // Soft reset
+pub const USB_DEV_SOFT_CONN: u32 = 0x20000000;     // Soft connect
+pub const USB_DEV_HIGH_SPEED: u32 = 0x10000000;    // High speed enable
+pub const USB_DEV_REMOTE_WAKE: u32 = 0x08000000;   // Remote wakeup enable
+
+// USB PHY Control bits
+pub const USB_PHY_ENABLE: u32 = 0x80000000;         // PHY enable
+pub const USB_PHY_SUSPEND: u32 = 0x40000000;        // PHY suspend
+pub const USB_PHY_PLL_LOCK: u32 = 0x00000001;       // PLL locked
+
+// USB Interrupt bits
+pub const USB_INT_RESET: u32 = 0x80000000;          // Bus reset
+pub const USB_INT_SUSPEND: u32 = 0x40000000;        // Suspend
+pub const USB_INT_RESUME: u32 = 0x20000000;         // Resume
+pub const USB_INT_SOF: u32 = 0x10000000;            // Start of frame
+pub const USB_INT_EP0_SETUP: u32 = 0x08000000;      // EP0 setup packet
+pub const USB_INT_EP0_RX: u32 = 0x04000000;         // EP0 RX complete
+pub const USB_INT_EP0_TX: u32 = 0x02000000;         // EP0 TX complete
+pub const USB_INT_EP1_RX: u32 = 0x01000000;         // EP1 RX complete
+pub const USB_INT_EP1_TX: u32 = 0x00800000;         // EP1 TX complete
+pub const USB_INT_EP2_RX: u32 = 0x00400000;         // EP2 RX complete
+pub const USB_INT_EP2_TX: u32 = 0x00200000;         // EP2 TX complete
+
+// USB Endpoint Control bits
+pub const USB_EP_EN: u32 = 0x80000000;              // Endpoint enable
+pub const USB_EP_TYPE_MASK: u32 = 0x60000000;       // Endpoint type
+pub const USB_EP_TYPE_CTRL: u32 = 0x00000000;       // Control
+pub const USB_EP_TYPE_ISO: u32 = 0x20000000;        // Isochronous
+pub const USB_EP_TYPE_BULK: u32 = 0x40000000;       // Bulk
+pub const USB_EP_TYPE_INTR: u32 = 0x60000000;       // Interrupt
+pub const USB_EP_DIR_IN: u32 = 0x10000000;          // Direction IN
+pub const USB_EP_DIR_OUT: u32 = 0x00000000;         // Direction OUT
+pub const USB_EP_STALL: u32 = 0x08000000;           // Stall endpoint
+pub const USB_EP_NAK: u32 = 0x04000000;             // NAK endpoint
+
+// USB Endpoint Status bits
+pub const USB_EP_STAT_BUSY: u32 = 0x80000000;       // Busy
+pub const USB_EP_STAT_DONE: u32 = 0x40000000;       // Transfer done
+pub const USB_EP_STAT_ERROR: u32 = 0x20000000;      // Error
+pub const USB_EP_STAT_STALL: u32 = 0x10000000;      // Stalled
+
+// USB max packet sizes
+pub const USB_EP0_MAX_PKT: u16 = 64;                // Control endpoint
+pub const USB_BULK_MAX_PKT: u16 = 512;              // Bulk endpoint (FS: 64, HS: 512)
+pub const USB_INTR_MAX_PKT: u16 = 64;               // Interrupt endpoint
+
+// USB Standard Request Types
+pub const USB_REQ_TYPE_STANDARD: u8 = 0x00;
+pub const USB_REQ_TYPE_CLASS: u8 = 0x20;
+pub const USB_REQ_TYPE_VENDOR: u8 = 0x40;
+pub const USB_REQ_TYPE_DEVICE: u8 = 0x00;
+pub const USB_REQ_TYPE_INTERFACE: u8 = 0x01;
+pub const USB_REQ_TYPE_ENDPOINT: u8 = 0x02;
+pub const USB_REQ_TYPE_DIR_OUT: u8 = 0x00;
+pub const USB_REQ_TYPE_DIR_IN: u8 = 0x80;
+
+// USB Standard Requests
+pub const USB_REQ_GET_STATUS: u8 = 0x00;
+pub const USB_REQ_CLEAR_FEATURE: u8 = 0x01;
+pub const USB_REQ_SET_FEATURE: u8 = 0x03;
+pub const USB_REQ_SET_ADDRESS: u8 = 0x05;
+pub const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
+pub const USB_REQ_SET_DESCRIPTOR: u8 = 0x07;
+pub const USB_REQ_GET_CONFIGURATION: u8 = 0x08;
+pub const USB_REQ_SET_CONFIGURATION: u8 = 0x09;
+pub const USB_REQ_GET_INTERFACE: u8 = 0x0A;
+pub const USB_REQ_SET_INTERFACE: u8 = 0x0B;
+pub const USB_REQ_SYNCH_FRAME: u8 = 0x0C;
+
+// USB Descriptor Types
+pub const USB_DESC_DEVICE: u8 = 0x01;
+pub const USB_DESC_CONFIGURATION: u8 = 0x02;
+pub const USB_DESC_STRING: u8 = 0x03;
+pub const USB_DESC_INTERFACE: u8 = 0x04;
+pub const USB_DESC_ENDPOINT: u8 = 0x05;
+pub const USB_DESC_QUALIFIER: u8 = 0x06;
+
+// USB Timeouts
+pub const USB_TIMEOUT_US: u32 = 1_000_000;          // 1 second timeout
 
 // ============================================================
 // DMA Engine

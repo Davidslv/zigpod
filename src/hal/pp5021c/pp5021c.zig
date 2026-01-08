@@ -16,6 +16,10 @@ const GpioInterruptMode = hal_types.GpioInterruptMode;
 const I2sFormat = hal_types.I2sFormat;
 const I2sSampleSize = hal_types.I2sSampleSize;
 const AtaDeviceInfo = hal_types.AtaDeviceInfo;
+const UsbEndpointType = hal_types.UsbEndpointType;
+const UsbDirection = hal_types.UsbDirection;
+const UsbDeviceState = hal_types.UsbDeviceState;
+const UsbSetupPacket = hal_types.UsbSetupPacket;
 
 // ============================================================
 // Internal State
@@ -26,6 +30,9 @@ var i2c_initialized: bool = false;
 var i2s_initialized: bool = false;
 var ata_initialized: bool = false;
 var lcd_initialized: bool = false;
+var usb_initialized: bool = false;
+var usb_device_state: UsbDeviceState = .disconnected;
+var usb_device_address: u7 = 0;
 
 // ============================================================
 // System Functions
@@ -237,31 +244,55 @@ fn hwI2cWriteRead(addr: u7, write_data: []const u8, read_buffer: []u8) HalError!
 // I2S Functions
 // ============================================================
 
-fn hwI2sInit(sample_rate: u32, format: I2sFormat, sample_size: I2sSampleSize) HalError!void {
-    _ = sample_rate; // TODO: Configure sample rate divider
+// Current I2S configuration
+var i2s_sample_rate: u32 = 44100;
 
-    // Reset I2S
+fn hwI2sInit(sample_rate: u32, format: I2sFormat, sample_size: I2sSampleSize) HalError!void {
+    // Enable I2S device clock
+    reg.modifyReg(reg.DEV_EN, 0, reg.DEV_I2S);
+    hwDelayUs(100);
+
+    // Reset I2S controller
     reg.writeReg(u32, reg.IISCONFIG, reg.IIS_RESET);
     hwDelayUs(100);
     reg.writeReg(u32, reg.IISCONFIG, 0);
+    hwDelayUs(100);
 
-    // Configure format
+    // Configure sample rate divider
+    const divider: u32 = switch (sample_rate) {
+        44100 => reg.IIS_DIV_44100,
+        48000 => reg.IIS_DIV_48000,
+        22050 => reg.IIS_DIV_22050,
+        24000 => reg.IIS_DIV_24000,
+        11025 => reg.IIS_DIV_11025,
+        12000 => reg.IIS_DIV_12000,
+        else => reg.IIS_DIV_44100, // Default
+    };
+    reg.writeReg(u32, reg.IISDIV, divider);
+    i2s_sample_rate = sample_rate;
+
+    // Build configuration register
     var config: u32 = 0;
 
+    // Format selection
     switch (format) {
         .i2s_standard => config |= reg.IIS_FORMAT_IIS,
         .left_justified => config |= reg.IIS_FORMAT_LJUST,
-        .right_justified => {}, // Default
+        .right_justified => config |= reg.IIS_FORMAT_RJUST,
     }
 
+    // Sample size
     switch (sample_size) {
         .bits_16 => config |= reg.IIS_SIZE_16BIT,
         .bits_24 => config |= reg.IIS_SIZE_24BIT,
         .bits_32 => config |= reg.IIS_SIZE_32BIT,
     }
 
-    // Set as master
+    // Set as master mode (iPod generates clocks)
     config |= reg.IIS_MASTER;
+
+    // Enable I2S
+    config |= reg.IIS_ENABLE;
 
     reg.writeReg(u32, reg.IISCONFIG, config);
 
@@ -272,14 +303,32 @@ fn hwI2sWrite(samples: []const i16) HalError!usize {
     if (!i2s_initialized) return HalError.DeviceNotReady;
 
     var written: usize = 0;
-    for (samples) |sample| {
-        // Wait for FIFO space
-        while (hwI2sTxFreeSlots() == 0) {}
+    var i: usize = 0;
 
-        // Write sample (both channels, same value for mono)
-        const sample32 = @as(u32, @bitCast(@as(i32, sample)));
-        reg.writeReg(u32, reg.IISFIFO_WR, (sample32 << 16) | (sample32 & 0xFFFF));
-        written += 1;
+    while (i < samples.len) {
+        // Wait for FIFO space
+        const timeout_start = hwGetTicksUs();
+        while (hwI2sTxFreeSlots() == 0) {
+            if (hwGetTicksUs() - timeout_start > 100000) { // 100ms timeout
+                return if (written > 0) written else HalError.Timeout;
+            }
+        }
+
+        // Write stereo sample pair (left in upper 16 bits, right in lower)
+        if (i + 1 < samples.len) {
+            // Stereo: samples[i] = left, samples[i+1] = right
+            const left: u32 = @bitCast(@as(i32, samples[i]));
+            const right: u32 = @bitCast(@as(i32, samples[i + 1]));
+            reg.writeReg(u32, reg.IISFIFO_WR, (left << 16) | (right & 0xFFFF));
+            i += 2;
+            written += 2;
+        } else {
+            // Odd sample - duplicate to both channels
+            const sample: u32 = @bitCast(@as(i32, samples[i]));
+            reg.writeReg(u32, reg.IISFIFO_WR, (sample << 16) | (sample & 0xFFFF));
+            i += 1;
+            written += 1;
+        }
     }
 
     return written;
@@ -296,8 +345,10 @@ fn hwI2sTxFreeSlots() usize {
 
 fn hwI2sEnable(enable: bool) void {
     if (enable) {
-        reg.modifyReg(reg.IISCONFIG, 0, reg.IIS_TXFIFOEN);
+        // Enable TX FIFO and I2S
+        reg.modifyReg(reg.IISCONFIG, 0, reg.IIS_TXFIFOEN | reg.IIS_ENABLE);
     } else {
+        // Disable TX FIFO
         reg.modifyReg(reg.IISCONFIG, reg.IIS_TXFIFOEN, 0);
     }
 }
@@ -909,6 +960,10 @@ fn hwLcdWake() HalError!void {
 // Click Wheel Functions
 // ============================================================
 
+// Last wheel packet data for caching
+var wheel_last_data: u32 = 0;
+var wheel_last_read_time: u64 = 0;
+
 fn hwClickwheelInit() HalError!void {
     // Enable optical device (click wheel)
     var dev_en = reg.readReg(u32, reg.DEV_EN);
@@ -928,28 +983,344 @@ fn hwClickwheelInit() HalError!void {
     dev_init |= reg.INIT_BUTTONS;
     reg.writeReg(u32, reg.DEV_INIT1, dev_init);
 
-    // Configure wheel interface (from Rockbox button-clickwheel.c)
-    reg.writeReg(u32, 0x7000C100, 0xC00A1F00);
-    reg.writeReg(u32, 0x7000C104, 0x01000000);
+    // Configure wheel interface
+    // Set sample period and enable wheel controller
+    reg.writeReg(u32, reg.WHEEL_PERIOD, reg.WHEEL_SAMPLE_RATE_MS * 1000); // Convert to us
+    reg.writeReg(u32, reg.WHEEL_CFG, reg.WHEEL_CFG_ENABLE);
+
+    // Configure hold switch GPIO as input
+    hwGpioSetDirection(reg.HOLD_GPIO_PORT, reg.HOLD_GPIO_PIN, .input);
+
+    hwDelayMs(10); // Allow wheel controller to stabilize
+}
+
+/// Read raw wheel packet from controller
+fn wheelReadPacket() u32 {
+    const current_time = hwGetTicksUs();
+
+    // Rate limit reads to avoid bus congestion
+    if (current_time - wheel_last_read_time < 5000) { // 5ms minimum between reads
+        return wheel_last_data;
+    }
+
+    // Check if data is available
+    const status = reg.readReg(u32, reg.WHEEL_STATUS);
+    if ((status & reg.WHEEL_STATUS_DATA) != 0) {
+        wheel_last_data = reg.readReg(u32, reg.WHEEL_DATA);
+        wheel_last_read_time = current_time;
+    }
+
+    return wheel_last_data;
 }
 
 fn hwClickwheelReadButtons() u8 {
-    // Read button state from GPIO or dedicated register
-    // The exact implementation depends on the iPod model
-    // For iPod Video, buttons are read via a specific interface
-    // TODO: Implement actual button reading
-    return 0;
+    const packet = wheelReadPacket();
+
+    // Extract button bits from packet
+    var buttons: u8 = @truncate((packet & reg.WHEEL_BUTTON_MASK) >> reg.WHEEL_BUTTON_SHIFT);
+
+    // Read hold switch from GPIO (active low typically)
+    const hold_state = hwGpioRead(reg.HOLD_GPIO_PORT, reg.HOLD_GPIO_PIN);
+    if (!hold_state) {
+        buttons |= 0x20; // HOLD bit
+    }
+
+    return buttons;
 }
 
 fn hwClickwheelReadPosition() u8 {
-    // Read wheel position (0-95)
-    // TODO: Implement actual wheel position reading
-    return 0;
+    const packet = wheelReadPacket();
+
+    // Extract position from packet
+    const position: u8 = @truncate((packet & reg.WHEEL_POSITION_MASK) >> reg.WHEEL_POSITION_SHIFT);
+
+    // Clamp to valid range
+    return if (position < reg.WHEEL_POSITIONS) position else 0;
 }
 
 fn hwGetTicks() u32 {
     // Return milliseconds since boot
     return @truncate(hwGetTicksUs() / 1000);
+}
+
+// ============================================================
+// USB Functions - Device Mode Implementation
+// ============================================================
+
+/// Wait for PHY PLL to lock
+fn usbWaitPhyReady() HalError!void {
+    const start = hwGetTicksUs();
+    while (true) {
+        const phy = reg.readReg(u32, reg.USB_PHY_CTRL);
+        if ((phy & reg.USB_PHY_PLL_LOCK) != 0) {
+            return;
+        }
+        if (hwGetTicksUs() - start > reg.USB_TIMEOUT_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+/// Wait for endpoint transfer to complete
+fn usbWaitEpDone(ep: u8) HalError!void {
+    const ep_base = reg.usbEpBase(ep);
+    const start = hwGetTicksUs();
+    while (true) {
+        const status = reg.readReg(u32, ep_base + reg.USB_EP_STAT);
+        if ((status & reg.USB_EP_STAT_BUSY) == 0) {
+            if ((status & reg.USB_EP_STAT_ERROR) != 0) {
+                return HalError.TransferError;
+            }
+            return;
+        }
+        if (hwGetTicksUs() - start > reg.USB_TIMEOUT_US) {
+            return HalError.Timeout;
+        }
+    }
+}
+
+fn hwUsbInit() HalError!void {
+    // Enable USB clocks
+    reg.modifyReg(reg.DEV_EN, 0, reg.DEV_USB0 | reg.DEV_USB1);
+    hwDelayMs(10);
+
+    // Perform soft reset
+    reg.writeReg(u32, reg.USB_DEV_CTRL, reg.USB_DEV_SOFT_RESET);
+    hwDelayMs(10);
+
+    // Enable PHY
+    reg.writeReg(u32, reg.USB_PHY_CTRL, reg.USB_PHY_ENABLE);
+    hwDelayMs(10);
+
+    // Wait for PHY PLL lock
+    try usbWaitPhyReady();
+
+    // Clear soft reset, enable device
+    reg.writeReg(u32, reg.USB_DEV_CTRL, reg.USB_DEV_EN);
+    hwDelayMs(1);
+
+    // Clear all pending interrupts
+    reg.writeReg(u32, reg.USB_INT_STAT, 0xFFFFFFFF);
+
+    // Enable essential interrupts: reset, setup, suspend, resume
+    reg.writeReg(u32, reg.USB_INT_EN, reg.USB_INT_RESET |
+        reg.USB_INT_SUSPEND |
+        reg.USB_INT_RESUME |
+        reg.USB_INT_EP0_SETUP |
+        reg.USB_INT_EP0_RX |
+        reg.USB_INT_EP0_TX);
+
+    // Set device address to 0
+    reg.writeReg(u32, reg.USB_DEV_ADDR, 0);
+
+    // Configure EP0 for control transfers
+    const ep0_ctrl = reg.USB_EP_EN |
+        reg.USB_EP_TYPE_CTRL |
+        (@as(u32, reg.USB_EP0_MAX_PKT) << 16);
+    reg.writeReg(u32, reg.USB_EP0_BASE + reg.USB_EP_CTRL, ep0_ctrl);
+    reg.writeReg(u32, reg.USB_EP0_BASE + reg.USB_EP_MAXPKT, reg.USB_EP0_MAX_PKT);
+
+    usb_initialized = true;
+    usb_device_state = .powered;
+    usb_device_address = 0;
+}
+
+fn hwUsbConnect() void {
+    if (!usb_initialized) return;
+
+    // Enable soft connect (pull-up on D+ line)
+    reg.modifyReg(reg.USB_DEV_CTRL, 0, reg.USB_DEV_SOFT_CONN);
+    usb_device_state = .attached;
+}
+
+fn hwUsbDisconnect() void {
+    if (!usb_initialized) return;
+
+    // Disable soft connect
+    reg.modifyReg(reg.USB_DEV_CTRL, reg.USB_DEV_SOFT_CONN, 0);
+    usb_device_state = .disconnected;
+}
+
+fn hwUsbIsConnected() bool {
+    if (!usb_initialized) return false;
+
+    // Check device control register for connection status
+    const ctrl = reg.readReg(u32, reg.USB_DEV_CTRL);
+    return (ctrl & reg.USB_DEV_SOFT_CONN) != 0;
+}
+
+fn hwUsbGetState() UsbDeviceState {
+    return usb_device_state;
+}
+
+fn hwUsbSetAddress(addr: u7) void {
+    if (!usb_initialized) return;
+
+    reg.writeReg(u32, reg.USB_DEV_ADDR, addr);
+    usb_device_address = addr;
+
+    if (addr > 0) {
+        usb_device_state = .addressed;
+    } else {
+        usb_device_state = .default;
+    }
+}
+
+fn hwUsbConfigureEndpoint(ep: u8, ep_type: UsbEndpointType, direction: UsbDirection, max_packet_size: u16) HalError!void {
+    if (!usb_initialized) return HalError.DeviceNotReady;
+    if (ep >= reg.USB_NUM_ENDPOINTS) return HalError.InvalidParameter;
+
+    const ep_base = reg.usbEpBase(ep);
+
+    // Build control register value
+    var ctrl: u32 = reg.USB_EP_EN;
+
+    // Set endpoint type
+    switch (ep_type) {
+        .control => ctrl |= reg.USB_EP_TYPE_CTRL,
+        .isochronous => ctrl |= reg.USB_EP_TYPE_ISO,
+        .bulk => ctrl |= reg.USB_EP_TYPE_BULK,
+        .interrupt => ctrl |= reg.USB_EP_TYPE_INTR,
+    }
+
+    // Set direction
+    if (direction == .in) {
+        ctrl |= reg.USB_EP_DIR_IN;
+    }
+
+    // Set max packet size in upper bits
+    ctrl |= (@as(u32, max_packet_size) << 16);
+
+    // Configure endpoint
+    reg.writeReg(u32, ep_base + reg.USB_EP_CTRL, ctrl);
+    reg.writeReg(u32, ep_base + reg.USB_EP_MAXPKT, max_packet_size);
+
+    // Enable endpoint interrupts
+    const ep_int_rx: u32 = switch (ep) {
+        0 => reg.USB_INT_EP0_RX,
+        1 => reg.USB_INT_EP1_RX,
+        2 => reg.USB_INT_EP2_RX,
+        else => 0,
+    };
+    const ep_int_tx: u32 = switch (ep) {
+        0 => reg.USB_INT_EP0_TX,
+        1 => reg.USB_INT_EP1_TX,
+        2 => reg.USB_INT_EP2_TX,
+        else => 0,
+    };
+
+    reg.modifyReg(reg.USB_INT_EN, 0, ep_int_rx | ep_int_tx);
+}
+
+fn hwUsbStallEndpoint(ep: u8) void {
+    if (ep >= reg.USB_NUM_ENDPOINTS) return;
+
+    const ep_base = reg.usbEpBase(ep);
+    reg.modifyReg(ep_base + reg.USB_EP_CTRL, 0, reg.USB_EP_STALL);
+}
+
+fn hwUsbUnstallEndpoint(ep: u8) void {
+    if (ep >= reg.USB_NUM_ENDPOINTS) return;
+
+    const ep_base = reg.usbEpBase(ep);
+    reg.modifyReg(ep_base + reg.USB_EP_CTRL, reg.USB_EP_STALL, 0);
+}
+
+fn hwUsbWriteEndpoint(ep: u8, data: []const u8) HalError!usize {
+    if (!usb_initialized) return HalError.DeviceNotReady;
+    if (ep >= reg.USB_NUM_ENDPOINTS) return HalError.InvalidParameter;
+
+    const ep_base = reg.usbEpBase(ep);
+    const fifo_addr = reg.usbEpFifo(ep);
+
+    // Wait for endpoint to be ready
+    try usbWaitEpDone(ep);
+
+    // Get max packet size
+    const max_pkt = reg.readReg(u16, ep_base + reg.USB_EP_MAXPKT);
+    const len = @min(data.len, max_pkt);
+
+    // Write data to FIFO (32 bits at a time)
+    var i: usize = 0;
+    while (i < len) {
+        var word: u32 = 0;
+        var j: usize = 0;
+        while (j < 4 and i + j < len) : (j += 1) {
+            word |= @as(u32, data[i + j]) << @truncate(j * 8);
+        }
+        reg.writeReg(u32, fifo_addr, word);
+        i += 4;
+    }
+
+    // Set TX length and trigger transfer
+    reg.writeReg(u32, ep_base + reg.USB_EP_TXLEN, @truncate(len));
+
+    return len;
+}
+
+fn hwUsbReadEndpoint(ep: u8, buffer: []u8) HalError!usize {
+    if (!usb_initialized) return HalError.DeviceNotReady;
+    if (ep >= reg.USB_NUM_ENDPOINTS) return HalError.InvalidParameter;
+
+    const ep_base = reg.usbEpBase(ep);
+    const fifo_addr = reg.usbEpFifo(ep);
+
+    // Get received length
+    const rx_len = reg.readReg(u32, ep_base + reg.USB_EP_RXLEN);
+    const len: usize = @min(@as(usize, @truncate(rx_len)), buffer.len);
+
+    // Read data from FIFO (32 bits at a time)
+    var i: usize = 0;
+    while (i < len) {
+        const word = reg.readReg(u32, fifo_addr);
+        var j: usize = 0;
+        while (j < 4 and i + j < len) : (j += 1) {
+            buffer[i + j] = @truncate((word >> @truncate(j * 8)) & 0xFF);
+        }
+        i += 4;
+    }
+
+    return len;
+}
+
+fn hwUsbGetInterrupts() u32 {
+    return reg.readReg(u32, reg.USB_INT_STAT);
+}
+
+fn hwUsbClearInterrupts(flags: u32) void {
+    // Write 1 to clear interrupts
+    reg.writeReg(u32, reg.USB_INT_STAT, flags);
+}
+
+fn hwUsbReadSetup() HalError!UsbSetupPacket {
+    if (!usb_initialized) return HalError.DeviceNotReady;
+
+    const fifo_addr = reg.USB_EP0_FIFO;
+
+    // Read 8 bytes of setup packet from EP0 FIFO
+    const word0 = reg.readReg(u32, fifo_addr);
+    const word1 = reg.readReg(u32, fifo_addr);
+
+    return UsbSetupPacket{
+        .bmRequestType = @truncate(word0 & 0xFF),
+        .bRequest = @truncate((word0 >> 8) & 0xFF),
+        .wValue = @truncate((word0 >> 16) & 0xFFFF),
+        .wIndex = @truncate(word1 & 0xFFFF),
+        .wLength = @truncate((word1 >> 16) & 0xFFFF),
+    };
+}
+
+fn hwUsbSendZlp(ep: u8) HalError!void {
+    if (!usb_initialized) return HalError.DeviceNotReady;
+    if (ep >= reg.USB_NUM_ENDPOINTS) return HalError.InvalidParameter;
+
+    const ep_base = reg.usbEpBase(ep);
+
+    // Wait for endpoint to be ready
+    try usbWaitEpDone(ep);
+
+    // Set TX length to 0 to send ZLP
+    reg.writeReg(u32, ep_base + reg.USB_EP_TXLEN, 0);
 }
 
 // ============================================================
@@ -1075,4 +1446,20 @@ pub const hal = Hal{
     .irq_disable = hwIrqDisable,
     .irq_enabled = hwIrqEnabled,
     .irq_register = hwIrqRegister,
+
+    .usb_init = hwUsbInit,
+    .usb_connect = hwUsbConnect,
+    .usb_disconnect = hwUsbDisconnect,
+    .usb_is_connected = hwUsbIsConnected,
+    .usb_get_state = hwUsbGetState,
+    .usb_set_address = hwUsbSetAddress,
+    .usb_configure_endpoint = hwUsbConfigureEndpoint,
+    .usb_stall_endpoint = hwUsbStallEndpoint,
+    .usb_unstall_endpoint = hwUsbUnstallEndpoint,
+    .usb_write_endpoint = hwUsbWriteEndpoint,
+    .usb_read_endpoint = hwUsbReadEndpoint,
+    .usb_get_interrupts = hwUsbGetInterrupts,
+    .usb_clear_interrupts = hwUsbClearInterrupts,
+    .usb_read_setup = hwUsbReadSetup,
+    .usb_send_zlp = hwUsbSendZlp,
 };

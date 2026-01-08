@@ -87,6 +87,55 @@ pub const AtaDeviceInfo = struct {
     supports_dma: bool,
 };
 
+/// USB endpoint type
+pub const UsbEndpointType = enum {
+    control,
+    isochronous,
+    bulk,
+    interrupt,
+};
+
+/// USB endpoint direction
+pub const UsbDirection = enum {
+    out, // Host to device
+    in, // Device to host
+};
+
+/// USB device state
+pub const UsbDeviceState = enum {
+    disconnected,
+    attached,
+    powered,
+    default,
+    addressed,
+    configured,
+    suspended,
+};
+
+/// USB setup packet (8 bytes)
+pub const UsbSetupPacket = struct {
+    bmRequestType: u8,
+    bRequest: u8,
+    wValue: u16,
+    wIndex: u16,
+    wLength: u16,
+
+    /// Check if request direction is device-to-host
+    pub fn isDirectionIn(self: UsbSetupPacket) bool {
+        return (self.bmRequestType & 0x80) != 0;
+    }
+
+    /// Get request type
+    pub fn getRequestType(self: UsbSetupPacket) u8 {
+        return self.bmRequestType & 0x60;
+    }
+
+    /// Get recipient
+    pub fn getRecipient(self: UsbSetupPacket) u8 {
+        return self.bmRequestType & 0x1F;
+    }
+};
+
 // ============================================================
 // HAL Interface Structure
 // ============================================================
@@ -275,6 +324,55 @@ pub const Hal = struct {
 
     /// Register interrupt handler
     irq_register: *const fn (irq: u8, handler: *const fn () void) void,
+
+    // --------------------------------------------------------
+    // USB Operations
+    // --------------------------------------------------------
+
+    /// Initialize USB controller in device mode
+    usb_init: *const fn () HalError!void,
+
+    /// Connect USB (enable pull-up)
+    usb_connect: *const fn () void,
+
+    /// Disconnect USB (disable pull-up)
+    usb_disconnect: *const fn () void,
+
+    /// Check if USB cable is connected
+    usb_is_connected: *const fn () bool,
+
+    /// Get current device state
+    usb_get_state: *const fn () UsbDeviceState,
+
+    /// Set device address (after SET_ADDRESS request)
+    usb_set_address: *const fn (addr: u7) void,
+
+    /// Configure endpoint
+    usb_configure_endpoint: *const fn (ep: u8, ep_type: UsbEndpointType, direction: UsbDirection, max_packet_size: u16) HalError!void,
+
+    /// Stall endpoint
+    usb_stall_endpoint: *const fn (ep: u8) void,
+
+    /// Unstall endpoint
+    usb_unstall_endpoint: *const fn (ep: u8) void,
+
+    /// Write data to endpoint (IN transfer)
+    usb_write_endpoint: *const fn (ep: u8, data: []const u8) HalError!usize,
+
+    /// Read data from endpoint (OUT transfer)
+    usb_read_endpoint: *const fn (ep: u8, buffer: []u8) HalError!usize,
+
+    /// Get pending interrupt flags
+    usb_get_interrupts: *const fn () u32,
+
+    /// Clear interrupt flags
+    usb_clear_interrupts: *const fn (flags: u32) void,
+
+    /// Read setup packet from EP0
+    usb_read_setup: *const fn () HalError!UsbSetupPacket,
+
+    /// Send ZLP (zero-length packet) on endpoint
+    usb_send_zlp: *const fn (ep: u8) HalError!void,
 };
 
 // ============================================================

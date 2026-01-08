@@ -13,6 +13,10 @@ const GpioInterruptMode = hal_types.GpioInterruptMode;
 const I2sFormat = hal_types.I2sFormat;
 const I2sSampleSize = hal_types.I2sSampleSize;
 const AtaDeviceInfo = hal_types.AtaDeviceInfo;
+const UsbEndpointType = hal_types.UsbEndpointType;
+const UsbDirection = hal_types.UsbDirection;
+const UsbDeviceState = hal_types.UsbDeviceState;
+const UsbSetupPacket = hal_types.UsbSetupPacket;
 
 // ============================================================
 // Mock State
@@ -56,6 +60,14 @@ pub const MockState = struct {
     // Interrupt state
     irq_enabled: bool = false,
     irq_handlers: [32]?*const fn () void = [_]?*const fn () void{null} ** 32,
+
+    // USB state
+    usb_initialized: bool = false,
+    usb_connected: bool = false,
+    usb_state: UsbDeviceState = .disconnected,
+    usb_address: u7 = 0,
+    usb_pending_setup: ?UsbSetupPacket = null,
+    usb_ep_data: [3]std.ArrayList(u8) = undefined,
 
     // Allocator for dynamic allocations
     allocator: std.mem.Allocator = undefined,
@@ -492,6 +504,107 @@ fn mockIrqRegister(irq: u8, handler: *const fn () void) void {
     }
 }
 
+// USB functions
+fn mockUsbInit() HalError!void {
+    const state = getState();
+    state.usb_initialized = true;
+    state.usb_state = .powered;
+    state.usb_address = 0;
+}
+
+fn mockUsbConnect() void {
+    const state = getState();
+    state.usb_connected = true;
+    state.usb_state = .attached;
+}
+
+fn mockUsbDisconnect() void {
+    const state = getState();
+    state.usb_connected = false;
+    state.usb_state = .disconnected;
+}
+
+fn mockUsbIsConnected() bool {
+    const state = getState();
+    return state.usb_connected;
+}
+
+fn mockUsbGetState() UsbDeviceState {
+    const state = getState();
+    return state.usb_state;
+}
+
+fn mockUsbSetAddress(addr: u7) void {
+    const state = getState();
+    state.usb_address = addr;
+    if (addr > 0) {
+        state.usb_state = .addressed;
+    } else {
+        state.usb_state = .default;
+    }
+}
+
+fn mockUsbConfigureEndpoint(ep: u8, ep_type: UsbEndpointType, direction: UsbDirection, max_packet_size: u16) HalError!void {
+    _ = ep;
+    _ = ep_type;
+    _ = direction;
+    _ = max_packet_size;
+    // Mock: just accept the configuration
+}
+
+fn mockUsbStallEndpoint(ep: u8) void {
+    _ = ep;
+    // Mock: no-op
+}
+
+fn mockUsbUnstallEndpoint(ep: u8) void {
+    _ = ep;
+    // Mock: no-op
+}
+
+fn mockUsbWriteEndpoint(ep: u8, data: []const u8) HalError!usize {
+    _ = ep;
+    // Mock: just return the length
+    return data.len;
+}
+
+fn mockUsbReadEndpoint(ep: u8, buffer: []u8) HalError!usize {
+    _ = ep;
+    // Mock: return empty
+    @memset(buffer, 0);
+    return 0;
+}
+
+fn mockUsbGetInterrupts() u32 {
+    return 0; // Mock: no pending interrupts
+}
+
+fn mockUsbClearInterrupts(flags: u32) void {
+    _ = flags;
+    // Mock: no-op
+}
+
+fn mockUsbReadSetup() HalError!UsbSetupPacket {
+    const state = getState();
+    if (state.usb_pending_setup) |setup| {
+        state.usb_pending_setup = null;
+        return setup;
+    }
+    // Return a default GET_DESCRIPTOR request
+    return UsbSetupPacket{
+        .bmRequestType = 0x80,
+        .bRequest = 0x06,
+        .wValue = 0x0100,
+        .wIndex = 0,
+        .wLength = 18,
+    };
+}
+
+fn mockUsbSendZlp(ep: u8) HalError!void {
+    _ = ep;
+    // Mock: no-op
+}
+
 // ============================================================
 // HAL Instance
 // ============================================================
@@ -554,6 +667,22 @@ pub const hal = Hal{
     .irq_disable = mockIrqDisable,
     .irq_enabled = mockIrqEnabled,
     .irq_register = mockIrqRegister,
+
+    .usb_init = mockUsbInit,
+    .usb_connect = mockUsbConnect,
+    .usb_disconnect = mockUsbDisconnect,
+    .usb_is_connected = mockUsbIsConnected,
+    .usb_get_state = mockUsbGetState,
+    .usb_set_address = mockUsbSetAddress,
+    .usb_configure_endpoint = mockUsbConfigureEndpoint,
+    .usb_stall_endpoint = mockUsbStallEndpoint,
+    .usb_unstall_endpoint = mockUsbUnstallEndpoint,
+    .usb_write_endpoint = mockUsbWriteEndpoint,
+    .usb_read_endpoint = mockUsbReadEndpoint,
+    .usb_get_interrupts = mockUsbGetInterrupts,
+    .usb_clear_interrupts = mockUsbClearInterrupts,
+    .usb_read_setup = mockUsbReadSetup,
+    .usb_send_zlp = mockUsbSendZlp,
 };
 
 // ============================================================
