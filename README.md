@@ -6,7 +6,7 @@ A custom operating system for the Apple iPod Video 5th Generation (2005), writte
 
 **Phase**: Integration & Polish (Phase 10)
 
-The project has implemented all core OS components including hardware abstraction, kernel, drivers, audio engine, UI framework, and complete audio codec support. All 218 unit tests pass.
+The project has implemented all core OS components including hardware abstraction, kernel, drivers, audio engine, UI framework, and complete audio codec support. All 283 unit tests pass.
 
 ### Supported Audio Formats
 
