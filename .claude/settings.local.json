@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "WebSearch",
+      "WebFetch(domain:theapplewiki.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:wiki.rockbox.org)",
+      "WebFetch(domain:www.freemyipod.org)"
+    ]
+  }
+}
