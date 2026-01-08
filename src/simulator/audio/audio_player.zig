@@ -56,10 +56,10 @@ pub const AudioPlayer = struct {
     position_ms: u64 = 0,
     volume: u8 = 100, // 0-100 (100 = no volume scaling, cleanest playback)
 
-    // Audio data
-    audio_data: []const u8 = &[_]u8{},
+    // Audio data (pre-converted to 44100Hz 16-bit stereo)
+    converted_data: []u8 = &[_]u8{},
     audio_offset: usize = 0,
-    data_start: usize = 0, // Offset to PCM data in file
+    total_samples: usize = 0, // Total samples in converted data
 
     // SDL2 audio
     audio_device: c.SDL_AudioDeviceID = 0,
@@ -82,41 +82,104 @@ pub const AudioPlayer = struct {
             c.SDL_CloseAudioDevice(self.audio_device);
             self.audio_device = 0;
         }
+        if (self.converted_data.len > 0) {
+            self.allocator.free(self.converted_data);
+        }
     }
 
-    /// Load a WAV file for playback
+    /// Load a WAV file for playback using SDL2's conversion
     pub fn loadWav(self: *Self, path: []const u8) !void {
         self.stop();
 
-        // Read the file
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        // Convert path to null-terminated string for SDL
+        var path_buf: [512]u8 = undefined;
+        if (path.len >= path_buf.len) return error.PathTooLong;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
 
-        const stat = try file.stat();
-        const file_size = stat.size;
+        // Use SDL to load the WAV file
+        var wav_spec: c.SDL_AudioSpec = undefined;
+        var wav_buffer: [*c]u8 = undefined;
+        var wav_length: u32 = undefined;
 
-        // Allocate buffer for file data
-        const data = try self.allocator.alloc(u8, file_size);
-        errdefer self.allocator.free(data);
-
-        const bytes_read = try file.readAll(data);
-        if (bytes_read != file_size) {
-            self.allocator.free(data);
-            return error.ReadError;
-        }
-
-        // Parse WAV header
-        if (!self.parseWavHeader(data)) {
-            self.allocator.free(data);
+        if (c.SDL_LoadWAV(&path_buf, &wav_spec, &wav_buffer, &wav_length) == null) {
+            std.debug.print("SDL_LoadWAV failed: {s}\n", .{c.SDL_GetError()});
             return error.InvalidFormat;
         }
+        defer c.SDL_FreeWAV(wav_buffer);
 
-        // Free old data if any
-        if (self.audio_data.len > 0) {
-            self.allocator.free(@constCast(self.audio_data));
+        // Store original track info
+        self.track_info.sample_rate = @intCast(wav_spec.freq);
+        self.track_info.channels = wav_spec.channels;
+        self.track_info.bits_per_sample = switch (wav_spec.format) {
+            c.AUDIO_S16LSB, c.AUDIO_S16MSB, c.AUDIO_U16LSB, c.AUDIO_U16MSB => 16,
+            c.AUDIO_S32LSB, c.AUDIO_S32MSB => 32,
+            c.AUDIO_F32LSB, c.AUDIO_F32MSB => 32,
+            c.AUDIO_S8, c.AUDIO_U8 => 8,
+            else => 16,
+        };
+
+        std.debug.print("Loaded WAV: {d}Hz, {d}-bit, {d} channels, {d} bytes\n", .{
+            wav_spec.freq, self.track_info.bits_per_sample, wav_spec.channels, wav_length,
+        });
+
+        // Build audio converter to target format (44100Hz, 16-bit signed, stereo)
+        var cvt: c.SDL_AudioCVT = undefined;
+        const build_result = c.SDL_BuildAudioCVT(
+            &cvt,
+            wav_spec.format,
+            wav_spec.channels,
+            wav_spec.freq,
+            c.AUDIO_S16LSB,
+            2, // stereo output
+            44100,
+        );
+
+        if (build_result < 0) {
+            std.debug.print("SDL_BuildAudioCVT failed: {s}\n", .{c.SDL_GetError()});
+            return error.ConversionFailed;
         }
 
-        self.audio_data = data;
+        // Free old data
+        if (self.converted_data.len > 0) {
+            self.allocator.free(self.converted_data);
+        }
+
+        if (build_result == 0) {
+            // No conversion needed
+            self.converted_data = try self.allocator.alloc(u8, wav_length);
+            @memcpy(self.converted_data, wav_buffer[0..wav_length]);
+            std.debug.print("No conversion needed\n", .{});
+        } else {
+            // Conversion needed
+            const conv_buf_size: usize = @intCast(@as(u64, wav_length) * @as(u64, @intCast(cvt.len_mult)));
+            self.converted_data = try self.allocator.alloc(u8, conv_buf_size);
+            @memcpy(self.converted_data[0..wav_length], wav_buffer[0..wav_length]);
+
+            cvt.len = @intCast(wav_length);
+            cvt.buf = self.converted_data.ptr;
+
+            std.debug.print("Converting audio: len_mult={d}, len_ratio={d:.2}\n", .{ cvt.len_mult, cvt.len_ratio });
+
+            if (c.SDL_ConvertAudio(&cvt) < 0) {
+                std.debug.print("SDL_ConvertAudio failed: {s}\n", .{c.SDL_GetError()});
+                self.allocator.free(self.converted_data);
+                self.converted_data = &[_]u8{};
+                return error.ConversionFailed;
+            }
+
+            // Shrink to actual converted size
+            const actual_size: usize = @intCast(cvt.len_cvt);
+            if (actual_size < self.converted_data.len) {
+                self.converted_data = self.allocator.realloc(self.converted_data, actual_size) catch self.converted_data;
+            }
+
+            std.debug.print("Converted to {d} bytes (44100Hz 16-bit stereo)\n", .{actual_size});
+        }
+
+        // Calculate total samples and duration
+        self.total_samples = self.converted_data.len / 4; // 4 bytes per stereo sample (16-bit * 2 channels)
+        self.track_info.duration_ms = (@as(u64, self.total_samples) * 1000) / 44100;
         self.audio_offset = 0;
         self.position_ms = 0;
 
@@ -131,47 +194,6 @@ pub const AudioPlayer = struct {
         }
     }
 
-    fn parseWavHeader(self: *Self, data: []const u8) bool {
-        if (data.len < 44) return false;
-
-        // Check RIFF header
-        if (!std.mem.eql(u8, data[0..4], "RIFF")) return false;
-        if (!std.mem.eql(u8, data[8..12], "WAVE")) return false;
-
-        // Find fmt chunk
-        var offset: usize = 12;
-        while (offset + 8 < data.len) {
-            const chunk_id = data[offset..][0..4];
-            const chunk_size = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little);
-
-            if (std.mem.eql(u8, chunk_id, "fmt ")) {
-                if (chunk_size < 16) return false;
-
-                const audio_format = std.mem.readInt(u16, data[offset + 8 ..][0..2], .little);
-                if (audio_format != 1) return false; // Only PCM supported
-
-                self.track_info.channels = std.mem.readInt(u16, data[offset + 10 ..][0..2], .little);
-                self.track_info.sample_rate = std.mem.readInt(u32, data[offset + 12 ..][0..4], .little);
-                self.track_info.bits_per_sample = std.mem.readInt(u16, data[offset + 22 ..][0..2], .little);
-            } else if (std.mem.eql(u8, chunk_id, "data")) {
-                self.data_start = offset + 8;
-                const data_size = chunk_size;
-
-                // Calculate duration
-                const bytes_per_sample = self.track_info.bits_per_sample / 8;
-                const samples = data_size / (bytes_per_sample * self.track_info.channels);
-                self.track_info.duration_ms = (@as(u64, samples) * 1000) / self.track_info.sample_rate;
-
-                return true;
-            }
-
-            offset += 8 + chunk_size;
-            if (chunk_size % 2 != 0) offset += 1; // Padding
-        }
-
-        return false;
-    }
-
     fn initSdlAudio(self: *Self) !void {
         // Initialize SDL audio subsystem if not already done
         if (c.SDL_WasInit(c.SDL_INIT_AUDIO) == 0) {
@@ -180,138 +202,72 @@ pub const AudioPlayer = struct {
             }
         }
 
-        // Always use standard output rate (44100 Hz) for compatibility
-        // We'll resample high sample rate files in the callback
         self.output_sample_rate = 44100;
 
         var desired: c.SDL_AudioSpec = std.mem.zeroes(c.SDL_AudioSpec);
-        desired.freq = @intCast(self.output_sample_rate);
-        desired.format = c.AUDIO_S16LSB; // Always output 16-bit
-        desired.channels = @intCast(self.track_info.channels);
-        desired.samples = 2048; // Buffer size
+        desired.freq = 44100;
+        desired.format = c.AUDIO_S16LSB;
+        desired.channels = 2; // Stereo (we pre-convert to stereo)
+        desired.samples = 2048;
         desired.callback = audioCallback;
         desired.userdata = self;
 
         self.audio_device = c.SDL_OpenAudioDevice(null, 0, &desired, &self.audio_spec, 0);
         if (self.audio_device == 0) {
+            std.debug.print("SDL_OpenAudioDevice failed: {s}\n", .{c.SDL_GetError()});
             return error.AudioInitFailed;
         }
 
-        std.debug.print("Output sample rate: {d}Hz (source: {d}Hz)\n", .{ self.output_sample_rate, self.track_info.sample_rate });
+        std.debug.print("Audio device opened: {d}Hz stereo\n", .{self.audio_spec.freq});
     }
-
-    // Debug counter for callback invocations
-    var callback_count: u32 = 0;
 
     fn audioCallback(userdata: ?*anyopaque, stream: [*c]u8, len: c_int) callconv(.c) void {
         const self: *Self = @ptrCast(@alignCast(userdata orelse {
-            std.debug.print("Audio callback: userdata is null!\n", .{});
+            @memset(stream[0..@intCast(len)], 0);
             return;
         }));
 
-        callback_count += 1;
-        if (callback_count <= 5 or callback_count % 100 == 0) {
-            std.debug.print("Audio callback #{d}: len={d}, state={any}, data_len={d}, offset={d}, bits={d}\n", .{ callback_count, len, self.state, self.audio_data.len, self.audio_offset, self.track_info.bits_per_sample });
-        }
+        const output: []u8 = stream[0..@intCast(len)];
 
-        const output_samples: [*]i16 = @ptrCast(@alignCast(stream));
-        const num_output_samples: usize = @intCast(@divTrunc(len, 2)); // 16-bit samples
-        const channels: usize = @intCast(self.track_info.channels);
-        const num_output_frames = num_output_samples / channels;
-
-        if (self.state != .playing or self.audio_data.len == 0) {
-            @memset(stream[0..@intCast(len)], 0);
+        if (self.state != .playing or self.converted_data.len == 0) {
+            @memset(output, 0);
             return;
         }
 
-        const source_rate = self.track_info.sample_rate;
-        const output_rate = self.output_sample_rate;
-        const bytes_per_sample: usize = self.track_info.bits_per_sample / 8;
-        const frame_size = bytes_per_sample * channels;
+        const bytes_remaining = self.converted_data.len - self.audio_offset;
+        const bytes_to_copy = @min(bytes_remaining, output.len);
 
-        // Calculate data boundaries
-        const data_start = self.data_start;
-        const data_end = self.audio_data.len;
-        const total_source_frames = (data_end - data_start) / frame_size;
+        if (bytes_to_copy > 0) {
+            // Copy pre-converted audio data directly
+            @memcpy(output[0..bytes_to_copy], self.converted_data[self.audio_offset..][0..bytes_to_copy]);
 
-        // Current position in source frames (with sub-sample precision via audio_offset)
-        const source_frame: usize = self.audio_offset / frame_size;
-
-        // Resample ratio
-        const ratio: f64 = @as(f64, @floatFromInt(source_rate)) / @as(f64, @floatFromInt(output_rate));
-
-        var out_idx: usize = 0;
-        while (out_idx < num_output_frames) : (out_idx += 1) {
-            // Calculate fractional source position for linear interpolation
-            const source_pos: f64 = @as(f64, @floatFromInt(source_frame)) + @as(f64, @floatFromInt(out_idx)) * ratio;
-            const target_frame: usize = @intFromFloat(source_pos);
-            const frac: f64 = source_pos - @as(f64, @floatFromInt(target_frame)); // Fractional part for interpolation
-
-            if (target_frame + 1 >= total_source_frames) {
-                // End of track - fill rest with silence
-                const remaining = (num_output_frames - out_idx) * channels;
-                for (0..remaining) |i| {
-                    output_samples[out_idx * channels + i] = 0;
-                }
-                self.state = .stopped;
-                break;
-            }
-
-            // Read source samples with linear interpolation (handle 16-bit and 24-bit)
-            const src_offset = data_start + target_frame * frame_size;
-            const next_offset = data_start + (target_frame + 1) * frame_size;
-
-            for (0..channels) |ch| {
-                const sample_offset = src_offset + ch * bytes_per_sample;
-                const next_sample_offset = next_offset + ch * bytes_per_sample;
-
-                if (next_sample_offset + bytes_per_sample <= self.audio_data.len) {
-                    var sample1: i32 = 0;
-                    var sample2: i32 = 0;
-
-                    if (bytes_per_sample == 3) {
-                        // 24-bit audio: read 3 bytes, convert to 16-bit value (but keep as i32 for interpolation)
-                        const b1_0 = self.audio_data[sample_offset + 1];
-                        const b1_2 = self.audio_data[sample_offset + 2];
-                        sample1 = @as(i32, @as(i16, @bitCast((@as(u16, b1_2) << 8) | @as(u16, b1_0))));
-
-                        const b2_0 = self.audio_data[next_sample_offset + 1];
-                        const b2_2 = self.audio_data[next_sample_offset + 2];
-                        sample2 = @as(i32, @as(i16, @bitCast((@as(u16, b2_2) << 8) | @as(u16, b2_0))));
-                    } else {
-                        // 16-bit audio
-                        sample1 = @as(i32, std.mem.readInt(i16, self.audio_data[sample_offset..][0..2], .little));
-                        sample2 = @as(i32, std.mem.readInt(i16, self.audio_data[next_sample_offset..][0..2], .little));
-                    }
-
-                    // Linear interpolation between samples to eliminate aliasing
-                    const interpolated: i32 = sample1 + @as(i32, @intFromFloat(@as(f64, @floatFromInt(sample2 - sample1)) * frac));
-
-                    // Apply volume
-                    var final_sample: i32 = interpolated;
-                    if (self.volume < 100) {
-                        final_sample = @divTrunc(interpolated * self.volume, 100);
-                    }
-
-                    output_samples[out_idx * channels + ch] = @intCast(std.math.clamp(final_sample, -32768, 32767));
-                } else {
-                    output_samples[out_idx * channels + ch] = 0;
+            // Apply volume if not 100%
+            if (self.volume < 100) {
+                const samples: [*]i16 = @ptrCast(@alignCast(output.ptr));
+                const num_samples = bytes_to_copy / 2;
+                for (0..num_samples) |i| {
+                    const scaled = @divTrunc(@as(i32, samples[i]) * self.volume, 100);
+                    samples[i] = @intCast(std.math.clamp(scaled, -32768, 32767));
                 }
             }
+
+            self.audio_offset += bytes_to_copy;
         }
 
-        // Advance source position by how many source frames we consumed
-        const frames_consumed: usize = @intFromFloat(@as(f64, @floatFromInt(num_output_frames)) * ratio);
-        self.audio_offset += frames_consumed * frame_size;
+        // Fill remaining with silence if we hit end of track
+        if (bytes_to_copy < output.len) {
+            @memset(output[bytes_to_copy..], 0);
+            self.state = .stopped;
+        }
 
-        // Update position in milliseconds
-        const frames_played = self.audio_offset / frame_size;
-        self.position_ms = (@as(u64, frames_played) * 1000) / source_rate;
+        // Update position
+        const samples_played = self.audio_offset / 4; // 4 bytes per stereo sample
+        self.position_ms = (samples_played * 1000) / 44100;
     }
 
     /// Start or resume playback
     pub fn play(self: *Self) void {
-        if (self.audio_data.len == 0) return;
+        if (self.converted_data.len == 0) return;
 
         self.state = .playing;
         if (self.audio_device != 0) {
@@ -348,12 +304,11 @@ pub const AudioPlayer = struct {
 
     /// Seek to position (milliseconds)
     pub fn seekMs(self: *Self, position: u64) void {
-        const bytes_per_sample = self.track_info.bits_per_sample / 8;
-        const bytes_per_ms = (self.track_info.sample_rate * bytes_per_sample * self.track_info.channels) / 1000;
+        // Converted data is 44100Hz, 16-bit stereo = 4 bytes per sample
+        const bytes_per_ms = (44100 * 4) / 1000; // ~176 bytes per ms
         const target_offset = position * bytes_per_ms;
-        const max_offset = self.audio_data.len - self.data_start;
 
-        self.audio_offset = @min(target_offset, max_offset);
+        self.audio_offset = @min(target_offset, self.converted_data.len);
         self.position_ms = position;
     }
 
