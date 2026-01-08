@@ -176,13 +176,99 @@ fn fiqHandler_arm() callconv(.naked) void {
 // Interrupt Handling (callable from assembly)
 // ============================================================
 
+const interrupts = @import("interrupts.zig");
+
+// Import register definitions for interrupt controller
+const reg = @import("../hal/pp5021c/registers.zig");
+
 export fn handleIrq() void {
-    // Read interrupt status and dispatch
-    // This would check CPU_INT_STAT and call registered handlers
+    // Read interrupt status register
+    const status = reg.readReg(u32, reg.CPU_INT_STAT);
+
+    // Dispatch to registered handlers based on active interrupts
+    // Check each interrupt source and call handler if registered
+
+    // Timer 1 interrupt (main tick)
+    if ((status & reg.TIMER1_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.timer1)]) |handler| {
+            handler();
+        }
+        // Clear the interrupt
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.TIMER1_IRQ);
+    }
+
+    // Timer 2 interrupt
+    if ((status & reg.TIMER2_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.timer2)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.TIMER2_IRQ);
+    }
+
+    // I2S audio interrupt (FIFO needs data)
+    if ((status & reg.IIS_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.i2s)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.IIS_IRQ);
+    }
+
+    // DMA interrupt (transfer complete)
+    if ((status & reg.DMA_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.dma)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.DMA_IRQ);
+    }
+
+    // IDE/ATA interrupt
+    if ((status & reg.IDE_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.ide)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.IDE_IRQ);
+    }
+
+    // GPIO interrupts (click wheel, buttons)
+    if ((status & reg.GPIO0_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.gpio0)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.GPIO0_IRQ);
+    }
+
+    if ((status & reg.GPIO1_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.gpio1)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.GPIO1_IRQ);
+    }
+
+    // USB interrupt
+    if ((status & reg.USB_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.usb)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.USB_IRQ);
+    }
+
+    // I2C interrupt
+    if ((status & reg.I2C_IRQ) != 0) {
+        if (interrupts.handlers[@intFromEnum(interrupts.Interrupt.i2c)]) |handler| {
+            handler();
+        }
+        reg.writeReg(u32, reg.CPU_INT_CLR, reg.I2C_IRQ);
+    }
 }
 
 export fn handleFiq() void {
-    // Fast interrupt handling
+    // Fast interrupt handling - typically used for time-critical operations
+    // On PP5021C, FIQ could be used for audio DMA if needed
+    const status = reg.readReg(u32, reg.CPU_INT_STAT);
+
+    // For now, just clear any pending FIQ sources
+    // In a full implementation, this would handle the highest-priority interrupt
+    _ = status;
 }
 
 // ============================================================

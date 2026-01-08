@@ -1,9 +1,136 @@
 //! Timer and Delay Utilities
 //!
 //! This module provides timing functions for ZigPod OS.
+//! Includes both software timers and hardware timer configuration
+//! for interrupt-driven timing on PP5021C.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const hal = @import("../hal/hal.zig");
+const interrupts = @import("interrupts.zig");
+
+// Hardware register access (only for ARM target)
+const is_arm = builtin.cpu.arch == .arm;
+const reg = if (is_arm) @import("../hal/pp5021c/registers.zig") else struct {
+    pub const TIMER1_CFG: usize = 0;
+    pub const TIMER1_VAL: usize = 0;
+    pub const TIMER2_CFG: usize = 0;
+    pub const TIMER2_VAL: usize = 0;
+    pub const CPU_INT_EN: usize = 0;
+    pub const TIMER1_IRQ: u32 = 1;
+    pub const TIMER2_IRQ: u32 = 2;
+    pub const TIMER_FREQ: u32 = 1_000_000;
+    pub fn readReg(comptime T: type, addr: usize) T {
+        _ = addr;
+        return 0;
+    }
+    pub fn writeReg(comptime T: type, addr: usize, value: T) void {
+        _ = addr;
+        _ = value;
+    }
+};
+
+// ============================================================
+// Hardware Timer Configuration (PP5021C)
+// ============================================================
+
+/// Timer configuration bits
+const TIMER_EN: u32 = 0x80000000; // Timer enable
+const TIMER_IRQ_EN: u32 = 0x40000000; // Interrupt enable
+const TIMER_PERIODIC: u32 = 0x20000000; // Periodic mode (auto-reload)
+const TIMER_CNT_MODE: u32 = 0x10000000; // Count mode
+
+/// System tick counter (incremented by timer interrupt)
+var system_ticks: u64 = 0;
+
+/// Tick rate in Hz (default 1000 = 1ms ticks)
+var tick_rate_hz: u32 = 1000;
+
+/// Hardware timer callback
+var hw_timer_callback: ?*const fn () void = null;
+
+/// Initialize hardware timer 1 for system ticks
+/// tick_hz: Number of ticks per second (e.g., 1000 for 1ms ticks)
+pub fn initHardwareTimer(tick_hz: u32) void {
+    if (!is_arm) return;
+
+    tick_rate_hz = tick_hz;
+
+    // Calculate reload value
+    // Timer runs at TIMER_FREQ (1 MHz)
+    // Reload = TIMER_FREQ / tick_hz
+    const reload_value = reg.TIMER_FREQ / tick_hz;
+
+    // Disable timer during configuration
+    reg.writeReg(u32, reg.TIMER1_CFG, 0);
+
+    // Set reload value
+    reg.writeReg(u32, reg.TIMER1_VAL, reload_value);
+
+    // Register our interrupt handler
+    interrupts.register(.timer1, timer1IrqHandler);
+
+    // Enable timer interrupt in interrupt controller
+    const int_en = reg.readReg(u32, reg.CPU_INT_EN);
+    reg.writeReg(u32, reg.CPU_INT_EN, int_en | reg.TIMER1_IRQ);
+
+    // Enable timer with interrupt and periodic mode
+    reg.writeReg(u32, reg.TIMER1_CFG, TIMER_EN | TIMER_IRQ_EN | TIMER_PERIODIC);
+}
+
+/// Stop hardware timer 1
+pub fn stopHardwareTimer() void {
+    if (!is_arm) return;
+
+    // Disable timer
+    reg.writeReg(u32, reg.TIMER1_CFG, 0);
+
+    // Disable interrupt
+    const int_en = reg.readReg(u32, reg.CPU_INT_EN);
+    reg.writeReg(u32, reg.CPU_INT_EN, int_en & ~reg.TIMER1_IRQ);
+
+    // Unregister handler
+    interrupts.unregister(.timer1);
+}
+
+/// Set callback for hardware timer (called on each tick)
+pub fn setTimerCallback(callback: ?*const fn () void) void {
+    hw_timer_callback = callback;
+}
+
+/// Timer 1 interrupt handler
+fn timer1IrqHandler() void {
+    // Increment system tick counter
+    system_ticks += 1;
+
+    // Call user callback if registered
+    if (hw_timer_callback) |cb| {
+        cb();
+    }
+
+    // Process software timers
+    processSoftwareTimers();
+}
+
+/// Get system tick count
+pub fn getSystemTicks() u64 {
+    return system_ticks;
+}
+
+/// Get tick rate in Hz
+pub fn getTickRate() u32 {
+    return tick_rate_hz;
+}
+
+/// Convert ticks to milliseconds
+pub fn ticksToMs(ticks: u64) u64 {
+    return (ticks * 1000) / tick_rate_hz;
+}
+
+/// Convert milliseconds to ticks
+pub fn msToTicks(ms: u64) u64 {
+    return (ms * tick_rate_hz) / 1000;
+}
 
 // ============================================================
 // Delay Functions

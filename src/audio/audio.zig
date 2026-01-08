@@ -25,6 +25,9 @@ pub const metadata = @import("metadata.zig");
 // Export DSP effects
 pub const dsp = @import("dsp.zig");
 
+// Export audio hardware (DMA-based output)
+pub const audio_hw = @import("audio_hw.zig");
+
 // ============================================================
 // Audio Constants
 // ============================================================

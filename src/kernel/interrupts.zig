@@ -32,7 +32,8 @@ pub const Interrupt = enum(u8) {
 
 pub const Handler = *const fn () void;
 
-var handlers: [32]?Handler = [_]?Handler{null} ** 32;
+/// Interrupt handler table - accessible for dispatch from boot.zig
+pub var handlers: [32]?Handler = [_]?Handler{null} ** 32;
 var enabled_mask: u32 = 0;
 
 /// Register an interrupt handler

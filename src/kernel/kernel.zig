@@ -7,6 +7,7 @@ pub const boot = @import("boot.zig");
 pub const memory = @import("memory.zig");
 pub const interrupts = @import("interrupts.zig");
 pub const timer = @import("timer.zig");
+pub const dma = @import("dma.zig");
 
 // Re-export commonly used types
 pub const CriticalSection = interrupts.CriticalSection;
@@ -21,4 +22,5 @@ test {
     _ = memory;
     _ = interrupts;
     _ = timer;
+    _ = dma;
 }
