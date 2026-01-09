@@ -11,9 +11,11 @@ const clickwheel = @import("../drivers/input/clickwheel.zig");
 // Export UI modules
 pub const now_playing = @import("now_playing.zig");
 pub const file_browser = @import("file_browser.zig");
+pub const music_browser = @import("music_browser.zig");
 pub const settings = @import("settings.zig");
 pub const system_info = @import("system_info.zig");
 pub const theme_loader = @import("theme_loader.zig");
+pub const state_machine = @import("state_machine.zig");
 
 // ============================================================
 // UI Constants

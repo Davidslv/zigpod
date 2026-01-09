@@ -114,6 +114,13 @@ pub const fixed = @import("lib/fixed_point.zig");
 pub const crc = @import("lib/crc.zig");
 
 // ============================================================
+// Performance Profiling
+// ============================================================
+
+/// Performance metrics and profiling
+pub const perf = @import("perf/metrics.zig");
+
+// ============================================================
 // Simulator
 // ============================================================
 

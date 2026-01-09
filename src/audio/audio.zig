@@ -25,6 +25,9 @@ pub const metadata = @import("metadata.zig");
 // Export DSP effects
 pub const dsp = @import("dsp.zig");
 
+// Export unified audio pipeline
+pub const pipeline = @import("pipeline.zig");
+
 // Export audio hardware (DMA-based output)
 pub const audio_hw = @import("audio_hw.zig");
 
@@ -162,6 +165,10 @@ var volume_left: i16 = -10; // Volume in dB (-89 to +6)
 var volume_right: i16 = -10;
 var muted: bool = false;
 var initialized: bool = false;
+
+// DSP processing chain (EQ, bass boost, stereo widening, volume ramping)
+var dsp_chain: dsp.DspChain = dsp.DspChain.init();
+var dsp_enabled: bool = true;
 
 // Gapless playback state
 var slots: [2]DecoderSlot = .{ DecoderSlot{}, DecoderSlot{} };
@@ -661,6 +668,93 @@ pub fn isMuted() bool {
 }
 
 // ============================================================
+// DSP Effects Control
+// ============================================================
+
+/// Get the DSP chain for direct access
+pub fn getDspChain() *dsp.DspChain {
+    return &dsp_chain;
+}
+
+/// Enable/disable DSP processing
+pub fn setDspEnabled(enabled: bool) void {
+    dsp_enabled = enabled;
+}
+
+/// Check if DSP is enabled
+pub fn isDspEnabled() bool {
+    return dsp_enabled;
+}
+
+/// Set software volume via DSP (0-100%)
+/// This uses smooth ramping to prevent clicks
+pub fn setDspVolume(percent: u8) void {
+    dsp_chain.setVolume(percent);
+}
+
+/// Get current DSP volume
+pub fn getDspVolume() u8 {
+    return dsp_chain.getVolume();
+}
+
+/// Set EQ band gain (-12 to +12 dB)
+pub fn setEqBand(band: usize, gain_db: i8) void {
+    dsp_chain.equalizer.setBandGain(band, gain_db);
+}
+
+/// Get EQ band gain
+pub fn getEqBand(band: usize) i8 {
+    return dsp_chain.equalizer.getBandGain(band);
+}
+
+/// Apply an EQ preset by index
+pub fn applyEqPreset(preset_index: usize) void {
+    dsp_chain.applyPreset(preset_index);
+}
+
+/// Enable/disable EQ
+pub fn setEqEnabled(enabled: bool) void {
+    dsp_chain.equalizer.enabled = enabled;
+}
+
+/// Check if EQ is enabled
+pub fn isEqEnabled() bool {
+    return dsp_chain.equalizer.enabled;
+}
+
+/// Set bass boost (0-12 dB)
+pub fn setBassBoost(db: i8) void {
+    dsp_chain.bass_boost.setBoost(db);
+    dsp_chain.bass_boost.enabled = db > 0;
+}
+
+/// Get bass boost level
+pub fn getBassBoost() i8 {
+    return dsp_chain.bass_boost.boost_db;
+}
+
+/// Set stereo width (0-200%, 100 = normal)
+pub fn setStereoWidth(percent: u8) void {
+    dsp_chain.stereo_widener.setWidth(percent);
+    dsp_chain.stereo_widener.enabled = percent != 100;
+}
+
+/// Check if volume is currently ramping
+pub fn isVolumeRamping() bool {
+    return dsp_chain.isVolumeRamping();
+}
+
+/// Mute via DSP with smooth fade out
+pub fn dspMute() void {
+    dsp_chain.mute();
+}
+
+/// Unmute via DSP with smooth fade in
+pub fn dspUnmute(percent: u8) void {
+    dsp_chain.unmute(percent);
+}
+
+// ============================================================
 // Audio Processing (called from main loop or interrupt)
 // ============================================================
 
@@ -692,6 +786,10 @@ pub fn process() hal.HalError!void {
         var samples: [64]i16 = undefined;
         const count = slot.buffer.read(&samples);
         if (count > 0) {
+            // Apply DSP processing (EQ, bass boost, stereo widening, volume)
+            if (dsp_enabled) {
+                dsp_chain.processBuffer(samples[0..count]);
+            }
             _ = try i2s.write(samples[0..count]);
         }
     }
