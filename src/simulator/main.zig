@@ -46,6 +46,7 @@ const Options = struct {
     rom_path: ?[]const u8 = null,
     disk_image: ?[]const u8 = null,
     audio_file: ?[]const u8 = null,
+    audio_samples: ?[]const u8 = null,
     cycles_per_frame: u64 = 10000,
     headless: bool = false,
     debug: bool = false,
@@ -74,6 +75,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--audio") or std.mem.eql(u8, arg, "-a")) {
             i += 1;
             if (i < args.len) options.audio_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--audio-samples") or std.mem.eql(u8, arg, "-s")) {
+            i += 1;
+            if (i < args.len) options.audio_samples = args[i];
         } else if (std.mem.eql(u8, arg, "--headless")) {
             options.headless = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -99,6 +103,7 @@ pub fn main() !void {
         .lcd_visualization = !options.headless,
         .debug_logging = options.debug,
         .disk_image_path = options.disk_image,
+        .audio_samples_path = options.audio_samples,
     };
 
     try simulator.initSimulator(allocator, config);
@@ -660,6 +665,7 @@ fn printHelp() void {
         \\  -r, --rom <file>     Load ROM/firmware binary
         \\  -d, --disk <file>    Attach disk image
         \\  -a, --audio <file>   Play WAV audio file (requires -Dsdl2=true)
+        \\  -s, --audio-samples <dir>  Create mock FAT32 with files from directory
         \\  -c, --cycles <n>     Cycles per frame (default: 10000)
         \\  -b, --break <addr>   Set breakpoint at address
         \\  --headless           Run without interactive mode
@@ -686,6 +692,7 @@ fn printHelp() void {
         \\  zigpod-sim -r firmware.bin         # Load and run firmware
         \\  zigpod-sim -a music.wav            # Play audio (GUI mode)
         \\  zigpod-sim -r rom.bin -d disk.img  # With disk image
+        \\  zigpod-sim -s ./audio-samples      # Mock FAT32 with audio files
         \\
     ) catch {};
 }

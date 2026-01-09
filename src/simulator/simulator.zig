@@ -31,6 +31,7 @@ pub const storage = struct {
     pub const disk_image = @import("storage/disk_image.zig");
     pub const identify = @import("storage/identify.zig");
     pub const ata_controller = @import("storage/ata_controller.zig");
+    pub const mock_fat32 = @import("storage/mock_fat32.zig");
 };
 
 // Export interrupt simulation modules
@@ -78,6 +79,8 @@ pub const SimulatorConfig = struct {
     disk_image_path: ?[]const u8 = null,
     /// In-memory disk size in sectors (if disk_image_path is null)
     memory_disk_sectors: u64 = 60 * 1024 * 1024 / 512, // 60MB default
+    /// Path to audio samples directory to populate mock FAT32 (overrides disk_image_path)
+    audio_samples_path: ?[]const u8 = null,
 };
 
 // ============================================================
@@ -170,7 +173,14 @@ pub const SimulatorState = struct {
         self.audio_buffer = .{};
 
         // Initialize disk image and ATA controller
-        if (config.disk_image_path) |path| {
+        if (config.audio_samples_path) |audio_path| {
+            // Create mock FAT32 disk populated with audio samples
+            std.debug.print("Creating mock FAT32 with audio samples from: {s}\n", .{audio_path});
+            self.disk_image = storage.mock_fat32.createMockDiskWithAudioSamples(allocator, audio_path) catch |err| blk: {
+                std.debug.print("Failed to create mock FAT32: {}\n", .{err});
+                break :blk null;
+            };
+        } else if (config.disk_image_path) |path| {
             // Open existing disk image file
             self.disk_image = storage.disk_image.DiskImage.open(path, false) catch null;
         } else if (config.memory_disk_sectors > 0) {
