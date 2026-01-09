@@ -766,6 +766,9 @@ fn simAtaIdentify() hal.HalError!hal.AtaDeviceInfo {
                 info.sector_size = 512;
                 info.supports_lba48 = disk.requiresLba48();
                 info.supports_dma = true;
+                // Simulator defaults to flash storage for faster testing
+                info.rotation_rate = 0x0001; // Non-rotating (SSD/flash)
+                info.supports_trim = true;
 
                 // Run identify command to verify controller works
                 controller.writeCommand(@intFromEnum(storage.ata_controller.AtaCommand.identify));

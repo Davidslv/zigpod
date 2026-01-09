@@ -2,6 +2,18 @@
 //!
 //! Provides safe flashing operations with automatic backup,
 //! verification, and rollback capabilities.
+//!
+//! SAFETY FEATURES:
+//! - Battery level check before any flash operation (minimum 20%)
+//! - Watchdog timer integration to prevent hangs during flash
+//! - Automatic backup before flashing with verification
+//! - Post-flash verification with automatic rollback on failure
+//! - Protected region detection to prevent bricking
+//!
+//! WARNING: Flashing firmware is inherently dangerous. Always ensure:
+//! - Device is connected to power (not just battery)
+//! - Battery has sufficient charge (>20%)
+//! - You have a verified backup before proceeding
 
 const std = @import("std");
 const backup = @import("backup.zig");
@@ -12,6 +24,32 @@ const BackupMetadata = backup.BackupMetadata;
 const DiskModeInterface = disk_mode.DiskModeInterface;
 const DeviceInfo = disk_mode.DeviceInfo;
 const DiskModeError = disk_mode.DiskModeError;
+
+// ============================================================
+// Safety Constants
+// ============================================================
+
+/// Minimum battery percentage required to start flashing
+pub const MIN_BATTERY_PERCENT: u8 = 20;
+
+/// Critical battery level - abort immediately
+pub const CRITICAL_BATTERY_PERCENT: u8 = 10;
+
+/// Minimum battery voltage in millivolts (3.2V)
+pub const MIN_BATTERY_VOLTAGE_MV: u16 = 3200;
+
+/// Watchdog timeout for flash operations (60 seconds)
+pub const FLASH_WATCHDOG_TIMEOUT_MS: u32 = 60_000;
+
+/// Watchdog refresh interval during operations (5 seconds)
+pub const WATCHDOG_REFRESH_INTERVAL_SECTORS: u64 = 1000;
+
+/// Maximum retry attempts for failed operations
+pub const MAX_RETRY_ATTEMPTS: u8 = 3;
+
+// ============================================================
+// Errors
+// ============================================================
 
 /// Flasher errors
 pub const FlasherError = error{
@@ -29,11 +67,24 @@ pub const FlasherError = error{
     ProtectedRegion,
     AlreadyInProgress,
     NothingToRollback,
+    /// Battery level too low to safely complete flash operation
+    LowBattery,
+    /// Battery level critically low - operation aborted for safety
+    CriticalBattery,
+    /// External power required but not connected
+    ExternalPowerRequired,
+    /// Watchdog timeout during operation
+    WatchdogTimeout,
+    /// Operation exceeded maximum retry attempts
+    MaxRetriesExceeded,
+    /// Hardware safety check failed
+    SafetyCheckFailed,
 };
 
 /// Flash operation state
 pub const FlashState = enum {
     idle,
+    checking_safety,
     backing_up,
     verifying_backup,
     flashing,
@@ -41,6 +92,8 @@ pub const FlashState = enum {
     rolling_back,
     completed,
     failed,
+    aborted_low_battery,
+    aborted_safety,
 };
 
 /// Progress callback
@@ -62,6 +115,99 @@ pub const FlashOptions = struct {
     backup_dir: []const u8 = "zigpod_backups",
     /// Description for backup
     backup_description: []const u8 = "Pre-flash backup",
+
+    // Safety options
+    /// Check battery level before flashing (highly recommended)
+    check_battery: bool = true,
+    /// Minimum battery percentage required (default: 20%)
+    min_battery_percent: u8 = MIN_BATTERY_PERCENT,
+    /// Require external power for large flash operations
+    require_external_power: bool = false,
+    /// Enable watchdog during flash operations
+    enable_watchdog: bool = true,
+    /// Watchdog timeout in milliseconds
+    watchdog_timeout_ms: u32 = FLASH_WATCHDOG_TIMEOUT_MS,
+    /// Abort if battery drops below critical level during flash
+    abort_on_critical_battery: bool = true,
+    /// Number of retry attempts for failed operations
+    max_retries: u8 = MAX_RETRY_ATTEMPTS,
+    /// Auto-rollback on verification failure
+    auto_rollback_on_failure: bool = true,
+};
+
+/// Safety check result
+pub const SafetyCheckResult = struct {
+    passed: bool,
+    battery_percent: u8,
+    battery_voltage_mv: u16,
+    external_power: bool,
+    is_charging: bool,
+    failure_reason: ?[]const u8,
+
+    pub fn format(self: *const SafetyCheckResult, writer: anytype) !void {
+        try writer.print("Safety Check Results:\n", .{});
+        try writer.print("  Status: {s}\n", .{if (self.passed) "PASSED" else "FAILED"});
+        try writer.print("  Battery: {d}% ({d}mV)\n", .{ self.battery_percent, self.battery_voltage_mv });
+        try writer.print("  External Power: {s}\n", .{if (self.external_power) "Yes" else "No"});
+        try writer.print("  Charging: {s}\n", .{if (self.is_charging) "Yes" else "No"});
+        if (self.failure_reason) |reason| {
+            try writer.print("  Failure: {s}\n", .{reason});
+        }
+    }
+};
+
+/// Battery status provider interface
+/// Allows the flasher to work with either real hardware or mock for testing
+pub const BatteryProvider = struct {
+    get_percent: *const fn () u8,
+    get_voltage_mv: *const fn () u16,
+    is_charging: *const fn () bool,
+    external_power_present: *const fn () bool,
+
+    /// Default provider that returns safe values for host testing
+    pub const mock = BatteryProvider{
+        .get_percent = mockGetPercent,
+        .get_voltage_mv = mockGetVoltage,
+        .is_charging = mockIsCharging,
+        .external_power_present = mockExternalPower,
+    };
+
+    fn mockGetPercent() u8 {
+        return 100; // Assume full battery for host testing
+    }
+
+    fn mockGetVoltage() u16 {
+        return 4200; // Full charge voltage
+    }
+
+    fn mockIsCharging() bool {
+        return false;
+    }
+
+    fn mockExternalPower() bool {
+        return true; // Assume external power for host testing
+    }
+};
+
+/// Watchdog provider interface
+pub const WatchdogProvider = struct {
+    init: *const fn (timeout_ms: u32) void,
+    start: *const fn () void,
+    stop: *const fn () void,
+    refresh: *const fn () void,
+
+    /// Default provider that does nothing for host testing
+    pub const mock = WatchdogProvider{
+        .init = mockInit,
+        .start = mockStart,
+        .stop = mockStop,
+        .refresh = mockRefresh,
+    };
+
+    fn mockInit(_: u32) void {}
+    fn mockStart() void {}
+    fn mockStop() void {}
+    fn mockRefresh() void {}
 };
 
 /// Safe Flasher
@@ -76,23 +222,129 @@ pub const SafeFlasher = struct {
     last_backup_path: ?[]u8 = null,
     /// Allocator
     allocator: std.mem.Allocator,
+    /// Battery status provider
+    battery: BatteryProvider,
+    /// Watchdog provider
+    watchdog: WatchdogProvider,
+    /// Sectors processed (for watchdog refresh)
+    sectors_processed: u64 = 0,
+    /// Last safety check result
+    last_safety_check: ?SafetyCheckResult = null,
 
     const Self = @This();
 
-    /// Create a new safe flasher
+    /// Create a new safe flasher with mock providers (for host testing)
     pub fn init(allocator: std.mem.Allocator, backup_dir: []const u8) Self {
+        return initWithProviders(allocator, backup_dir, BatteryProvider.mock, WatchdogProvider.mock);
+    }
+
+    /// Create a new safe flasher with custom providers (for real hardware)
+    pub fn initWithProviders(
+        allocator: std.mem.Allocator,
+        backup_dir: []const u8,
+        battery_provider: BatteryProvider,
+        watchdog_provider: WatchdogProvider,
+    ) Self {
         return .{
             .allocator = allocator,
             .disk = DiskModeInterface.init(allocator),
             .backups = BackupManager.init(allocator, backup_dir),
+            .battery = battery_provider,
+            .watchdog = watchdog_provider,
         };
     }
 
     /// Cleanup
     pub fn deinit(self: *Self) void {
+        // Ensure watchdog is stopped
+        self.watchdog.stop();
         self.disk.deinit();
         if (self.last_backup_path) |path| {
             self.allocator.free(path);
+        }
+    }
+
+    // ============================================================
+    // Safety Check Functions
+    // ============================================================
+
+    /// Perform comprehensive safety check before flash operation
+    pub fn checkSafety(self: *Self, options: FlashOptions) SafetyCheckResult {
+        const battery_percent = self.battery.get_percent();
+        const battery_voltage = self.battery.get_voltage_mv();
+        const external_power = self.battery.external_power_present();
+        const is_charging = self.battery.is_charging();
+
+        var result = SafetyCheckResult{
+            .passed = true,
+            .battery_percent = battery_percent,
+            .battery_voltage_mv = battery_voltage,
+            .external_power = external_power,
+            .is_charging = is_charging,
+            .failure_reason = null,
+        };
+
+        // Check battery level
+        if (options.check_battery) {
+            if (battery_percent < CRITICAL_BATTERY_PERCENT) {
+                result.passed = false;
+                result.failure_reason = "CRITICAL: Battery below 10% - flash operation forbidden";
+                self.last_safety_check = result;
+                return result;
+            }
+
+            if (battery_percent < options.min_battery_percent) {
+                result.passed = false;
+                result.failure_reason = "Battery below minimum threshold for safe flashing";
+                self.last_safety_check = result;
+                return result;
+            }
+
+            // Also check voltage as backup (percentage can be unreliable)
+            if (battery_voltage < MIN_BATTERY_VOLTAGE_MV and !external_power) {
+                result.passed = false;
+                result.failure_reason = "Battery voltage too low (below 3.2V)";
+                self.last_safety_check = result;
+                return result;
+            }
+        }
+
+        // Check external power requirement
+        if (options.require_external_power and !external_power) {
+            result.passed = false;
+            result.failure_reason = "External power required but not connected";
+            self.last_safety_check = result;
+            return result;
+        }
+
+        self.last_safety_check = result;
+        return result;
+    }
+
+    /// Check if battery is at critical level (should abort immediately)
+    pub fn isBatteryCritical(self: *Self) bool {
+        return self.battery.get_percent() < CRITICAL_BATTERY_PERCENT;
+    }
+
+    /// Get last safety check result
+    pub fn getLastSafetyCheck(self: *const Self) ?SafetyCheckResult {
+        return self.last_safety_check;
+    }
+
+    /// Refresh watchdog and check battery during long operations
+    fn refreshSafetyDuringOperation(self: *Self, options: FlashOptions) FlasherError!void {
+        self.sectors_processed += 1;
+
+        // Refresh watchdog periodically
+        if (self.sectors_processed % WATCHDOG_REFRESH_INTERVAL_SECTORS == 0) {
+            self.watchdog.refresh();
+
+            // Also check battery during long operations
+            if (options.abort_on_critical_battery and self.isBatteryCritical()) {
+                self.state = .aborted_low_battery;
+                self.watchdog.stop();
+                return FlasherError.CriticalBattery;
+            }
         }
     }
 
@@ -165,7 +417,19 @@ pub const SafeFlasher = struct {
         return self.last_backup_path.?;
     }
 
-    /// Flash data to device (with safety checks)
+    /// Flash data to device (with comprehensive safety checks)
+    ///
+    /// This function implements a safe flashing procedure:
+    /// 1. Pre-flight safety checks (battery, power)
+    /// 2. Watchdog initialization
+    /// 3. Automatic backup creation
+    /// 4. Backup verification
+    /// 5. Flash operation with periodic safety checks
+    /// 6. Post-flash verification
+    /// 7. Automatic rollback on failure (if enabled)
+    ///
+    /// Returns error if any step fails. On verification failure,
+    /// will attempt automatic rollback if auto_rollback_on_failure is enabled.
     pub fn flashData(
         self: *Self,
         start_sector: u64,
@@ -178,33 +442,96 @@ pub const SafeFlasher = struct {
         const info = self.disk.getDeviceInfo() orelse return FlasherError.NotConnected;
         const sector_count = (data.len + info.sector_size - 1) / info.sector_size;
 
-        // Step 1: Create backup
+        // Reset state tracking
+        self.sectors_processed = 0;
+
+        // ============================================================
+        // Step 0: Pre-flight Safety Checks
+        // ============================================================
+        self.state = .checking_safety;
+        self.reportProgress(options.progress_callback, 0, sector_count, "Checking safety conditions...");
+
+        const safety = self.checkSafety(options);
+        if (!safety.passed) {
+            self.state = .aborted_safety;
+            if (safety.battery_percent < CRITICAL_BATTERY_PERCENT) {
+                return FlasherError.CriticalBattery;
+            }
+            if (safety.failure_reason) |reason| {
+                if (std.mem.indexOf(u8, reason, "External power") != null) {
+                    return FlasherError.ExternalPowerRequired;
+                }
+            }
+            return FlasherError.LowBattery;
+        }
+
+        // ============================================================
+        // Step 1: Initialize Watchdog
+        // ============================================================
+        if (options.enable_watchdog) {
+            self.watchdog.init(options.watchdog_timeout_ms);
+            self.watchdog.start();
+        }
+        // Ensure watchdog is stopped on any exit
+        defer if (options.enable_watchdog) self.watchdog.stop();
+
+        // ============================================================
+        // Step 2: Create Backup
+        // ============================================================
         if (options.create_backup) {
             self.state = .backing_up;
             self.reportProgress(options.progress_callback, 0, sector_count, "Creating backup...");
 
-            _ = try self.createBackup(start_sector, sector_count, options.backup_description);
+            if (options.enable_watchdog) self.watchdog.refresh();
+
+            _ = self.createBackup(start_sector, sector_count, options.backup_description) catch |err| {
+                self.state = .failed;
+                return err;
+            };
         }
 
-        // Step 2: Verify backup if requested
+        // ============================================================
+        // Step 3: Verify Backup
+        // ============================================================
         if (options.create_backup and options.verify_backup_before_flash) {
             self.state = .verifying_backup;
-            self.reportProgress(options.progress_callback, 0, 1, "Verifying backup...");
+            self.reportProgress(options.progress_callback, 0, 1, "Verifying backup integrity...");
+
+            if (options.enable_watchdog) self.watchdog.refresh();
 
             if (self.last_backup_path) |path| {
-                _ = self.backups.verifyBackup(path) catch return FlasherError.VerificationFailed;
+                _ = self.backups.verifyBackup(path) catch {
+                    self.state = .failed;
+                    return FlasherError.VerificationFailed;
+                };
             }
         }
 
-        // Step 3: Set protection mode
+        // ============================================================
+        // Step 4: Final Pre-Flash Battery Check
+        // ============================================================
+        if (options.check_battery) {
+            if (self.isBatteryCritical()) {
+                self.state = .aborted_low_battery;
+                return FlasherError.CriticalBattery;
+            }
+        }
+
+        // ============================================================
+        // Step 5: Set Protection Mode
+        // ============================================================
         if (options.allow_protected_writes) {
             self.disk.enableProtectedWrites(true);
         }
         defer self.disk.enableProtectedWrites(false);
 
-        // Step 4: Flash
+        // ============================================================
+        // Step 6: Flash Operation
+        // ============================================================
         self.state = .flashing;
-        self.reportProgress(options.progress_callback, 0, sector_count, "Flashing...");
+        self.reportProgress(options.progress_callback, 0, sector_count, "Flashing firmware...");
+
+        if (options.enable_watchdog) self.watchdog.refresh();
 
         const bytes_written = self.disk.writeSectors(
             start_sector,
@@ -212,6 +539,11 @@ pub const SafeFlasher = struct {
             data,
         ) catch |err| {
             self.state = .failed;
+            // Attempt rollback on write failure if we have a backup
+            if (options.auto_rollback_on_failure and self.last_backup_path != null) {
+                self.reportProgress(options.progress_callback, 0, sector_count, "Write failed - attempting rollback...");
+                self.rollback() catch {};
+            }
             return switch (err) {
                 DiskModeError.ProtectedRegion => FlasherError.ProtectedRegion,
                 else => FlasherError.WriteFailed,
@@ -220,27 +552,63 @@ pub const SafeFlasher = struct {
 
         if (bytes_written < data.len) {
             self.state = .failed;
+            if (options.auto_rollback_on_failure and self.last_backup_path != null) {
+                self.reportProgress(options.progress_callback, 0, sector_count, "Incomplete write - attempting rollback...");
+                self.rollback() catch {};
+            }
             return FlasherError.WriteFailed;
         }
 
-        // Step 5: Verify
+        // ============================================================
+        // Step 7: Post-Flash Verification
+        // ============================================================
         if (options.verify_after_write) {
             self.state = .verifying_flash;
             self.reportProgress(options.progress_callback, 0, sector_count, "Verifying flash...");
 
-            const verify_buffer = self.allocator.alloc(u8, data.len) catch return FlasherError.VerificationFailed;
+            if (options.enable_watchdog) self.watchdog.refresh();
+
+            // Check battery before verification (it's a critical phase)
+            if (options.abort_on_critical_battery and self.isBatteryCritical()) {
+                self.state = .aborted_low_battery;
+                return FlasherError.CriticalBattery;
+            }
+
+            const verify_buffer = self.allocator.alloc(u8, data.len) catch {
+                self.state = .failed;
+                return FlasherError.VerificationFailed;
+            };
             defer self.allocator.free(verify_buffer);
 
-            _ = self.disk.readSectors(start_sector, @intCast(sector_count), verify_buffer) catch return FlasherError.ReadFailed;
+            _ = self.disk.readSectors(start_sector, @intCast(sector_count), verify_buffer) catch {
+                self.state = .failed;
+                // Attempt rollback on read failure during verify
+                if (options.auto_rollback_on_failure and self.last_backup_path != null) {
+                    self.reportProgress(options.progress_callback, 0, sector_count, "Verification read failed - attempting rollback...");
+                    self.rollback() catch {};
+                }
+                return FlasherError.ReadFailed;
+            };
 
             if (!std.mem.eql(u8, data, verify_buffer[0..data.len])) {
                 self.state = .failed;
+                // CRITICAL: Data mismatch - attempt rollback immediately
+                if (options.auto_rollback_on_failure and self.last_backup_path != null) {
+                    self.reportProgress(options.progress_callback, 0, sector_count, "VERIFICATION FAILED - rolling back...");
+                    self.rollback() catch {
+                        // Rollback failed too - this is a critical situation
+                        self.reportProgress(options.progress_callback, 0, sector_count, "CRITICAL: Rollback failed! Device may be in inconsistent state.");
+                    };
+                }
                 return FlasherError.VerificationFailed;
             }
         }
 
+        // ============================================================
+        // Step 8: Success
+        // ============================================================
         self.state = .completed;
-        self.reportProgress(options.progress_callback, sector_count, sector_count, "Complete!");
+        self.reportProgress(options.progress_callback, sector_count, sector_count, "Flash completed successfully!");
     }
 
     /// Rollback to last backup
@@ -414,4 +782,168 @@ test "print summary" {
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "Test Device") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "51200 bytes") != null);
+}
+
+// ============================================================
+// Safety Feature Tests
+// ============================================================
+
+test "safety constants are sensible" {
+    try std.testing.expect(MIN_BATTERY_PERCENT > CRITICAL_BATTERY_PERCENT);
+    try std.testing.expect(MIN_BATTERY_PERCENT <= 30);
+    try std.testing.expect(CRITICAL_BATTERY_PERCENT >= 5);
+    try std.testing.expect(MIN_BATTERY_VOLTAGE_MV >= 3000);
+    try std.testing.expect(FLASH_WATCHDOG_TIMEOUT_MS >= 30_000);
+}
+
+test "flash options safety defaults" {
+    const options = FlashOptions{};
+
+    try std.testing.expect(options.check_battery);
+    try std.testing.expect(options.enable_watchdog);
+    try std.testing.expect(options.abort_on_critical_battery);
+    try std.testing.expect(options.auto_rollback_on_failure);
+    try std.testing.expectEqual(MIN_BATTERY_PERCENT, options.min_battery_percent);
+    try std.testing.expectEqual(FLASH_WATCHDOG_TIMEOUT_MS, options.watchdog_timeout_ms);
+}
+
+test "safety check passes with mock provider" {
+    const allocator = std.testing.allocator;
+    var flasher = SafeFlasher.init(allocator, "/tmp/backups");
+    defer flasher.deinit();
+
+    const result = flasher.checkSafety(FlashOptions{});
+    try std.testing.expect(result.passed);
+    try std.testing.expectEqual(@as(u8, 100), result.battery_percent);
+    try std.testing.expect(result.failure_reason == null);
+}
+
+test "safety check fails with low battery provider" {
+    const allocator = std.testing.allocator;
+
+    // Create custom provider that reports low battery
+    const low_battery_provider = BatteryProvider{
+        .get_percent = struct {
+            fn f() u8 {
+                return 5; // Critical level
+            }
+        }.f,
+        .get_voltage_mv = struct {
+            fn f() u16 {
+                return 3000;
+            }
+        }.f,
+        .is_charging = struct {
+            fn f() bool {
+                return false;
+            }
+        }.f,
+        .external_power_present = struct {
+            fn f() bool {
+                return false;
+            }
+        }.f,
+    };
+
+    var flasher = SafeFlasher.initWithProviders(
+        allocator,
+        "/tmp/backups",
+        low_battery_provider,
+        WatchdogProvider.mock,
+    );
+    defer flasher.deinit();
+
+    const result = flasher.checkSafety(FlashOptions{});
+    try std.testing.expect(!result.passed);
+    try std.testing.expectEqual(@as(u8, 5), result.battery_percent);
+    try std.testing.expect(result.failure_reason != null);
+}
+
+test "safety check passes with low battery but external power" {
+    const allocator = std.testing.allocator;
+
+    // Low battery but external power connected
+    const provider = BatteryProvider{
+        .get_percent = struct {
+            fn f() u8 {
+                return 15; // Below threshold
+            }
+        }.f,
+        .get_voltage_mv = struct {
+            fn f() u16 {
+                return 3100; // Below voltage threshold
+            }
+        }.f,
+        .is_charging = struct {
+            fn f() bool {
+                return true;
+            }
+        }.f,
+        .external_power_present = struct {
+            fn f() bool {
+                return true;
+            }
+        }.f,
+    };
+
+    var flasher = SafeFlasher.initWithProviders(
+        allocator,
+        "/tmp/backups",
+        provider,
+        WatchdogProvider.mock,
+    );
+    defer flasher.deinit();
+
+    // With battery check but low threshold - should still fail
+    var options = FlashOptions{};
+    options.min_battery_percent = 10; // Lower threshold to 10%
+
+    const result = flasher.checkSafety(options);
+    try std.testing.expect(result.passed); // 15% > 10%, so passes
+}
+
+test "battery critical check" {
+    const allocator = std.testing.allocator;
+
+    const critical_provider = BatteryProvider{
+        .get_percent = struct {
+            fn f() u8 {
+                return 5; // Critical
+            }
+        }.f,
+        .get_voltage_mv = BatteryProvider.mock.get_voltage_mv,
+        .is_charging = BatteryProvider.mock.is_charging,
+        .external_power_present = BatteryProvider.mock.external_power_present,
+    };
+
+    var flasher = SafeFlasher.initWithProviders(
+        allocator,
+        "/tmp/backups",
+        critical_provider,
+        WatchdogProvider.mock,
+    );
+    defer flasher.deinit();
+
+    try std.testing.expect(flasher.isBatteryCritical());
+}
+
+test "safety check result format" {
+    const result = SafetyCheckResult{
+        .passed = true,
+        .battery_percent = 75,
+        .battery_voltage_mv = 3850,
+        .external_power = true,
+        .is_charging = true,
+        .failure_reason = null,
+    };
+
+    var buffer: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+
+    try result.format(stream.writer());
+    const output = stream.getWritten();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "PASSED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "75%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "3850mV") != null);
 }

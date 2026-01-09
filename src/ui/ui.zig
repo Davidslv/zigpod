@@ -16,6 +16,7 @@ pub const settings = @import("settings.zig");
 pub const system_info = @import("system_info.zig");
 pub const theme_loader = @import("theme_loader.zig");
 pub const state_machine = @import("state_machine.zig");
+pub const install_progress = @import("install_progress.zig");
 
 // ============================================================
 // UI Constants

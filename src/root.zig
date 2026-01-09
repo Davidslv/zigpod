@@ -53,6 +53,9 @@ pub const i2s = @import("drivers/audio/i2s.zig");
 /// ATA/IDE storage driver
 pub const ata = @import("drivers/storage/ata.zig");
 
+/// Storage type detection (HDD vs Flash/iFlash)
+pub const storage_detect = @import("drivers/storage/storage_detect.zig");
+
 /// LCD display driver
 pub const lcd = @import("drivers/display/lcd.zig");
 

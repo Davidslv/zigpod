@@ -7,6 +7,8 @@ const std = @import("std");
 const hal = @import("../hal/hal.zig");
 const pmu = @import("pmu.zig");
 const lcd = @import("display/lcd.zig");
+const storage_detect = @import("storage/storage_detect.zig");
+const ata = @import("storage/ata.zig");
 
 // ============================================================
 // Power States
@@ -93,6 +95,22 @@ const LOW_BATTERY_PERCENT: u8 = 15;
 const CRITICAL_BATTERY_PERCENT: u8 = 5;
 const LOW_BATTERY_VOLTAGE: u16 = 3500;
 const CRITICAL_BATTERY_VOLTAGE: u16 = 3300;
+
+// ============================================================
+// Storage-Aware Power Management
+// ============================================================
+
+/// Returns true if using flash storage (iFlash, SD adapter, etc.)
+/// Flash storage uses less power and doesn't need spin-up time
+pub fn isUsingFlashStorage() bool {
+    return storage_detect.isFlashStorage();
+}
+
+/// Get recommended spin-up delay in milliseconds
+/// Returns 0 for flash storage, 1000-2000 for HDD
+pub fn getStorageSpinUpDelayMs() u32 {
+    return storage_detect.getSpinUpDelayMs();
+}
 
 // ============================================================
 // Initialization
@@ -189,6 +207,17 @@ fn enterActive() !void {
 fn enterIdle() !void {
     // Reduce power but stay responsive
     // CPU can sleep between events
+
+    // For HDD storage, put drive in standby after idle timeout
+    // Flash storage (iFlash, etc.) doesn't need this
+    if (storage_detect.shouldStandbyWhenIdle()) {
+        const idle_timeout = storage_detect.getStorageType().getIdleTimeout();
+        if (idle_timeout > 0) {
+            // In a real implementation, we'd start a timer here
+            // For now, put drive in standby immediately when idle
+            ata.standby() catch {}; // Ignore errors, drive may already be in standby
+        }
+    }
 }
 
 fn enterSleep() !void {
@@ -201,6 +230,9 @@ fn enterStandby() !void {
     // Ultra-low power, quick wake
     lcd.setBacklight(false);
     backlight_on = false;
+
+    // Put HDD in standby (no-op for flash storage)
+    ata.standby() catch {};
 
     // Could reduce CPU frequency here
 }

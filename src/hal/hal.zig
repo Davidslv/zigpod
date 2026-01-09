@@ -89,6 +89,11 @@ pub const AtaDeviceInfo = struct {
     sector_size: u16,
     supports_lba48: bool,
     supports_dma: bool,
+    /// Word 217: Nominal Media Rotation Rate
+    /// 0x0000 = Not reported, 0x0001 = Non-rotating (SSD/Flash), 0x0401+ = RPM
+    rotation_rate: u16 = 1,
+    /// Word 169 bit 0: TRIM supported
+    supports_trim: bool = false,
 };
 
 /// USB endpoint type
@@ -567,6 +572,155 @@ pub inline fn delayMs(ms: u32) void {
 /// Get current system time in microseconds
 pub inline fn getTicksUs() u64 {
     return current_hal.get_ticks_us();
+}
+
+/// Enter low power sleep mode
+pub inline fn sleep() void {
+    current_hal.sleep();
+}
+
+/// Perform system reset
+pub inline fn systemReset() noreturn {
+    current_hal.reset();
+}
+
+/// Read a 32-bit register
+pub inline fn readReg32(addr: u32) u32 {
+    const ptr: *volatile u32 = @ptrFromInt(addr);
+    return ptr.*;
+}
+
+/// Write a 32-bit register
+pub inline fn writeReg32(addr: u32, value: u32) void {
+    const ptr: *volatile u32 = @ptrFromInt(addr);
+    ptr.* = value;
+}
+
+// ============================================================
+// Click Wheel Convenience Functions
+// ============================================================
+
+/// Read click wheel button state
+pub inline fn clickwheelReadButtons() u8 {
+    return current_hal.clickwheel_read_buttons();
+}
+
+// ============================================================
+// Watchdog Timer Convenience Functions
+// ============================================================
+
+/// Initialize watchdog timer with specified timeout
+pub inline fn wdtInit(timeout_ms: u32) HalError!void {
+    return current_hal.wdt_init(timeout_ms);
+}
+
+/// Start watchdog timer
+pub inline fn wdtStart() void {
+    current_hal.wdt_start();
+}
+
+/// Stop watchdog timer
+pub inline fn wdtStop() void {
+    current_hal.wdt_stop();
+}
+
+/// Refresh watchdog (prevent reset)
+pub inline fn wdtRefresh() void {
+    current_hal.wdt_refresh();
+}
+
+// ============================================================
+// Power Management Convenience Functions
+// ============================================================
+
+/// Get battery percentage (0-100)
+pub inline fn pmuGetBatteryPercent() u8 {
+    return current_hal.pmu_get_battery_percent();
+}
+
+/// Get battery voltage in millivolts
+pub inline fn pmuGetBatteryVoltage() u16 {
+    return current_hal.pmu_get_battery_voltage();
+}
+
+/// Check if device is charging
+pub inline fn pmuIsCharging() bool {
+    return current_hal.pmu_is_charging();
+}
+
+/// Check if external power is connected
+pub inline fn pmuExternalPowerPresent() bool {
+    return current_hal.pmu_external_power_present();
+}
+
+// ============================================================
+// Flash Memory Operations
+// ============================================================
+
+/// Write data to flash memory at specified address
+/// This is a low-level function for firmware updates
+pub fn flashWrite(address: u32, data: []const u8) HalError!void {
+    // Flash write requires erasing before writing
+    // The actual implementation handles sector-aligned operations
+
+    // For PP5021C, flash is accessed through the ATA interface
+    // Convert address to sector and use ATA write
+    const sector_size: u32 = 512;
+    const start_sector = address / sector_size;
+    const sectors_needed = (data.len + sector_size - 1) / sector_size;
+
+    // Write data sector by sector
+    var offset: usize = 0;
+    var current_sector = start_sector;
+
+    while (offset < data.len) : ({
+        offset += sector_size;
+        current_sector += 1;
+    }) {
+        const remaining = data.len - offset;
+        const write_len = @min(remaining, sector_size);
+
+        // Prepare sector buffer (pad with 0xFF if partial)
+        var sector_buf: [512]u8 = [_]u8{0xFF} ** 512;
+        @memcpy(sector_buf[0..write_len], data[offset..][0..write_len]);
+
+        try current_hal.ata_write_sectors(current_sector, 1, &sector_buf);
+    }
+
+    // Flush to ensure data is written
+    try current_hal.ata_flush();
+
+    _ = sectors_needed;
+}
+
+/// Read data from flash memory at specified address
+pub fn flashRead(address: u32, buffer: []u8) HalError!void {
+    const sector_size: u32 = 512;
+    const start_sector = address / sector_size;
+    const offset_in_sector = address % sector_size;
+
+    // Read first sector
+    var sector_buf: [512]u8 = undefined;
+    try current_hal.ata_read_sectors(start_sector, 1, &sector_buf);
+
+    // Copy requested portion
+    const first_copy = @min(buffer.len, sector_size - offset_in_sector);
+    @memcpy(buffer[0..first_copy], sector_buf[offset_in_sector..][0..first_copy]);
+
+    // If more data needed, read additional sectors
+    var remaining = buffer.len - first_copy;
+    var current_sector = start_sector + 1;
+    var buf_offset = first_copy;
+
+    while (remaining > 0) : ({
+        remaining -= @min(remaining, sector_size);
+        current_sector += 1;
+        buf_offset += sector_size;
+    }) {
+        try current_hal.ata_read_sectors(current_sector, 1, &sector_buf);
+        const copy_len = @min(remaining, sector_size);
+        @memcpy(buffer[buf_offset..][0..copy_len], sector_buf[0..copy_len]);
+    }
 }
 
 // ============================================================

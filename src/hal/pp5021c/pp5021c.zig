@@ -620,6 +620,15 @@ fn hwAtaIdentify() HalError!AtaDeviceInfo {
         info.total_sectors = lba28_sectors;
     }
 
+    // Word 169 (bytes 338-339): DATA SET MANAGEMENT support
+    // Bit 0 = TRIM supported
+    const dsm_support = @as(u16, identify_data[338]) | (@as(u16, identify_data[339]) << 8);
+    info.supports_trim = (dsm_support & 0x0001) != 0;
+
+    // Word 217 (bytes 434-435): Nominal Media Rotation Rate
+    // 0x0000 = Not reported, 0x0001 = Non-rotating (SSD), others = RPM
+    info.rotation_rate = @as(u16, identify_data[434]) | (@as(u16, identify_data[435]) << 8);
+
     // Store for internal use
     ata_supports_lba48 = info.supports_lba48;
     ata_total_sectors = info.total_sectors;

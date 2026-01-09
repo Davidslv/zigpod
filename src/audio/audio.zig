@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const hal = @import("../hal/hal.zig");
+const storage_detect = @import("../drivers/storage/storage_detect.zig");
 
 // Logging - see docs/LOGGING_GUIDE.md for usage
 const log = @import("../debug/logger.zig").scoped(.audio);
@@ -53,7 +54,16 @@ pub const CHANNELS: u8 = 2; // Stereo
 
 /// Gapless pre-buffer time in milliseconds
 /// This is the time before end of track when we start loading the next track
+/// Note: For HDD storage, use longer pre-buffer to handle seek latency
+/// For flash storage (iFlash, etc.), shorter pre-buffer is fine
 pub const GAPLESS_PREBUFFER_MS: u32 = 2000;
+
+/// Get recommended pre-buffer time based on storage type
+/// HDD needs longer pre-buffer (2000ms) to handle seek latency
+/// Flash storage (iFlash, SD) can use shorter pre-buffer (500ms)
+pub fn getRecommendedPrebufferMs() u32 {
+    return storage_detect.getRecommendedAudioBufferMs();
+}
 
 /// Calculate gapless threshold in samples for a given sample rate
 /// This ensures consistent ~2 second prebuffer regardless of sample rate
@@ -319,7 +329,13 @@ pub fn init() hal.HalError!void {
     initialized = true;
     state = .stopped;
 
-    log.info("Audio engine ready (buffer={d} samples)", .{BUFFER_SIZE});
+    // Log storage-aware buffer configuration
+    const prebuffer_ms = getRecommendedPrebufferMs();
+    log.info("Audio engine ready (buffer={d} samples, prebuffer={d}ms, flash={})", .{
+        BUFFER_SIZE,
+        prebuffer_ms,
+        storage_detect.isFlashStorage(),
+    });
 }
 
 /// Shutdown the audio engine
@@ -842,8 +858,17 @@ pub fn process() hal.HalError!void {
     // Check if we need to request next track for gapless playback
     if (gapless_enabled and !next_track_requested) {
         const remaining = slot.remainingSamples();
-        if (remaining < GAPLESS_THRESHOLD and remaining > 0) {
-            log.debug("Requesting next track for gapless (remaining={d} samples)", .{remaining});
+        // Use storage-aware threshold for gapless prebuffer
+        // HDD needs larger threshold (2000ms) for seek latency
+        // Flash storage (iFlash, etc.) can use smaller threshold (500ms)
+        const prebuffer_ms = getRecommendedPrebufferMs();
+        const threshold = if (slot.track_info) |info|
+            gaplessThresholdSamples(info.sample_rate) * prebuffer_ms / GAPLESS_PREBUFFER_MS
+        else
+            GAPLESS_THRESHOLD;
+
+        if (remaining < threshold and remaining > 0) {
+            log.debug("Requesting next track for gapless (remaining={d} samples, threshold={d})", .{ remaining, threshold });
             // Request next track from playlist controller
             if (next_track_callback) |callback| {
                 next_track_requested = true;

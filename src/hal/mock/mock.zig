@@ -357,6 +357,8 @@ fn mockAtaIdentify() HalError!AtaDeviceInfo {
         .sector_size = state.ata_sector_size,
         .supports_lba48 = true,
         .supports_dma = false,
+        .rotation_rate = 0x0001, // Mock as non-rotating (SSD/flash) for testing
+        .supports_trim = true,
     };
     @memcpy(info.model[0..9], "MOCK DISK");
     @memset(info.model[9..], ' ');

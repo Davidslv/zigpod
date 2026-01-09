@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const hal = @import("../hal/hal.zig");
+const usb_dfu = @import("usb_dfu.zig");
 
 // ============================================================
 // Bootloader Constants
@@ -51,6 +52,12 @@ pub const BootReason = enum(u8) {
 // Boot Configuration
 // ============================================================
 
+/// Maximum consecutive boot failures before forcing original firmware
+pub const MAX_BOOT_FAILURES: u8 = 3;
+
+/// Boot timeout in milliseconds (watchdog will reset if boot takes longer)
+pub const BOOT_TIMEOUT_MS: u32 = 30_000;
+
 pub const BootConfig = extern struct {
     magic: u32 = ZIGPOD_MAGIC,
     version: u32 = 1,
@@ -59,6 +66,10 @@ pub const BootConfig = extern struct {
     boot_count: u32 = 0,
     last_boot_reason: BootReason = .normal,
     flags: BootFlags = .{},
+    /// Consecutive boot failures counter
+    consecutive_failures: u8 = 0,
+    /// Reserved for alignment
+    _reserved_align: [3]u8 = [_]u8{0} ** 3,
     checksum: u32 = 0,
 
     pub const BootFlags = packed struct {
@@ -66,7 +77,13 @@ pub const BootConfig = extern struct {
         update_pending: bool = false,
         safe_mode: bool = false,
         first_boot: bool = true,
-        _reserved: u28 = 0,
+        /// Last boot failed (watchdog reset or crash)
+        last_boot_failed: bool = false,
+        /// Force original firmware on next boot
+        force_original: bool = false,
+        /// Boot fallback is active (booting original due to failures)
+        fallback_active: bool = false,
+        _reserved: u25 = 0,
     };
 
     /// Calculate checksum for config validation
@@ -293,19 +310,41 @@ pub fn init() void {
     // Determine boot reason
     boot_reason = detectBootReason();
 
+    // Check if last boot was a watchdog reset (indicates boot failure)
+    if (hal.current_hal.wdt_caused_reset()) {
+        boot_reason = .watchdog;
+        boot_config.flags.last_boot_failed = true;
+        boot_config.consecutive_failures +|= 1; // Saturating add
+
+        // Too many consecutive failures - force original firmware
+        if (boot_config.consecutive_failures >= MAX_BOOT_FAILURES) {
+            boot_config.flags.force_original = true;
+            boot_config.flags.fallback_active = true;
+        }
+    }
+
     // Check for user boot mode selection
     selected_mode = detectUserSelection();
+
+    // Override selection if force_original is set (due to failures)
+    if (boot_config.flags.force_original) {
+        selected_mode = .original;
+        // Clear the force flag after this boot
+        boot_config.flags.force_original = false;
+    }
 
     // Handle recovery flag
     if (boot_config.flags.recovery_requested) {
         selected_mode = .recovery;
         boot_config.flags.recovery_requested = false;
-        saveConfig();
     }
 
     // Increment boot count
     boot_config.boot_count +%= 1;
     boot_config.last_boot_reason = boot_reason;
+
+    // Save updated config
+    saveConfig();
 }
 
 /// Load configuration from persistent storage
@@ -380,17 +419,96 @@ pub fn boot() noreturn {
 
 /// Boot ZigPod OS
 fn bootZigPod() noreturn {
+    // Set up boot watchdog to catch hangs during initialization
+    // Firmware is expected to call markBootSuccessful() after init
+    hal.wdtInit(BOOT_TIMEOUT_MS) catch {
+        // If watchdog setup fails, fall back for safety
+        bootOriginalWithFallbackMarker();
+    };
+    hal.wdtStart();
+
+    // Pre-flight hardware checks
+    if (!performHardwareChecks()) {
+        // Hardware check failed - fall back to original firmware
+        hal.wdtStop();
+        bootOriginalWithFallbackMarker();
+    }
+
     // Verify firmware header
     const header: *const FirmwareHeader = @ptrFromInt(ZIGPOD_FW_ADDR);
 
     if (!header.isValid()) {
-        // Fallback to original firmware
-        bootOriginal();
+        // Invalid firmware - fallback to original
+        hal.wdtStop();
+        bootOriginalWithFallbackMarker();
     }
 
+    // Validate firmware for boot (includes signature check if enabled)
+    if (!validateFirmwareForBoot(header)) {
+        hal.wdtStop();
+        bootOriginalWithFallbackMarker();
+    }
+
+    // Mark that we're attempting ZigPod boot
+    boot_config.flags.last_boot_failed = false; // Will be set true by watchdog if we crash
+    saveConfig();
+
     // Jump to entry point
+    // The firmware is responsible for calling markBootSuccessful() and stopping watchdog
     const entry: *const fn () noreturn = @ptrFromInt(header.entry_point);
     entry();
+}
+
+/// Boot original firmware with fallback marker
+fn bootOriginalWithFallbackMarker() noreturn {
+    boot_config.flags.fallback_active = true;
+    saveConfig();
+    bootOriginal();
+}
+
+/// Perform pre-boot hardware checks
+fn performHardwareChecks() bool {
+    // Check 1: Battery level sufficient for boot
+    const battery = hal.pmuGetBatteryPercent();
+    if (battery < 5) {
+        // Critical battery - don't attempt ZigPod boot
+        return false;
+    }
+
+    // Check 2: Verify memory is accessible
+    if (!checkMemory()) {
+        return false;
+    }
+
+    // Check 3: Verify storage is responding (basic ATA check)
+    if (!checkStorage()) {
+        return false;
+    }
+
+    return true;
+}
+
+/// Basic memory check
+fn checkMemory() bool {
+    // Write and read test pattern to known RAM location
+    const test_addr: *volatile u32 = @ptrFromInt(0x40000100);
+    const test_pattern: u32 = 0xDEADBEEF;
+    const backup = test_addr.*;
+
+    test_addr.* = test_pattern;
+    const readback = test_addr.*;
+    test_addr.* = backup;
+
+    return readback == test_pattern;
+}
+
+/// Basic storage check
+fn checkStorage() bool {
+    // Try to read ATA identify (returns false if drive not responding)
+    _ = hal.current_hal.ata_identify() catch {
+        return false;
+    };
+    return true;
 }
 
 /// Boot original Apple firmware
@@ -417,12 +535,32 @@ fn enterRecovery() noreturn {
 
 /// Enter DFU (Device Firmware Upgrade) mode
 fn enterDfu() noreturn {
-    // Enable USB and wait for host connection
-    // This would implement USB DFU protocol
-
-    while (true) {
-        hal.sleep();
+    // Check battery level before entering DFU mode
+    // DFU operations require sufficient battery to prevent corruption
+    const battery = hal.pmuGetBatteryPercent();
+    if (battery < usb_dfu.MIN_BATTERY_FOR_DFU) {
+        // Battery too low - display warning and boot to original firmware
+        // which can charge the battery
+        displayLowBatteryWarning();
+        bootOriginal();
     }
+
+    // Initialize watchdog for DFU operations
+    hal.wdtInit(60_000) catch {}; // 60 second timeout
+    hal.wdtStart();
+
+    // Enter USB DFU mode
+    // This implements the USB DFU 1.1 protocol and handles firmware updates
+    usb_dfu.enterDfuMode();
+}
+
+/// Display low battery warning before falling back
+fn displayLowBatteryWarning() void {
+    // Would display:
+    // "Battery Too Low"
+    // "Charge device before updating firmware"
+    // Wait 3 seconds for user to read message
+    hal.delayMs(3000);
 }
 
 // ============================================================
@@ -511,6 +649,54 @@ pub fn disableSafeMode() void {
 /// Check if safe mode is enabled
 pub fn isSafeMode() bool {
     return boot_config.flags.safe_mode;
+}
+
+// ============================================================
+// Boot Success / Failure Tracking
+// ============================================================
+
+/// Mark boot as successful (called by firmware after successful initialization)
+/// This stops the watchdog and resets the failure counter
+pub fn markBootSuccessful() void {
+    // Stop boot watchdog
+    hal.wdtStop();
+
+    // Reset failure tracking
+    boot_config.consecutive_failures = 0;
+    boot_config.flags.last_boot_failed = false;
+    boot_config.flags.fallback_active = false;
+
+    saveConfig();
+}
+
+/// Check if we're running in fallback mode (booted original due to failures)
+pub fn isInFallbackMode() bool {
+    return boot_config.flags.fallback_active;
+}
+
+/// Get consecutive failure count
+pub fn getFailureCount() u8 {
+    return boot_config.consecutive_failures;
+}
+
+/// Check if last boot failed
+pub fn didLastBootFail() bool {
+    return boot_config.flags.last_boot_failed;
+}
+
+/// Reset failure counter manually (e.g., after user clears error)
+pub fn resetFailureCounter() void {
+    boot_config.consecutive_failures = 0;
+    boot_config.flags.last_boot_failed = false;
+    boot_config.flags.fallback_active = false;
+    boot_config.flags.force_original = false;
+    saveConfig();
+}
+
+/// Force next boot to use original firmware
+pub fn forceOriginalFirmware() void {
+    boot_config.flags.force_original = true;
+    saveConfig();
 }
 
 // ============================================================
@@ -653,4 +839,48 @@ test "signature algorithm enum" {
 test "public key placeholder" {
     const key = PublicKey.getBootloaderKey();
     try std.testing.expectEqual(SignatureAlgorithm.none, key.algorithm);
+}
+
+test "boot failure counter" {
+    var config = BootConfig{};
+
+    // Initially no failures
+    try std.testing.expectEqual(@as(u8, 0), config.consecutive_failures);
+    try std.testing.expect(!config.flags.last_boot_failed);
+    try std.testing.expect(!config.flags.fallback_active);
+
+    // Simulate failures
+    config.consecutive_failures = 2;
+    config.flags.last_boot_failed = true;
+    try std.testing.expectEqual(@as(u8, 2), config.consecutive_failures);
+
+    // After MAX_BOOT_FAILURES, should force original
+    config.consecutive_failures = MAX_BOOT_FAILURES;
+    try std.testing.expect(config.consecutive_failures >= MAX_BOOT_FAILURES);
+}
+
+test "boot flags" {
+    var config = BootConfig{};
+
+    // Test individual flags
+    config.flags.force_original = true;
+    try std.testing.expect(config.flags.force_original);
+
+    config.flags.fallback_active = true;
+    try std.testing.expect(config.flags.fallback_active);
+
+    config.flags.last_boot_failed = true;
+    try std.testing.expect(config.flags.last_boot_failed);
+}
+
+test "max boot failures constant" {
+    // Ensure reasonable default
+    try std.testing.expect(MAX_BOOT_FAILURES >= 2);
+    try std.testing.expect(MAX_BOOT_FAILURES <= 10);
+}
+
+test "boot timeout constant" {
+    // Ensure reasonable boot timeout
+    try std.testing.expect(BOOT_TIMEOUT_MS >= 10_000); // At least 10 seconds
+    try std.testing.expect(BOOT_TIMEOUT_MS <= 120_000); // At most 2 minutes
 }

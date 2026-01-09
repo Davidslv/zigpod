@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const hal = @import("../../hal/hal.zig");
+const storage_detect = @import("storage_detect.zig");
 
 // Logging - see docs/LOGGING_GUIDE.md for usage
 const log = @import("../../debug/logger.zig").scoped(.storage);
@@ -35,6 +36,20 @@ pub fn init() hal.HalError!void {
     if (device_info) |info| {
         const capacity_gb = (info.total_sectors * info.sector_size) / (1024 * 1024 * 1024);
         log.info("ATA device: {d}GB, {d} sectors", .{ capacity_gb, info.total_sectors });
+
+        // Initialize storage detection from the ATA info we already have
+        // This avoids a duplicate ata_identify() call
+        storage_detect.initFromAtaInfo(info);
+
+        // Log detection results
+        const result = storage_detect.getDetectionResult();
+        log.info("Storage: {s}, flash={}, rotation={d}, trim={}, delay={d}ms", .{
+            @tagName(result.storage_type),
+            result.storage_type.isFlash(),
+            result.rotation_rate,
+            result.supports_trim,
+            storage_detect.getSpinUpDelayMs(),
+        });
     }
 }
 
@@ -134,8 +149,16 @@ pub fn flush() hal.HalError!void {
 }
 
 /// Put drive in standby mode (spin down)
+/// Note: This is a no-op for flash storage (iFlash, SD adapters, etc.)
 pub fn standby() hal.HalError!void {
     if (!initialized) return hal.HalError.DeviceNotReady;
+
+    // Skip standby for flash storage - it doesn't need it and may not support the command
+    if (!storage_detect.shouldStandbyWhenIdle()) {
+        log.debug("Standby skipped (flash storage)", .{});
+        return;
+    }
+
     log.info("Spinning down drive", .{});
     return hal.current_hal.ata_standby();
 }
