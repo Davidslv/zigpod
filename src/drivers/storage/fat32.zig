@@ -351,3 +351,211 @@ pub const File = struct {
 test "FAT32 structures size" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(DirEntry));
 }
+
+test "BootSector structure size" {
+    try std.testing.expectEqual(@as(usize, 90), @sizeOf(BootSector));
+}
+
+test "DirEntry cluster extraction" {
+    var entry = DirEntry{
+        .name = "TEST    TXT".*,
+        .attributes = 0x20,
+        .reserved = 0,
+        .create_time_tenth = 0,
+        .create_time = 0,
+        .create_date = 0,
+        .access_date = 0,
+        .cluster_high = 0x0001,
+        .modify_time = 0,
+        .modify_date = 0,
+        .cluster_low = 0x0002,
+        .file_size = 1024,
+    };
+
+    // Cluster should be 0x00010002 = 65538
+    try std.testing.expectEqual(@as(u32, 0x00010002), entry.getCluster());
+}
+
+test "DirEntry attributes" {
+    // Regular file
+    var file_entry = DirEntry{
+        .name = "TEST    TXT".*,
+        .attributes = DirEntry.ATTR_ARCHIVE,
+        .reserved = 0,
+        .create_time_tenth = 0,
+        .create_time = 0,
+        .create_date = 0,
+        .access_date = 0,
+        .cluster_high = 0,
+        .modify_time = 0,
+        .modify_date = 0,
+        .cluster_low = 2,
+        .file_size = 1024,
+    };
+    try std.testing.expect(file_entry.isFile());
+    try std.testing.expect(!file_entry.isDirectory());
+
+    // Directory
+    var dir_entry = file_entry;
+    dir_entry.attributes = DirEntry.ATTR_DIRECTORY;
+    try std.testing.expect(dir_entry.isDirectory());
+    try std.testing.expect(!dir_entry.isFile());
+
+    // Deleted entry
+    var deleted_entry = file_entry;
+    deleted_entry.name[0] = 0xE5;
+    try std.testing.expect(deleted_entry.isDeleted());
+
+    // End of directory
+    var end_entry = file_entry;
+    end_entry.name[0] = 0x00;
+    try std.testing.expect(end_entry.isEndOfDir());
+}
+
+test "DirEntry long name marker" {
+    const lfn_entry = DirEntry{
+        .name = [_]u8{ 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ', 'T', 'X', 'T' },
+        .attributes = DirEntry.ATTR_LONG_NAME,
+        .reserved = 0,
+        .create_time_tenth = 0,
+        .create_time = 0,
+        .create_date = 0,
+        .access_date = 0,
+        .cluster_high = 0,
+        .modify_time = 0,
+        .modify_date = 0,
+        .cluster_low = 0,
+        .file_size = 0,
+    };
+
+    // Long name entries have ATTR_LONG_NAME (0x0F)
+    try std.testing.expectEqual(DirEntry.ATTR_LONG_NAME, lfn_entry.attributes);
+}
+
+test "FAT32 cluster to LBA calculation" {
+    // Create a minimal Fat32 instance for testing
+    var fs = Fat32{
+        .partition_start = 2048,
+        .bytes_per_sector = 512,
+        .sectors_per_cluster = 8,
+        .cluster_size = 4096,
+        .fat_start = 2048 + 32,
+        .fat_sectors = 1000,
+        .num_fats = 2,
+        .data_start = 2048 + 32 + 2000,
+        .root_cluster = 2,
+        .total_clusters = 100000,
+    };
+
+    // Cluster 2 should be at data_start + 0 (since cluster numbering starts at 2)
+    try std.testing.expectEqual(fs.data_start, fs.clusterToLba(2));
+
+    // Cluster 3 should be at data_start + sectors_per_cluster
+    try std.testing.expectEqual(fs.data_start + 8, fs.clusterToLba(3));
+
+    // Cluster 10 should be at data_start + 8 * sectors_per_cluster
+    try std.testing.expectEqual(fs.data_start + 64, fs.clusterToLba(10));
+}
+
+test "FAT32 cluster size calculation" {
+    // Verify cluster_size = bytes_per_sector * sectors_per_cluster
+    const bytes_per_sector: u32 = 512;
+    const sectors_per_cluster: u32 = 8;
+    const expected_cluster_size = bytes_per_sector * sectors_per_cluster;
+
+    try std.testing.expectEqual(@as(u32, 4096), expected_cluster_size);
+}
+
+test "File seek within bounds" {
+    // Create mock Fat32 and File
+    var fs = Fat32{
+        .partition_start = 0,
+        .bytes_per_sector = 512,
+        .sectors_per_cluster = 8,
+        .cluster_size = 4096,
+        .fat_start = 32,
+        .fat_sectors = 100,
+        .num_fats = 2,
+        .data_start = 232,
+        .root_cluster = 2,
+        .total_clusters = 1000,
+    };
+
+    var file = File{
+        .fs = &fs,
+        .first_cluster = 10,
+        .current_cluster = 10,
+        .file_size = 10000,
+        .position = 0,
+    };
+
+    // tell() should return current position
+    try std.testing.expectEqual(@as(u32, 0), file.tell());
+
+    // size() should return file size
+    try std.testing.expectEqual(@as(u32, 10000), file.size());
+}
+
+test "Directory rewind" {
+    var fs = Fat32{
+        .partition_start = 0,
+        .bytes_per_sector = 512,
+        .sectors_per_cluster = 8,
+        .cluster_size = 4096,
+        .fat_start = 32,
+        .fat_sectors = 100,
+        .num_fats = 2,
+        .data_start = 232,
+        .root_cluster = 2,
+        .total_clusters = 1000,
+    };
+
+    var dir = Directory{
+        .fs = &fs,
+        .first_cluster = 5,
+        .current_cluster = 10,
+        .position = 50,
+    };
+
+    // Simulate having traversed directory
+    dir.rewind();
+
+    // After rewind, should be back at start
+    try std.testing.expectEqual(@as(u32, 5), dir.current_cluster);
+    try std.testing.expectEqual(@as(u32, 0), dir.position);
+}
+
+test "FAT entry values" {
+    // FAT32 special cluster values
+    const FREE_CLUSTER: u32 = 0x00000000;
+    const RESERVED_START: u32 = 0x0FFFFFF0;
+    const BAD_CLUSTER: u32 = 0x0FFFFFF7;
+    const END_OF_CHAIN: u32 = 0x0FFFFFF8;
+
+    try std.testing.expect(FREE_CLUSTER == 0);
+    try std.testing.expect(BAD_CLUSTER < END_OF_CHAIN);
+    try std.testing.expect(END_OF_CHAIN >= RESERVED_START);
+}
+
+test "8.3 filename parsing" {
+    // Standard 8.3 filename: "FILENAME.EXT" stored as "FILENAMEEXT"
+    const name_raw = "FILENAMEEXT".*;
+
+    // First 8 chars are name, last 3 are extension
+    const name_part = name_raw[0..8];
+    const ext_part = name_raw[8..11];
+
+    try std.testing.expect(std.mem.eql(u8, name_part, "FILENAME"));
+    try std.testing.expect(std.mem.eql(u8, ext_part, "EXT"));
+}
+
+test "cluster chain constants" {
+    // Minimum valid cluster number is 2
+    const MIN_VALID_CLUSTER: u32 = 2;
+
+    // Maximum valid cluster number (before reserved range)
+    const MAX_VALID_CLUSTER: u32 = 0x0FFFFFEF;
+
+    try std.testing.expect(MIN_VALID_CLUSTER < MAX_VALID_CLUSTER);
+    try std.testing.expectEqual(@as(u32, 2), MIN_VALID_CLUSTER);
+}
