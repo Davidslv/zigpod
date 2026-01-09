@@ -8,6 +8,271 @@ Hardware validation is essential before deploying ZigPod firmware to actual devi
 
 **Golden Rule**: Never write to flash storage without a verified backup and recovery plan.
 
+---
+
+## Important: JTAG Not Available on iPod Classic 5.5G
+
+**The 30-pin dock connector does NOT expose JTAG signals.** The dock handles:
+- USB data/sync
+- Charging
+- Analog audio line-out
+- Accessory protocols
+
+JTAG (CPU debug interface) is NOT routed to any accessible pins on the iPod Classic 5.5G. This means:
+- ❌ No live CPU debugging/stepping
+- ❌ No memory inspection during execution
+- ❌ No register dumps while running
+- ✅ USB Disk Mode access only
+- ✅ Persistent logging to disk
+- ✅ Post-mortem crash analysis
+
+**All debugging must use USB Disk Mode and persistent logs.**
+
+---
+
+## USB-Based Debugging Workflow
+
+Since JTAG isn't available, ZigPod uses disk-based telemetry for debugging.
+
+### Log Files Location
+
+When running ZigPod, logs are written to:
+```
+/ZIGPOD/
+└── LOGS/
+    ├── telemetry.bin    # Binary event buffer (for zigpod-telemetry tool)
+    ├── crash.log        # Human-readable crash info (if crash occurred)
+    ├── boot.log         # Boot sequence log
+    └── session.txt      # Runtime text log
+```
+
+### Debugging Workflow
+
+**Step 1: Run ZigPod on Hardware**
+```
+1. Install ZigPod firmware
+2. Boot into ZigPod
+3. Use the device, trigger the issue
+4. Observe any error indicators in status bar
+```
+
+**Step 2: Extract Logs via USB**
+```bash
+# Force reboot into Apple firmware
+# Hold Menu + Select for 8 seconds
+
+# Connect USB cable
+# iPod mounts as disk
+
+# Copy log files
+cp /Volumes/IPOD/ZIGPOD/LOGS/* ~/zigpod-debug/
+
+# Or if using Linux
+cp /media/ipod/ZIGPOD/LOGS/* ~/zigpod-debug/
+```
+
+**Step 3: Analyze Logs**
+```bash
+# Parse telemetry
+./zigpod-telemetry analyze ~/zigpod-debug/telemetry.bin
+
+# View crash log (if exists)
+cat ~/zigpod-debug/crash.log
+
+# View session log
+cat ~/zigpod-debug/session.txt
+```
+
+**Step 4: Share for Troubleshooting**
+```
+When reporting issues, include:
+1. Output of: zigpod-telemetry analyze telemetry.bin
+2. Contents of crash.log (if exists)
+3. Last 100 lines of session.txt
+4. Steps to reproduce the issue
+```
+
+### What Gets Logged
+
+| Category | Events Captured |
+|----------|-----------------|
+| **Boot** | Start, complete, boot count |
+| **Audio** | Init, play, stop, underruns, decode errors |
+| **Storage** | ATA reads, timeouts, FAT32 errors |
+| **UI** | Screen changes, button presses |
+| **Power** | Battery level, charging, sleep |
+| **Errors** | All error codes with context |
+| **Crashes** | PC, LR, SP registers, panic message |
+
+### Crash Log Example
+
+If ZigPod crashes, `crash.log` contains:
+```
+=== ZIGPOD CRASH LOG ===
+
+Boot: #7
+
+Registers:
+  PC:   0x40001234
+  LR:   0x40001220
+  SP:   0x40050FF0
+  CPSR: 0x600000D3
+
+Message: Division by zero in audio_decode
+
+To debug:
+  1. Note the PC address above
+  2. Run: arm-none-eabi-addr2line -e zigpod.elf 0x40001234
+  3. This shows the source file and line
+
+Telemetry saved to: /ZIGPOD/LOGS/telemetry.bin
+```
+
+### Converting PC Address to Source Line
+
+```bash
+# If you have the ELF file with debug symbols
+arm-none-eabi-addr2line -e zig-out/bin/zigpod.elf 0x40001234
+
+# Output example:
+# /Users/you/zigpod/src/audio/dsp.zig:156
+```
+
+---
+
+## Real-Time Logging via USB CDC
+
+When the iPod is connected to a computer AND running ZigPod, you can stream
+logs in real-time over USB. The iPod appears as a virtual serial port.
+
+### Connecting to the Debug Console
+
+**macOS:**
+```bash
+# Find the device
+ls /dev/tty.usbmodem*
+
+# Connect (115200 baud)
+screen /dev/tty.usbmodem* 115200
+
+# Or use the ZigPod tool
+./zigpod-serial --port /dev/tty.usbmodem*
+```
+
+**Linux:**
+```bash
+# Find the device
+ls /dev/ttyACM*
+
+# Connect
+screen /dev/ttyACM0 115200
+
+# Or use minicom
+minicom -D /dev/ttyACM0 -b 115200
+```
+
+**Windows:**
+- Open Device Manager, find the COM port
+- Use PuTTY with that COM port at 115200 baud
+
+### Debug Console Commands
+
+Once connected, you can type commands:
+
+| Command | Description |
+|---------|-------------|
+| `help` | Show available commands |
+| `status` | Show system status |
+| `battery` | Show battery info |
+| `audio` | Show audio engine status |
+| `errors` | Show error log |
+| `clear` | Clear error state |
+| `reboot` | Reboot device |
+
+### Log Output Format
+
+```
+[    1234] INFO  [AUD] Audio engine started at 44100Hz
+[    1235] DEBUG [STO] Reading sector 12345
+[    1240] WARN  [PWR] Battery low: 15%
+[    1250] ERROR [AUD] Buffer underrun detected
+```
+
+Format: `[timestamp_ms] LEVEL [CATEGORY] Message`
+
+### Log Levels
+
+| Level | Description | Destinations |
+|-------|-------------|--------------|
+| TRACE | Verbose debug | CDC only (if enabled) |
+| DEBUG | Detailed info | CDC + Disk |
+| INFO | Normal events | CDC + Disk |
+| WARN | Potential issues | CDC + Disk + Telemetry |
+| ERROR | Failures | CDC + Disk + Telemetry |
+| FATAL | Unrecoverable | CDC + Disk + Crash Store |
+
+---
+
+## Persistent Crash Store
+
+Critical failures are stored in a reserved area of the disk that survives
+reboots. This allows post-mortem analysis of crashes that occur when not
+connected to a computer.
+
+### What Gets Stored
+
+Each crash entry contains:
+- Boot count when crash occurred
+- CPU registers (PC, LR, SP, CPSR, R0-R12)
+- Exception type (panic, data abort, undefined instruction, etc.)
+- Error code
+- Human-readable message
+- Timestamp (if RTC available)
+
+### Crash Recovery Workflow
+
+1. **Crash occurs** → Crash handler saves state to reserved disk area
+2. **Device reboots** (or user power cycles)
+3. **Next boot** → ZigPod detects pending crashes, shows warning
+4. **Connect USB** → Access crash logs via /ZIGPOD/LOGS/crashes/
+5. **Analyze** → Use crash report with `addr2line` to find source location
+
+### Viewing Crash History
+
+When connected via USB CDC:
+```
+> errors
+=== ZigPod Crash Report ===
+Total crashes recorded: 2
+Entries in store: 2/16
+
+--- Crash #1 ---
+Boot: #5
+Type: data_abort
+Error: 0x00000000
+
+Registers:
+  PC:   0x40001234
+  LR:   0x40001220
+  SP:   0x40050000
+  CPSR: 0x600000D3
+
+Message: Invalid memory access in audio_decode
+```
+
+### Exporting Crash Data
+
+Via USB Disk Mode:
+```bash
+# Copy crash store binary
+cp /Volumes/IPOD/ZIGPOD/LOGS/crashes.bin ~/debug/
+
+# Parse with tool
+./zigpod-crash-parser ~/debug/crashes.bin
+```
+
+---
+
 ## Validation Levels
 
 ### Level 1: Read-Only Testing
@@ -281,25 +546,7 @@ zigpod-flasher restore --backup backup.img
 # (This restores original Apple firmware)
 ```
 
-### Method 2: JTAG Recovery
-
-If Disk Mode is inaccessible:
-
-```bash
-# Connect via JTAG
-zigpod-jtag connect
-
-# Halt CPU
-zigpod-jtag halt
-
-# Load recovery bootloader to RAM
-zigpod-jtag load --addr 0x40000000 --file recovery_loader.bin
-
-# Execute recovery
-zigpod-jtag run --addr 0x40000000
-```
-
-### Method 3: iTunes/Finder Restore
+### Method 2: iTunes/Finder Restore
 
 Full restore to factory firmware:
 
