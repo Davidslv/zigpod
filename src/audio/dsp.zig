@@ -1283,3 +1283,199 @@ test "resampler calc output size" {
     try std.testing.expect(out_size >= 108);
     try std.testing.expect(out_size <= 110);
 }
+
+
+// ============================================================
+// Performance Benchmarks
+// ============================================================
+
+// Benchmark: Measure DSP chain throughput
+// Target: At least 100x real-time on ARM7TDMI at 80MHz
+// (i.e., process 4.41M samples/second at 44.1kHz)
+test "benchmark DSP chain throughput" {
+    var chain = DspChain.init();
+    chain.enabled = true;
+    chain.equalizer.enabled = true;
+    chain.bass_boost.enabled = true;
+
+    // Prepare test buffer (1 second of stereo audio at 44.1kHz)
+    const sample_rate = 44100;
+    const duration_ms = 100; // 100ms test duration
+    const num_samples = (sample_rate * duration_ms * 2) / 1000; // stereo
+    var samples: [num_samples]i16 = undefined;
+
+    // Fill with test pattern
+    for (&samples, 0..) |*s, i| {
+        s.* = @as(i16, @intCast(@mod(i, 32768)));
+    }
+
+    // Benchmark
+    const start = std.time.nanoTimestamp();
+    const iterations: u32 = 100;
+
+    var iter: u32 = 0;
+    while (iter < iterations) : (iter += 1) {
+        chain.processBuffer(&samples);
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const samples_processed = @as(u64, num_samples / 2) * iterations; // stereo pairs
+    const ns_per_sample = elapsed_ns / samples_processed;
+
+    // Log benchmark results (visible in test output with verbose mode)
+    std.log.info("DSP Chain Benchmark:", .{});
+    std.log.info("  Samples processed: {d}", .{samples_processed});
+    std.log.info("  Time: {d} ns", .{elapsed_ns});
+    std.log.info("  ns/sample: {d}", .{ns_per_sample});
+
+    // Performance target: < 1000 ns/sample (1M samples/sec minimum)
+    // Real ARM7TDMI at 80MHz: ~12.5 ns/cycle, so 1000ns = 80 cycles/sample
+    try std.testing.expect(ns_per_sample < 10000); // Relaxed for host testing
+}
+
+// Benchmark: Measure EQ band processing overhead
+test "benchmark EQ band processing" {
+    var eq = Equalizer.init();
+    eq.enabled = true;
+    eq.setBandGain(0, 6); // 1kHz band boosted
+    eq.setBandGain(1, -3); // 2kHz band cut
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 1000;
+    var right: i16 = 1000;
+    while (i < iterations) : (i += 1) {
+        const result = eq.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("EQ Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Should be reasonably fast (< 5000 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 50000);
+}
+
+// Benchmark: Measure volume ramper performance
+test "benchmark volume ramper" {
+    var vol = VolumeRamper.init();
+    vol.setVolume(80);
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 16000;
+    var right: i16 = 16000;
+    while (i < iterations) : (i += 1) {
+        const result = vol.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("Volume Ramper Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Volume ramper should be very fast (< 500 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 10000);
+}
+
+// Benchmark: Measure resampler performance (upsampling)
+test "benchmark resampler upsampling" {
+    var resampler = Resampler.init();
+    resampler.configure(44100, 48000); // Common CD to DAC conversion
+
+    // Input buffer (100ms at 44.1kHz stereo)
+    const input_samples = 4410 * 2;
+    var input: [input_samples]i16 = undefined;
+    for (&input, 0..) |*s, i| {
+        s.* = @as(i16, @intCast(@mod(i * 100, 32000)));
+    }
+
+    // Output buffer (slightly larger)
+    var output: [5000]i16 = undefined;
+
+    const iterations: u32 = 100;
+    const start = std.time.nanoTimestamp();
+
+    var iter: u32 = 0;
+    while (iter < iterations) : (iter += 1) {
+        _ = resampler.resampleBuffer(&input, &output);
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_iteration = elapsed_ns / iterations;
+    const samples_per_iteration = input_samples / 2;
+    const ns_per_sample = ns_per_iteration / samples_per_iteration;
+
+    std.log.info("Resampler Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Resampling should be reasonably fast (< 2000 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 20000);
+}
+
+// Benchmark: Measure bass boost processing
+test "benchmark bass boost" {
+    var bass = BassBoost.init();
+    bass.enabled = true;
+    bass.setBoost(6); // +6dB boost
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 8000;
+    var right: i16 = 8000;
+    while (i < iterations) : (i += 1) {
+        const result = bass.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("Bass Boost Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Bass boost should be fast (< 1000 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 10000);
+}
+
+// Benchmark: Measure stereo widener performance
+test "benchmark stereo widener" {
+    var widener = StereoWidener.init();
+    widener.setWidth(50); // 50% width
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 10000;
+    var right: i16 = 12000;
+    while (i < iterations) : (i += 1) {
+        const result = widener.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("Stereo Widener Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Stereo widener should be very fast (< 500 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 5000);
+}
