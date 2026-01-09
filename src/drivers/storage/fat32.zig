@@ -695,7 +695,7 @@ fn findFreeEntrySlot(fs: *Fat32, dir: *Directory) hal.HalError!struct { cluster:
 fn writeDataToChain(fs: *Fat32, data: []const u8) FatError!u32 {
     if (data.len == 0) return 0;
 
-    const first_cluster = fs.allocateCluster() catch return FatError.io_error orelse return FatError.io_error;
+    const first_cluster = (fs.allocateCluster() catch return FatError.io_error) orelse return FatError.io_error;
     var current_cluster = first_cluster;
     var offset: usize = 0;
 
@@ -711,7 +711,7 @@ fn writeDataToChain(fs: *Fat32, data: []const u8) FatError!u32 {
 
         if (offset < data.len) {
             // Need another cluster
-            const next = fs.extendChain(current_cluster) catch return FatError.io_error orelse return FatError.io_error;
+            const next = (fs.extendChain(current_cluster) catch return FatError.io_error) orelse return FatError.io_error;
             current_cluster = next;
         }
     }
@@ -845,7 +845,7 @@ pub fn createDirectory(path: []const u8) FatError!void {
             if (slot.cluster == 0) return FatError.io_error;
 
             // Allocate cluster for new directory
-            const dir_cluster = fs.allocateCluster() catch return FatError.io_error orelse return FatError.io_error;
+            const dir_cluster = (fs.allocateCluster() catch return FatError.io_error) orelse return FatError.io_error;
 
             // Initialize directory cluster with . and .. entries
             var dir_data: [32768]u8 = [_]u8{0} ** 32768;

@@ -14,6 +14,7 @@ const now_playing = @import("../ui/now_playing.zig");
 const file_browser = @import("../ui/file_browser.zig");
 const music_browser = @import("../ui/music_browser.zig");
 const settings_ui = @import("../ui/settings.zig");
+const music_db = @import("../library/music_db.zig");
 
 // ============================================================
 // Application Screens
@@ -135,6 +136,9 @@ var main_menu_items = [_]ui.MenuItem{
 
 /// Initialize the application
 pub fn init() void {
+    // Load settings from storage (or use defaults)
+    settings_ui.initSettings();
+
     // Initialize main menu
     app_state.main_menu = ui.Menu{
         .title = "ZigPod",
@@ -149,6 +153,9 @@ pub fn init() void {
 
     // Initialize settings browser
     app_state.settings_browser_state = settings_ui.SettingsBrowser.init();
+
+    // Scan music library in background
+    music_db.scanDefaultPaths();
 
     // Set initial screen
     app_state.current_screen = .main_menu;
@@ -390,7 +397,11 @@ fn handleSettingsInput(event: clickwheel.InputEvent) void {
     );
 
     switch (action) {
-        .exit => app_state.popScreen(),
+        .exit => {
+            // Save settings when exiting settings screen
+            settings_ui.saveSettings();
+            app_state.popScreen();
+        },
         .show_about => {
             app_state.settings_browser_state.category = .about;
             app_state.pushScreen(.about);
