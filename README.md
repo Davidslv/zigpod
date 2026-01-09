@@ -13,7 +13,7 @@ A custom operating system for the Apple iPod Video (5th Generation), written ent
 - **Native Audio Playback**: WAV, AIFF, FLAC, and MP3 support
 - **Full Hardware Support**: LCD, click wheel, audio codec, storage
 - **Complete Simulator**: Test without hardware using the PP5021C emulator
-- **Modern Codebase**: Clean Zig implementation with 458+ unit tests
+- **Modern Codebase**: Clean Zig implementation with 590+ unit tests
 
 ## Quick Start
 
@@ -166,7 +166,7 @@ zigpod/
 ### Running Tests
 
 ```bash
-# Run all tests (458+ tests)
+# Run all tests (590+ tests)
 zig build test
 
 # Run with verbose output
