@@ -28,6 +28,7 @@ pub const SystemInfoScreen = struct {
         overview,
         battery,
         storage,
+        errors,
         about,
     };
 
@@ -49,6 +50,7 @@ pub const SystemInfoScreen = struct {
             .overview => self.drawOverviewPage(),
             .battery => self.drawBatteryPage(),
             .storage => self.drawStoragePage(),
+            .errors => self.drawErrorsPage(),
             .about => self.drawAboutPage(),
         }
 
@@ -175,6 +177,66 @@ pub const SystemInfoScreen = struct {
         drawLabelValue(PADDING, y, "Playlists:", "15");
     }
 
+    fn drawErrorsPage(self: *SystemInfoScreen) void {
+        _ = self;
+        var y: u16 = HEADER_HEIGHT + PADDING;
+
+        // Get error status from UI
+        const error_status = ui_core.getErrorStatus();
+
+        if (!error_status.has_errors) {
+            // No errors - show success message
+            lcd.drawString(80, 100, "No Errors", lcd.Colors.GREEN, null);
+            lcd.drawString(50, 120, "System running normally", lcd.Colors.GRAY, null);
+            return;
+        }
+
+        // Error count
+        var count_buf: [16]u8 = undefined;
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{error_status.error_count}) catch "?";
+        drawLabelValue(PADDING, y, "Errors:", count_str);
+        y += LINE_HEIGHT;
+
+        // Severity
+        const severity_str = switch (error_status.severity) {
+            .none => "None",
+            .warning => "Warning",
+            .significant => "Significant",
+            .critical => "Critical",
+        };
+        const severity_color = switch (error_status.severity) {
+            .none => lcd.Colors.GREEN,
+            .warning => lcd.Colors.YELLOW,
+            .significant => lcd.rgb(255, 140, 0), // Orange
+            .critical => lcd.Colors.RED,
+        };
+        lcd.drawString(PADDING, y, "Severity:", lcd.Colors.GRAY, null);
+        lcd.drawString(PADDING + 100, y, severity_str, severity_color, null);
+        y += LINE_HEIGHT;
+
+        y += 10;
+
+        // Error indicator visual
+        if (error_status.severity == .critical) {
+            lcd.drawString(PADDING, y, "Critical errors detected!", lcd.Colors.RED, null);
+            y += LINE_HEIGHT;
+            lcd.drawString(PADDING, y, "Check logs or restart.", lcd.Colors.GRAY, null);
+        } else if (error_status.severity == .significant) {
+            lcd.drawString(PADDING, y, "Some operations failed.", lcd.rgb(255, 140, 0), null);
+            y += LINE_HEIGHT;
+            lcd.drawString(PADDING, y, "System still operational.", lcd.Colors.GRAY, null);
+        } else if (error_status.severity == .warning) {
+            lcd.drawString(PADDING, y, "Minor issues detected.", lcd.Colors.YELLOW, null);
+            y += LINE_HEIGHT;
+            lcd.drawString(PADDING, y, "No action required.", lcd.Colors.GRAY, null);
+        }
+
+        y += LINE_HEIGHT + 10;
+
+        // Hint
+        lcd.drawString(PADDING, y, "Errors clear on restart", lcd.Colors.DARK_GRAY, null);
+    }
+
     fn drawAboutPage(self: *SystemInfoScreen) void {
         _ = self;
         var y: u16 = HEADER_HEIGHT + PADDING;
@@ -232,7 +294,8 @@ pub const SystemInfoScreen = struct {
         self.current_page = switch (self.current_page) {
             .overview => .battery,
             .battery => .storage,
-            .storage => .about,
+            .storage => .errors,
+            .errors => .about,
             .about => .overview,
         };
     }
@@ -242,7 +305,8 @@ pub const SystemInfoScreen = struct {
             .overview => .about,
             .battery => .overview,
             .storage => .battery,
-            .about => .storage,
+            .errors => .storage,
+            .about => .errors,
         };
     }
 };
@@ -260,6 +324,7 @@ fn drawHeader(page: SystemInfoScreen.Page) void {
         .overview => "System Info",
         .battery => "Battery",
         .storage => "Storage",
+        .errors => "Errors",
         .about => "About",
     };
     lcd.drawString(10, 3, title, lcd.Colors.WHITE, null);
@@ -267,7 +332,7 @@ fn drawHeader(page: SystemInfoScreen.Page) void {
     // Page indicator
     const page_num = @intFromEnum(page) + 1;
     var buf: [8]u8 = undefined;
-    const page_str = std.fmt.bufPrint(&buf, "{d}/4", .{page_num}) catch "?/4";
+    const page_str = std.fmt.bufPrint(&buf, "{d}/5", .{page_num}) catch "?/5";
     lcd.drawString(280, 3, page_str, lcd.Colors.GRAY, null);
 }
 

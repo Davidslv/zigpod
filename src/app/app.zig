@@ -197,11 +197,30 @@ pub fn update() void {
         };
     }
 
+    // Sync error state to UI for status bar indicator
+    syncErrorStateToUI();
+
     // Draw if needed
     if (app_state.needs_redraw) {
         draw();
         app_state.needs_redraw = false;
     }
+}
+
+/// Sync error state to UI system for status bar display
+fn syncErrorStateToUI() void {
+    const error_state = app_state.error_state;
+    const ui_severity: ui.ErrorIndicator.ErrorSeverity = switch (error_state.severity) {
+        .none => .none,
+        .warning => .warning,
+        .significant => .significant,
+        .critical => .critical,
+    };
+    ui.updateErrorStatus(
+        error_state.hasErrors(),
+        error_state.error_count,
+        ui_severity,
+    );
 }
 
 // ============================================================

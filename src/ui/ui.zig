@@ -525,6 +525,7 @@ pub const OverlayType = enum {
     hold,
     low_battery,
     charging,
+    system_error,
 };
 
 /// Overlay display state
@@ -576,6 +577,14 @@ pub const OverlayState = struct {
         self.show_time = timestamp;
     }
 
+    /// Show system error overlay
+    pub fn showError(self: *OverlayState, error_count: u8, timestamp: u32) void {
+        self.overlay_type = .system_error;
+        self.value = error_count;
+        self.show_time = timestamp;
+        self.duration_ms = 4000; // Show errors longer
+    }
+
     /// Hide overlay
     pub fn hide(self: *OverlayState) void {
         self.overlay_type = .none;
@@ -599,6 +608,7 @@ pub fn drawOverlay(current_time: u32) void {
         .hold => drawHoldOverlay(),
         .low_battery => drawLowBatteryOverlay(overlay_state.value),
         .charging => drawChargingOverlay(overlay_state.value),
+        .system_error => drawErrorOverlay(overlay_state.value),
         .none => {},
     }
 }
@@ -741,6 +751,46 @@ fn drawChargingOverlay(percent: u8) void {
     lcd.drawString(box_x + 80, box_y + 35, "%", lcd.rgb(200, 200, 200), lcd.rgb(20, 40, 20));
 }
 
+/// Draw system error overlay
+fn drawErrorOverlay(error_count: u8) void {
+    const box_width: u16 = 220;
+    const box_height: u16 = 80;
+    const box_x: u16 = (SCREEN_WIDTH - box_width) / 2;
+    const box_y: u16 = (SCREEN_HEIGHT - box_height) / 2;
+
+    // Dark red background
+    lcd.fillRect(box_x, box_y, box_width, box_height, lcd.rgb(60, 20, 20));
+    lcd.drawRect(box_x, box_y, box_width, box_height, lcd.rgb(255, 80, 80));
+
+    // Error icon (simplified - exclamation in rectangle)
+    const icon_x = box_x + 20;
+    const icon_y = box_y + 15;
+    const error_color = lcd.rgb(255, 80, 80);
+
+    // Warning triangle approximation using rectangles
+    lcd.fillRect(icon_x + 8, icon_y, 8, 4, error_color);
+    lcd.fillRect(icon_x + 6, icon_y + 4, 12, 4, error_color);
+    lcd.fillRect(icon_x + 4, icon_y + 8, 16, 4, error_color);
+    lcd.fillRect(icon_x + 2, icon_y + 12, 20, 4, error_color);
+    lcd.fillRect(icon_x, icon_y + 16, 24, 4, error_color);
+
+    // Exclamation mark (black on red)
+    lcd.fillRect(icon_x + 10, icon_y + 4, 4, 8, lcd.rgb(60, 20, 20));
+    lcd.fillRect(icon_x + 10, icon_y + 14, 4, 3, lcd.rgb(60, 20, 20));
+
+    // Error title
+    lcd.drawString(icon_x + 35, box_y + 15, "System Error", lcd.rgb(255, 100, 100), lcd.rgb(60, 20, 20));
+
+    // Error count
+    var buf: [16]u8 = undefined;
+    const count_str = formatNumber(error_count, buf[0..4]);
+    lcd.drawString(icon_x + 35, box_y + 35, count_str, lcd.rgb(200, 200, 200), lcd.rgb(60, 20, 20));
+    lcd.drawString(icon_x + 60, box_y + 35, " error(s) logged", lcd.rgb(200, 200, 200), lcd.rgb(60, 20, 20));
+
+    // Hint
+    lcd.drawString(box_x + 20, box_y + 55, "Check System Info for details", lcd.rgb(160, 160, 160), lcd.rgb(60, 20, 20));
+}
+
 // ============================================================
 // Status Bar Indicators
 // ============================================================
@@ -753,6 +803,34 @@ pub const BatteryStatus = struct {
 };
 
 var battery_status = BatteryStatus{};
+
+/// Error indicator status
+pub const ErrorIndicator = struct {
+    has_errors: bool = false,
+    error_count: u32 = 0,
+    severity: ErrorSeverity = .none,
+
+    pub const ErrorSeverity = enum {
+        none,
+        warning,
+        significant,
+        critical,
+    };
+};
+
+var error_indicator = ErrorIndicator{};
+
+/// Update error indicator status
+pub fn updateErrorStatus(has_errors: bool, error_count: u32, severity: ErrorIndicator.ErrorSeverity) void {
+    error_indicator.has_errors = has_errors;
+    error_indicator.error_count = error_count;
+    error_indicator.severity = severity;
+}
+
+/// Get error indicator status
+pub fn getErrorStatus() ErrorIndicator {
+    return error_indicator;
+}
 
 /// Update battery status
 pub fn updateBatteryStatus(percent: u8, charging: bool) void {
@@ -794,10 +872,41 @@ pub fn drawBatteryIcon(x: u16, y: u16, percent: u8, low: bool) void {
     }
 }
 
+/// Draw error indicator icon
+fn drawErrorIndicatorIcon(x: u16, y: u16, severity: ErrorIndicator.ErrorSeverity) void {
+    // Color based on severity
+    const color = switch (severity) {
+        .none => current_theme.disabled,
+        .warning => lcd.rgb(255, 200, 0), // Yellow
+        .significant => lcd.rgb(255, 140, 0), // Orange
+        .critical => lcd.rgb(255, 60, 60), // Red
+    };
+
+    // Draw small warning triangle using stacked rectangles (12x10)
+    lcd.fillRect(x + 5, y, 2, 2, color);
+    lcd.fillRect(x + 4, y + 2, 4, 2, color);
+    lcd.fillRect(x + 3, y + 4, 6, 2, color);
+    lcd.fillRect(x + 2, y + 6, 8, 2, color);
+    lcd.fillRect(x + 1, y + 8, 10, 2, color);
+
+    // Exclamation mark (darker on colored background)
+    const bg = current_theme.header_bg;
+    lcd.fillRect(x + 5, y + 2, 2, 3, bg);
+    lcd.fillRect(x + 5, y + 6, 2, 2, bg);
+}
+
 /// Draw status bar with battery and other indicators
 pub fn drawStatusBar() void {
+    // Error indicator (before battery if errors exist)
+    const next_x: u16 = SCREEN_WIDTH - 40;
+
+    if (error_indicator.has_errors) {
+        const error_x = next_x - 20;
+        drawErrorIndicatorIcon(error_x, 6, error_indicator.severity);
+    }
+
     // Battery icon in top-right corner
-    const battery_x = SCREEN_WIDTH - 40;
+    const battery_x = next_x;
     const battery_y: u16 = 5;
     drawBatteryIcon(battery_x, battery_y, battery_status.percent, battery_status.is_low);
 
@@ -981,4 +1090,39 @@ test "format number" {
 
     const three = formatNumber(100, &buf);
     try std.testing.expectEqualStrings("100", three);
+}
+
+test "error indicator status" {
+    // Initially no errors
+    updateErrorStatus(false, 0, .none);
+    var status = getErrorStatus();
+    try std.testing.expect(!status.has_errors);
+    try std.testing.expectEqual(@as(u32, 0), status.error_count);
+    try std.testing.expectEqual(ErrorIndicator.ErrorSeverity.none, status.severity);
+
+    // Set warning error
+    updateErrorStatus(true, 3, .warning);
+    status = getErrorStatus();
+    try std.testing.expect(status.has_errors);
+    try std.testing.expectEqual(@as(u32, 3), status.error_count);
+    try std.testing.expectEqual(ErrorIndicator.ErrorSeverity.warning, status.severity);
+
+    // Set critical error
+    updateErrorStatus(true, 5, .critical);
+    status = getErrorStatus();
+    try std.testing.expectEqual(ErrorIndicator.ErrorSeverity.critical, status.severity);
+
+    // Clear errors
+    updateErrorStatus(false, 0, .none);
+    status = getErrorStatus();
+    try std.testing.expect(!status.has_errors);
+}
+
+test "error overlay" {
+    var overlay = OverlayState{};
+
+    overlay.showError(5, 0);
+    try std.testing.expectEqual(OverlayType.system_error, overlay.overlay_type);
+    try std.testing.expectEqual(@as(u8, 5), overlay.value);
+    try std.testing.expectEqual(@as(u32, 4000), overlay.duration_ms); // Errors show longer
 }
