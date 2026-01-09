@@ -1090,21 +1090,28 @@ fn deserializeSettings(s: *const SerializedSettings) Settings {
 }
 
 /// Storage interface for settings persistence
-/// TODO: Implement actual storage when FAT32 write support is added
 const SettingsStorage = struct {
+    const fat32 = @import("../drivers/storage/fat32.zig");
+    const SETTINGS_DIR = "/.zigpod";
+
     /// Write settings to storage
     fn write(data: []const u8) bool {
-        // TODO: Implement when FAT32 write support is available
-        // For now, settings are volatile (lost on power off)
-        _ = data;
-        return false;
+        if (!fat32.isInitialized()) return false;
+
+        // Ensure settings directory exists
+        fat32.createDirectory(SETTINGS_DIR) catch {};
+
+        // Write settings file
+        fat32.writeFile(SETTINGS_FILE_PATH, data) catch return false;
+        return true;
     }
 
     /// Read settings from storage
     fn read(buffer: []u8) ?usize {
-        // TODO: Implement when FAT32 read for config files is available
-        _ = buffer;
-        return null;
+        if (!fat32.isInitialized()) return null;
+
+        const bytes_read = fat32.readFile(SETTINGS_FILE_PATH, buffer) catch return null;
+        return bytes_read;
     }
 };
 

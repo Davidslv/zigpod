@@ -188,6 +188,89 @@ pub const Fat32 = struct {
         try ata.readSectors(lba, sectors, buffer);
     }
 
+    /// Write a cluster from buffer
+    pub fn writeCluster(self: *Fat32, cluster: u32, buffer: []const u8) hal.HalError!void {
+        const lba = self.clusterToLba(cluster);
+        const sectors: u16 = @intCast(self.sectors_per_cluster);
+        try ata.writeSectors(lba, sectors, buffer);
+    }
+
+    /// Set FAT entry for a cluster
+    pub fn setFatEntry(self: *Fat32, cluster: u32, value: u32) hal.HalError!void {
+        const fat_offset = cluster * 4;
+        const fat_sector = self.fat_start + (fat_offset / 512);
+        const offset_in_sector = fat_offset % 512;
+
+        // Load FAT sector if not cached or different sector
+        if (!self.fat_cache_valid or self.current_fat_sector != fat_sector) {
+            try ata.readSector(fat_sector, &self.fat_cache);
+            self.current_fat_sector = fat_sector;
+            self.fat_cache_valid = true;
+        }
+
+        // Update entry in cache
+        const entry_ptr: *align(1) u32 = @ptrCast(&self.fat_cache[offset_in_sector]);
+        entry_ptr.* = value & 0x0FFFFFFF;
+
+        // Write back to all FATs
+        var fat_num: u8 = 0;
+        while (fat_num < self.num_fats) : (fat_num += 1) {
+            const sector = fat_sector + (@as(u64, fat_num) * self.fat_sectors);
+            try ata.writeSector(sector, &self.fat_cache);
+        }
+    }
+
+    /// Allocate a free cluster
+    /// Returns the cluster number or null if disk is full
+    pub fn allocateCluster(self: *Fat32) hal.HalError!?u32 {
+        // Search for free cluster starting from cluster 2
+        var cluster: u32 = 2;
+        while (cluster < self.total_clusters + 2) : (cluster += 1) {
+            const entry = try self.getNextCluster(cluster);
+            if (entry == null or entry.? == 0) {
+                // Check if this is actually a free cluster (entry == 0)
+                const fat_offset = cluster * 4;
+                const fat_sector = self.fat_start + (fat_offset / 512);
+                const offset_in_sector = fat_offset % 512;
+
+                if (!self.fat_cache_valid or self.current_fat_sector != fat_sector) {
+                    try ata.readSector(fat_sector, &self.fat_cache);
+                    self.current_fat_sector = fat_sector;
+                    self.fat_cache_valid = true;
+                }
+
+                const entry_ptr: *align(1) const u32 = @ptrCast(&self.fat_cache[offset_in_sector]);
+                if ((entry_ptr.* & 0x0FFFFFFF) == 0) {
+                    // Mark as end of chain
+                    try self.setFatEntry(cluster, 0x0FFFFFFF);
+                    return cluster;
+                }
+            }
+        }
+        return null; // Disk full
+    }
+
+    /// Allocate a cluster and link it to an existing chain
+    pub fn extendChain(self: *Fat32, last_cluster: u32) hal.HalError!?u32 {
+        const new_cluster = try self.allocateCluster() orelse return null;
+        try self.setFatEntry(last_cluster, new_cluster);
+        return new_cluster;
+    }
+
+    /// Free a cluster chain starting from the given cluster
+    pub fn freeChain(self: *Fat32, start_cluster: u32) hal.HalError!void {
+        var cluster = start_cluster;
+        while (cluster >= 2 and cluster < 0x0FFFFFF8) {
+            const next = try self.getNextCluster(cluster);
+            try self.setFatEntry(cluster, 0); // Mark as free
+            if (next) |n| {
+                cluster = n;
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Open root directory
     pub fn openRootDir(self: *Fat32) Directory {
         return Directory{
@@ -445,6 +528,356 @@ pub fn readFile(path: []const u8, buffer: []u8) FatError!usize {
     // Read entire file
     const bytes_read = f.read(buffer) catch return FatError.io_error;
     return bytes_read;
+}
+
+/// Write data to a file, creating it if it doesn't exist
+/// This replaces the entire file contents
+pub fn writeFile(path: []const u8, data: []const u8) FatError!void {
+    var fs = global_fs orelse return FatError.not_initialized;
+
+    // Split path into directory and filename
+    var dir_end: usize = 0;
+    for (path, 0..) |c, i| {
+        if (c == '/') dir_end = i;
+    }
+
+    const dir_path = if (dir_end > 0) path[0..dir_end] else "/";
+    const filename = if (dir_end < path.len - 1) path[dir_end + 1 ..] else return FatError.file_not_found;
+
+    // Open parent directory
+    var dir = openDirectory(&fs, dir_path) catch return FatError.file_not_found;
+
+    // Try to find existing file
+    dir.rewind();
+    const existing = findEntryWithPosition(&dir, filename) catch return FatError.io_error;
+
+    if (existing.entry) |entry| {
+        // File exists - update it
+        try updateExistingFile(&fs, &dir, entry, existing.cluster, existing.offset, data);
+    } else {
+        // Create new file
+        try createNewFile(&fs, &dir, filename, data);
+    }
+}
+
+/// Result of finding an entry with position info
+const EntrySearchResult = struct {
+    entry: ?DirEntry,
+    cluster: u32, // Cluster containing the entry
+    offset: u32, // Byte offset within cluster
+};
+
+/// Find a directory entry and return its location
+fn findEntryWithPosition(dir: *Directory, name: []const u8) hal.HalError!EntrySearchResult {
+    const entries_per_cluster = dir.fs.cluster_size / 32;
+
+    while (true) {
+        const entry_in_cluster = dir.position % entries_per_cluster;
+        if (dir.position > 0 and entry_in_cluster == 0) {
+            if (try dir.fs.getNextCluster(dir.current_cluster)) |next| {
+                dir.current_cluster = next;
+            } else {
+                return EntrySearchResult{ .entry = null, .cluster = 0, .offset = 0 };
+            }
+        }
+
+        var cluster_buffer: [32768]u8 = undefined;
+        const cluster_data = cluster_buffer[0..dir.fs.cluster_size];
+        try dir.fs.readCluster(dir.current_cluster, cluster_data);
+
+        const entry_offset = entry_in_cluster * 32;
+        const entry: *const DirEntry = @ptrCast(@alignCast(&cluster_data[entry_offset]));
+
+        const current_cluster = dir.current_cluster;
+        const current_offset = @as(u32, @intCast(entry_offset));
+        dir.position += 1;
+
+        if (entry.isEndOfDir()) {
+            return EntrySearchResult{ .entry = null, .cluster = current_cluster, .offset = current_offset };
+        }
+
+        if (entry.isDeleted()) continue;
+        if ((entry.attributes & DirEntry.ATTR_LONG_NAME) == DirEntry.ATTR_LONG_NAME) continue;
+
+        // Compare name
+        var entry_name: [12]u8 = undefined;
+        var entry_name_len: usize = 0;
+
+        var i: usize = 0;
+        while (i < 8 and entry.name[i] != ' ') : (i += 1) {
+            entry_name[entry_name_len] = entry.name[i];
+            entry_name_len += 1;
+        }
+
+        if (entry.name[8] != ' ') {
+            entry_name[entry_name_len] = '.';
+            entry_name_len += 1;
+            i = 8;
+            while (i < 11 and entry.name[i] != ' ') : (i += 1) {
+                entry_name[entry_name_len] = entry.name[i];
+                entry_name_len += 1;
+            }
+        }
+
+        if (caseInsensitiveEqual(entry_name[0..entry_name_len], name)) {
+            return EntrySearchResult{ .entry = entry.*, .cluster = current_cluster, .offset = current_offset };
+        }
+    }
+}
+
+/// Update an existing file with new data
+fn updateExistingFile(fs: *Fat32, dir: *Directory, entry: DirEntry, entry_cluster: u32, entry_offset: u32, data: []const u8) FatError!void {
+    _ = dir;
+
+    // Free old cluster chain if file had data
+    if (entry.getCluster() >= 2) {
+        fs.freeChain(entry.getCluster()) catch return FatError.io_error;
+    }
+
+    // Allocate new clusters and write data
+    const first_cluster = try writeDataToChain(fs, data);
+
+    // Update directory entry
+    try updateDirectoryEntry(fs, entry_cluster, entry_offset, first_cluster, @intCast(data.len));
+}
+
+/// Create a new file
+fn createNewFile(fs: *Fat32, dir: *Directory, filename: []const u8, data: []const u8) FatError!void {
+    // Find free entry slot in directory
+    dir.rewind();
+    const slot = findFreeEntrySlot(fs, dir) catch return FatError.io_error;
+    if (slot.cluster == 0) return FatError.io_error; // Directory full
+
+    // Allocate clusters and write data
+    const first_cluster = if (data.len > 0) try writeDataToChain(fs, data) else 0;
+
+    // Create directory entry
+    try createDirectoryEntry(fs, slot.cluster, slot.offset, filename, first_cluster, @intCast(data.len), false);
+}
+
+/// Find a free directory entry slot
+fn findFreeEntrySlot(fs: *Fat32, dir: *Directory) hal.HalError!struct { cluster: u32, offset: u32 } {
+    const entries_per_cluster = fs.cluster_size / 32;
+    var last_cluster = dir.current_cluster;
+
+    while (true) {
+        const entry_in_cluster = dir.position % entries_per_cluster;
+        if (dir.position > 0 and entry_in_cluster == 0) {
+            if (try fs.getNextCluster(dir.current_cluster)) |next| {
+                last_cluster = dir.current_cluster;
+                dir.current_cluster = next;
+            } else {
+                // Need to extend directory
+                const new_cluster = try fs.extendChain(last_cluster) orelse return .{ .cluster = 0, .offset = 0 };
+                // Zero out new cluster
+                var zeros: [32768]u8 = [_]u8{0} ** 32768;
+                try fs.writeCluster(new_cluster, zeros[0..fs.cluster_size]);
+                dir.current_cluster = new_cluster;
+            }
+        }
+
+        var cluster_buffer: [32768]u8 = undefined;
+        const cluster_data = cluster_buffer[0..fs.cluster_size];
+        try fs.readCluster(dir.current_cluster, cluster_data);
+
+        const entry_offset = entry_in_cluster * 32;
+        const entry: *const DirEntry = @ptrCast(@alignCast(&cluster_data[entry_offset]));
+
+        if (entry.isEndOfDir() or entry.isDeleted()) {
+            return .{ .cluster = dir.current_cluster, .offset = @intCast(entry_offset) };
+        }
+
+        dir.position += 1;
+    }
+}
+
+/// Write data to a new cluster chain
+fn writeDataToChain(fs: *Fat32, data: []const u8) FatError!u32 {
+    if (data.len == 0) return 0;
+
+    const first_cluster = fs.allocateCluster() catch return FatError.io_error orelse return FatError.io_error;
+    var current_cluster = first_cluster;
+    var offset: usize = 0;
+
+    while (offset < data.len) {
+        const bytes_to_write = @min(data.len - offset, fs.cluster_size);
+
+        // Prepare cluster buffer (zero-padded)
+        var cluster_buffer: [32768]u8 = [_]u8{0} ** 32768;
+        @memcpy(cluster_buffer[0..bytes_to_write], data[offset..][0..bytes_to_write]);
+
+        fs.writeCluster(current_cluster, cluster_buffer[0..fs.cluster_size]) catch return FatError.io_error;
+        offset += bytes_to_write;
+
+        if (offset < data.len) {
+            // Need another cluster
+            const next = fs.extendChain(current_cluster) catch return FatError.io_error orelse return FatError.io_error;
+            current_cluster = next;
+        }
+    }
+
+    return first_cluster;
+}
+
+/// Update a directory entry at a known location
+fn updateDirectoryEntry(fs: *Fat32, cluster: u32, offset: u32, first_cluster: u32, size: u32) FatError!void {
+    var cluster_buffer: [32768]u8 = undefined;
+    const cluster_data = cluster_buffer[0..fs.cluster_size];
+    fs.readCluster(cluster, cluster_data) catch return FatError.io_error;
+
+    const entry: *DirEntry = @ptrCast(@alignCast(&cluster_data[offset]));
+    entry.cluster_low = @truncate(first_cluster);
+    entry.cluster_high = @truncate(first_cluster >> 16);
+    entry.file_size = size;
+
+    fs.writeCluster(cluster, cluster_data) catch return FatError.io_error;
+}
+
+/// Create a new directory entry
+fn createDirectoryEntry(fs: *Fat32, cluster: u32, offset: u32, name: []const u8, first_cluster: u32, size: u32, is_directory: bool) FatError!void {
+    var cluster_buffer: [32768]u8 = undefined;
+    const cluster_data = cluster_buffer[0..fs.cluster_size];
+    fs.readCluster(cluster, cluster_data) catch return FatError.io_error;
+
+    const entry: *DirEntry = @ptrCast(@alignCast(&cluster_data[offset]));
+
+    // Convert filename to 8.3 format
+    entry.name = [_]u8{' '} ** 11;
+    var name_pos: usize = 0;
+    var ext_pos: usize = 8;
+    var in_ext = false;
+
+    for (name) |c| {
+        if (c == '.') {
+            in_ext = true;
+            continue;
+        }
+        // Convert to uppercase
+        const upper = if (c >= 'a' and c <= 'z') c - 32 else c;
+        if (in_ext) {
+            if (ext_pos < 11) {
+                entry.name[ext_pos] = upper;
+                ext_pos += 1;
+            }
+        } else {
+            if (name_pos < 8) {
+                entry.name[name_pos] = upper;
+                name_pos += 1;
+            }
+        }
+    }
+
+    entry.attributes = if (is_directory) DirEntry.ATTR_DIRECTORY else DirEntry.ATTR_ARCHIVE;
+    entry.reserved = 0;
+    entry.create_time_tenth = 0;
+    entry.create_time = 0;
+    entry.create_date = 0;
+    entry.access_date = 0;
+    entry.modify_time = 0;
+    entry.modify_date = 0;
+    entry.cluster_high = @truncate(first_cluster >> 16);
+    entry.cluster_low = @truncate(first_cluster);
+    entry.file_size = size;
+
+    // Write end-of-directory marker after this entry if needed
+    if (offset + 32 < fs.cluster_size) {
+        const next_entry: *DirEntry = @ptrCast(@alignCast(&cluster_data[offset + 32]));
+        if (next_entry.name[0] != 0 and !next_entry.isDeleted()) {
+            // Don't overwrite existing entries
+        } else if (next_entry.name[0] != 0) {
+            // Mark end of directory
+            next_entry.name[0] = 0;
+        }
+    }
+
+    fs.writeCluster(cluster, cluster_data) catch return FatError.io_error;
+}
+
+/// Create a directory (including parent directories if needed)
+pub fn createDirectory(path: []const u8) FatError!void {
+    var fs = global_fs orelse return FatError.not_initialized;
+
+    var current_path: [256]u8 = undefined;
+    var path_len: usize = 0;
+
+    var remaining = path;
+    if (remaining.len > 0 and remaining[0] == '/') {
+        remaining = remaining[1..];
+    }
+
+    // Create each component
+    while (remaining.len > 0) {
+        // Find next component
+        var component_end: usize = 0;
+        while (component_end < remaining.len and remaining[component_end] != '/') {
+            component_end += 1;
+        }
+
+        if (component_end == 0) {
+            if (remaining.len > 0) remaining = remaining[1..];
+            continue;
+        }
+
+        const component = remaining[0..component_end];
+
+        // Build path to this component
+        if (path_len > 0) {
+            current_path[path_len] = '/';
+            path_len += 1;
+        } else {
+            current_path[0] = '/';
+            path_len = 1;
+        }
+        @memcpy(current_path[path_len..][0..component.len], component);
+        path_len += component.len;
+
+        // Check if directory exists
+        const dir_result = openDirectory(&fs, current_path[0..path_len]);
+        if (dir_result) |_| {
+            // Directory exists, continue
+        } else |_| {
+            // Need to create it
+            const parent_path = if (path_len > component.len + 1) current_path[0 .. path_len - component.len - 1] else "/";
+            var parent_dir = openDirectory(&fs, parent_path) catch return FatError.io_error;
+
+            // Find free slot
+            const slot = findFreeEntrySlot(&fs, &parent_dir) catch return FatError.io_error;
+            if (slot.cluster == 0) return FatError.io_error;
+
+            // Allocate cluster for new directory
+            const dir_cluster = fs.allocateCluster() catch return FatError.io_error orelse return FatError.io_error;
+
+            // Initialize directory cluster with . and .. entries
+            var dir_data: [32768]u8 = [_]u8{0} ** 32768;
+
+            // . entry
+            const dot: *DirEntry = @ptrCast(@alignCast(&dir_data[0]));
+            dot.name = ".          ".*;
+            dot.attributes = DirEntry.ATTR_DIRECTORY;
+            dot.cluster_low = @truncate(dir_cluster);
+            dot.cluster_high = @truncate(dir_cluster >> 16);
+
+            // .. entry
+            const dotdot: *DirEntry = @ptrCast(@alignCast(&dir_data[32]));
+            dotdot.name = "..         ".*;
+            dotdot.attributes = DirEntry.ATTR_DIRECTORY;
+            const parent_cluster = parent_dir.first_cluster;
+            dotdot.cluster_low = @truncate(parent_cluster);
+            dotdot.cluster_high = @truncate(parent_cluster >> 16);
+
+            fs.writeCluster(dir_cluster, dir_data[0..fs.cluster_size]) catch return FatError.io_error;
+
+            // Create entry in parent
+            try createDirectoryEntry(&fs, slot.cluster, slot.offset, component, dir_cluster, 0, true);
+        }
+
+        // Move to next component
+        if (component_end < remaining.len) {
+            remaining = remaining[component_end + 1 ..];
+        } else {
+            break;
+        }
+    }
 }
 
 /// Open a directory by path (e.g., "/MUSIC")
