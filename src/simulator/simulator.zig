@@ -160,6 +160,9 @@ pub const SimulatorState = struct {
         self.config = config;
         self.start_time = std.time.nanoTimestamp();
 
+        // Initialize HAL (uses mock HAL when not on hardware)
+        hal.init();
+
         // Initialize I2C devices
         self.i2c_devices = std.AutoHashMap(u7, I2cDevice).init(allocator);
 
@@ -188,6 +191,31 @@ pub const SimulatorState = struct {
 
         if (self.disk_image) |*disk| {
             self.ata_controller = storage.ata_controller.AtaController.init(disk);
+
+            // Wire the mock HAL's ATA storage to use the disk image data
+            // This allows the FAT32 driver to read from the mock FAT32 disk
+            if (config.audio_samples_path != null) {
+                hal.mock.setAtaStorage(disk.getData());
+                std.debug.print("Mock HAL ATA storage wired to disk image ({d} bytes)\n", .{disk.getData().len});
+
+                // Initialize the ATA driver (needed before FAT32)
+                const ata = @import("../drivers/storage/ata.zig");
+                ata.init() catch |err| {
+                    std.debug.print("Failed to init ATA driver: {}\n", .{err});
+                };
+
+                // Initialize FAT32 driver to use the disk
+                // The mock FAT32 disk starts at sector 0 (no MBR, direct FAT32)
+                const fat32_driver = @import("../drivers/storage/fat32.zig");
+                const fs = fat32_driver.Fat32.init(0) catch |err| blk: {
+                    std.debug.print("Failed to init FAT32 driver: {}\n", .{err});
+                    break :blk null;
+                };
+                if (fs) |valid_fs| {
+                    fat32_driver.initGlobal(valid_fs);
+                    std.debug.print("FAT32 driver initialized\n", .{});
+                }
+            }
         }
 
         // Connect timer system to interrupt controller

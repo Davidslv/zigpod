@@ -155,6 +155,16 @@ pub const DiskImage = struct {
         return self.file != null or self.memory != null;
     }
 
+    /// Get the raw data buffer (only for memory-backed disks)
+    /// Returns the underlying memory buffer for wiring to mock HAL
+    pub fn getData(self: *Self) []u8 {
+        if (self.memory) |mem| {
+            return mem;
+        }
+        // For file-backed, return empty slice (caller should check isOpen)
+        return &[_]u8{};
+    }
+
     /// Read sectors from the disk
     pub fn readSectors(self: *Self, lba: u64, count: u16, buffer: []u8) DiskImageError!void {
         if (!self.isOpen()) return DiskImageError.NotOpen;

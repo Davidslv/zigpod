@@ -181,6 +181,14 @@ pub fn getFramebuffer() *[320 * 240]u16 {
     return &state.framebuffer;
 }
 
+/// Set the ATA storage buffer to use external data (e.g., from mock FAT32 disk)
+/// This allows wiring the mock HAL to use a pre-populated disk image
+pub fn setAtaStorage(data: []u8) void {
+    const state = getState();
+    state.ata_storage = data;
+    state.ata_initialized = true;
+}
+
 // ============================================================
 // Mock HAL Implementation
 // ============================================================
@@ -338,10 +346,13 @@ fn mockTimerStop(timer_id: u2) void {
 // ATA functions
 fn mockAtaInit() HalError!void {
     const state = getState();
+    // If storage was pre-set (e.g., by setAtaStorage), don't reallocate
+    if (!state.ata_initialized or state.ata_storage.len == 0) {
+        // Allocate 1MB of mock storage
+        state.ata_storage = state.allocator.alloc(u8, 1024 * 1024) catch return HalError.HardwareError;
+        @memset(state.ata_storage, 0);
+    }
     state.ata_initialized = true;
-    // Allocate 1MB of mock storage
-    state.ata_storage = state.allocator.alloc(u8, 1024 * 1024) catch return HalError.HardwareError;
-    @memset(state.ata_storage, 0);
 }
 
 fn mockAtaIdentify() HalError!AtaDeviceInfo {
@@ -349,11 +360,15 @@ fn mockAtaIdentify() HalError!AtaDeviceInfo {
     if (!state.ata_initialized) {
         return HalError.DeviceNotReady;
     }
+    const total_sectors = if (state.ata_storage.len > 0)
+        state.ata_storage.len / state.ata_sector_size
+    else
+        0;
     var info = AtaDeviceInfo{
         .model = undefined,
         .serial = undefined,
         .firmware = undefined,
-        .total_sectors = state.ata_storage.len / state.ata_sector_size,
+        .total_sectors = total_sectors,
         .sector_size = state.ata_sector_size,
         .supports_lba48 = true,
         .supports_dma = false,
