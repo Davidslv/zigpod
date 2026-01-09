@@ -71,6 +71,7 @@ pub const Category = enum(u8) {
     usb = 5,
     input = 6,
     network = 7, // Future
+    dma_audio = 8, // DMA audio pipeline
     custom = 255,
 
     pub fn toString(self: Category) []const u8 {
@@ -83,6 +84,7 @@ pub const Category = enum(u8) {
             .usb => "USB",
             .input => "INP",
             .network => "NET",
+            .dma_audio => "DMA",
             .custom => "USR",
         };
     }

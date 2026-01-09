@@ -36,6 +36,9 @@ pub const pipeline = @import("pipeline.zig");
 // Export audio hardware (DMA-based output)
 pub const audio_hw = @import("audio_hw.zig");
 
+// DMA audio pipeline for interrupt-driven output
+pub const dma_pipeline = @import("dma_pipeline.zig");
+
 // Import FAT32 for file reading
 const fat32 = @import("../drivers/storage/fat32.zig");
 
@@ -192,6 +195,10 @@ var volume_right: i16 = -10;
 var muted: bool = false;
 var initialized: bool = false;
 
+// DMA mode for interrupt-driven output (vs polling mode)
+var use_dma_mode: bool = true;
+var dma_initialized: bool = false;
+
 // DSP processing chain (EQ, bass boost, stereo widening, volume ramping)
 var dsp_chain: dsp.DspChain = dsp.DspChain.init();
 var dsp_enabled: bool = true;
@@ -220,7 +227,8 @@ var current_decoder: CurrentDecoder = .{ .none = {} };
 pub const CurrentDecoder = union(enum) {
     none: void,
     wav: decoders.wav.WavDecoder,
-    // Future: flac, mp3, etc.
+    mp3: decoders.mp3.Mp3Decoder,
+    // Future: flac, aac, etc.
 };
 
 /// Track metadata from loaded file
@@ -292,6 +300,61 @@ fn current_track() ?TrackInfo {
     return slots[active_slot].track_info;
 }
 
+// ============================================================
+// DMA Fill Callback
+// ============================================================
+
+/// Fill callback for DMA pipeline - called from FIQ context to refill buffers
+/// This reads from the active decoder slot and applies DSP processing
+fn dmaFillCallback(buffer: []i16) usize {
+    if (state != .playing) {
+        // Output silence when not playing
+        @memset(buffer, 0);
+        return buffer.len;
+    }
+
+    const slot = &slots[active_slot];
+    var total_written: usize = 0;
+
+    // Read from the decoder slot's ring buffer
+    while (total_written < buffer.len) {
+        const remaining = buffer.len - total_written;
+        var temp: [256]i16 = undefined;
+        const to_read = @min(remaining, temp.len);
+
+        const read_count = slot.buffer.read(temp[0..to_read]);
+        if (read_count == 0) {
+            // Buffer empty - check if track is finishing
+            if (slot.state == .finishing) {
+                // Try gapless transition
+                if (gapless_enabled and tryGaplessTransition()) {
+                    // Switched to next track, continue filling
+                    next_track_requested = false;
+                    continue;
+                } else {
+                    // No next track - fill rest with silence
+                    @memset(buffer[total_written..], 0);
+                    return total_written;
+                }
+            }
+            // Buffer underrun - fill rest with silence
+            @memset(buffer[total_written..], 0);
+            return total_written;
+        }
+
+        // Copy to output buffer
+        @memcpy(buffer[total_written..][0..read_count], temp[0..read_count]);
+        total_written += read_count;
+    }
+
+    // Apply DSP processing to the filled buffer
+    if (dsp_enabled and total_written > 0) {
+        dsp_chain.processBuffer(buffer[0..total_written]);
+    }
+
+    return total_written;
+}
+
 fn current_position() u64 {
     return slots[active_slot].position;
 }
@@ -329,12 +392,20 @@ pub fn init() hal.HalError!void {
     initialized = true;
     state = .stopped;
 
+    // Initialize DMA pipeline for interrupt-driven audio output
+    if (use_dma_mode) {
+        dma_pipeline.init();
+        dma_initialized = true;
+        log.info("DMA audio pipeline initialized", .{});
+    }
+
     // Log storage-aware buffer configuration
     const prebuffer_ms = getRecommendedPrebufferMs();
-    log.info("Audio engine ready (buffer={d} samples, prebuffer={d}ms, flash={})", .{
+    log.info("Audio engine ready (buffer={d} samples, prebuffer={d}ms, flash={}, dma={})", .{
         BUFFER_SIZE,
         prebuffer_ms,
         storage_detect.isFlashStorage(),
+        dma_initialized,
     });
 }
 
@@ -344,6 +415,13 @@ pub fn shutdown() void {
 
     log.info("Shutting down audio engine", .{});
     stop();
+
+    // Shutdown DMA pipeline first
+    if (dma_initialized) {
+        dma_pipeline.deinit();
+        dma_initialized = false;
+    }
+
     i2s.disable();
     codec.shutdown() catch {};
     initialized = false;
@@ -439,7 +517,55 @@ pub fn loadFile(path: []const u8) LoadError!void {
                 return LoadError.DecoderError;
             };
         },
-        .flac, .mp3, .aiff, .aac, .m4a => {
+        .mp3 => {
+            var mp3_decoder = decoders.mp3.Mp3Decoder.init(file_buffer[0..file_buffer_len]) catch {
+                log.err("Failed to initialize MP3 decoder", .{});
+                return LoadError.DecoderError;
+            };
+            current_decoder = .{ .mp3 = mp3_decoder };
+
+            // Parse ID3 tags for metadata
+            const id3_meta = decoders.id3.parse(file_buffer[0..file_buffer_len]);
+
+            if (id3_meta.title_len > 0) {
+                loaded_track_info.setTitle(id3_meta.getTitle());
+            } else {
+                // Fall back to filename
+                const filename = loaded_track_info.getFilename();
+                if (filename.len > 4) {
+                    loaded_track_info.setTitle(filename[0 .. filename.len - 4]);
+                } else {
+                    loaded_track_info.setTitle(filename);
+                }
+            }
+
+            if (id3_meta.artist_len > 0) {
+                loaded_track_info.setArtist(id3_meta.getArtist());
+            }
+
+            if (id3_meta.album_len > 0) {
+                loaded_track_info.setAlbum(id3_meta.getAlbum());
+            }
+
+            // Start playback with decoder callback
+            const track_info = mp3_decoder.getTrackInfo();
+            log.info("Playing MP3: {s} - {s}", .{
+                if (id3_meta.artist_len > 0) id3_meta.getArtist() else "Unknown Artist",
+                if (id3_meta.title_len > 0) id3_meta.getTitle() else loaded_track_info.getTitle(),
+            });
+            log.info("  {d}Hz, {d}ch, {d}kbps, {d}ms", .{
+                track_info.sample_rate,
+                track_info.channels,
+                if (mp3_decoder.current_header) |h| h.bitrate_kbps else 0,
+                track_info.duration_ms,
+            });
+
+            play(mp3DecodeCallback, track_info) catch {
+                log.err("Failed to start playback", .{});
+                return LoadError.DecoderError;
+            };
+        },
+        .flac, .aiff, .aac, .m4a => {
             log.warn("Unsupported format: {s}", .{@tagName(format)});
             return LoadError.UnsupportedFormat;
         },
@@ -456,7 +582,17 @@ fn wavDecodeCallback(output: []i16) usize {
         .wav => |*decoder| {
             return decoder.decode(output);
         },
-        .none => return 0,
+        .mp3, .none => return 0,
+    }
+}
+
+/// MP3 decoder callback for audio engine
+fn mp3DecodeCallback(output: []i16) usize {
+    switch (current_decoder) {
+        .mp3 => |*decoder| {
+            return decoder.decode(output);
+        },
+        .wav, .none => return 0,
     }
 }
 
@@ -475,6 +611,11 @@ pub fn restartTrack() void {
     switch (current_decoder) {
         .wav => |*decoder| {
             decoder.seek(0);
+            slots[active_slot].position = 0;
+            slots[active_slot].buffer.clear();
+        },
+        .mp3 => |*decoder| {
+            decoder.reset();
             slots[active_slot].position = 0;
             slots[active_slot].buffer.clear();
         },
@@ -532,6 +673,14 @@ pub fn play(callback: DecodeCallback, track_info: TrackInfo) hal.HalError!void {
     fillSlotBuffer(0);
 
     state = .playing;
+
+    // Start DMA pipeline for interrupt-driven output
+    if (dma_initialized) {
+        dma_pipeline.start(dmaFillCallback) catch |err| {
+            log.err("Failed to start DMA pipeline: {s}", .{@errorName(err)});
+            // Fall back to polling mode
+        };
+    }
 }
 
 /// Queue next track for gapless playback (called by playlist controller)
@@ -586,6 +735,12 @@ pub fn stop() void {
     if (state != .stopped) {
         log.info("Stopping playback", .{});
     }
+
+    // Stop DMA pipeline first
+    if (dma_initialized and dma_pipeline.isRunning()) {
+        dma_pipeline.stop();
+    }
+
     state = .stopped;
     slots[0].reset();
     slots[1].reset();
@@ -598,6 +753,11 @@ pub fn pause() void {
     if (state == .playing) {
         log.info("Pausing playback", .{});
         state = .paused;
+
+        // Pause DMA pipeline (outputs silence)
+        if (dma_initialized and dma_pipeline.isRunning()) {
+            dma_pipeline.pause();
+        }
     }
 }
 
@@ -606,6 +766,11 @@ pub fn resumePlayback() void {
     if (state == .paused) {
         log.info("Resuming playback", .{});
         state = .playing;
+
+        // Resume DMA pipeline
+        if (dma_initialized and dma_pipeline.isRunning()) {
+            dma_pipeline.unpause();
+        }
     }
 }
 
@@ -846,14 +1011,42 @@ pub fn process() hal.HalError!void {
         fillSlotBuffer(active_slot);
     }
 
-    // Detect buffer underrun (buffer critically low while playing)
-    const buffer_level = slot.buffer.len();
-    if (buffer_level == 0 and last_buffer_level > 0 and slot.state == .active) {
-        underrun_count += 1;
-        log.warn("Buffer underrun detected (count={d})", .{underrun_count});
-        telemetry.record(.audio_buffer_underrun, @truncate(underrun_count), @truncate(buffer_level));
+    // If DMA is running, let it handle buffer refills
+    if (dma_initialized and dma_pipeline.isRunning()) {
+        // Process DMA pipeline (refills buffers marked by FIQ handler)
+        dma_pipeline.process();
+
+        // Track DMA underruns
+        const dma_underruns = dma_pipeline.getUnderrunCount();
+        if (dma_underruns > underrun_count) {
+            underrun_count = dma_underruns;
+            telemetry.record(.audio_buffer_underrun, @truncate(underrun_count), 0);
+        }
+    } else {
+        // Fallback: polling-based I2S output (no DMA)
+
+        // Detect buffer underrun (buffer critically low while playing)
+        const buffer_level = slot.buffer.len();
+        if (buffer_level == 0 and last_buffer_level > 0 and slot.state == .active) {
+            underrun_count += 1;
+            log.warn("Buffer underrun detected (count={d})", .{underrun_count});
+            telemetry.record(.audio_buffer_underrun, @truncate(underrun_count), @truncate(buffer_level));
+        }
+        last_buffer_level = buffer_level;
+
+        // Write samples to I2S from active slot (polling mode)
+        while (i2s.txReady() and !slot.buffer.isEmpty()) {
+            var samples: [64]i16 = undefined;
+            const count = slot.buffer.read(&samples);
+            if (count > 0) {
+                // Apply DSP processing (EQ, bass boost, stereo widening, volume)
+                if (dsp_enabled) {
+                    dsp_chain.processBuffer(samples[0..count]);
+                }
+                _ = try i2s.write(samples[0..count]);
+            }
+        }
     }
-    last_buffer_level = buffer_level;
 
     // Check if we need to request next track for gapless playback
     if (gapless_enabled and !next_track_requested) {
@@ -874,19 +1067,6 @@ pub fn process() hal.HalError!void {
                 next_track_requested = true;
                 _ = callback();
             }
-        }
-    }
-
-    // Write samples to I2S from active slot
-    while (i2s.txReady() and !slot.buffer.isEmpty()) {
-        var samples: [64]i16 = undefined;
-        const count = slot.buffer.read(&samples);
-        if (count > 0) {
-            // Apply DSP processing (EQ, bass boost, stereo widening, volume)
-            if (dsp_enabled) {
-                dsp_chain.processBuffer(samples[0..count]);
-            }
-            _ = try i2s.write(samples[0..count]);
         }
     }
 
@@ -922,6 +1102,54 @@ pub fn getUnderrunCount() u32 {
 /// Reset underrun counter
 pub fn resetUnderrunCount() void {
     underrun_count = 0;
+    if (dma_initialized) {
+        dma_pipeline.resetStats();
+    }
+}
+
+// ============================================================
+// DMA Mode Control
+// ============================================================
+
+/// Enable or disable DMA mode (must be called before init)
+pub fn setDmaMode(enabled: bool) void {
+    if (!initialized) {
+        use_dma_mode = enabled;
+    }
+}
+
+/// Check if DMA mode is enabled
+pub fn isDmaMode() bool {
+    return use_dma_mode;
+}
+
+/// Check if DMA pipeline is currently running
+pub fn isDmaRunning() bool {
+    return dma_initialized and dma_pipeline.isRunning();
+}
+
+/// Get DMA playback position in milliseconds (if DMA is running)
+pub fn getDmaPositionMs() u64 {
+    if (dma_initialized and dma_pipeline.isRunning()) {
+        return dma_pipeline.getPositionMs();
+    }
+    return 0;
+}
+
+/// Get DMA statistics for diagnostics
+pub fn getDmaStats() struct {
+    fiq_count: u32,
+    underruns: u32,
+    samples_played: u64,
+} {
+    if (dma_initialized) {
+        return .{
+            .fiq_count = dma_pipeline.getFiqCount(),
+            .underruns = dma_pipeline.getUnderrunCount(),
+            .samples_played = dma_pipeline.getSamplesPlayed(),
+        };
+    }
+    return .{ .fiq_count = 0, .underruns = 0, .samples_played = 0 };
 }
 
 /// Attempt gapless transition to next track

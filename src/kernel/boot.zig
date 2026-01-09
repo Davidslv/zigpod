@@ -181,6 +181,9 @@ const interrupts = @import("interrupts.zig");
 // Import register definitions for interrupt controller
 const reg = @import("../hal/pp5021c/registers.zig");
 
+// Import DMA audio pipeline for FIQ handling
+const dma_pipeline = @import("../audio/dma_pipeline.zig");
+
 export fn handleIrq() void {
     // Read interrupt status register
     const status = reg.readReg(u32, reg.CPU_INT_STAT);
@@ -262,13 +265,28 @@ export fn handleIrq() void {
 }
 
 export fn handleFiq() void {
-    // Fast interrupt handling - typically used for time-critical operations
-    // On PP5021C, FIQ could be used for audio DMA if needed
+    // Fast interrupt handling - used for time-critical audio DMA
+    // FIQ is routed for I2S and DMA by dma_pipeline.zig
+
     const status = reg.readReg(u32, reg.CPU_INT_STAT);
 
-    // For now, just clear any pending FIQ sources
-    // In a full implementation, this would handle the highest-priority interrupt
-    _ = status;
+    // Check if this is an audio-related interrupt (DMA or I2S)
+    const audio_mask = reg.DMA_IRQ | reg.IIS_IRQ;
+    if ((status & audio_mask) != 0) {
+        // Handle audio FIQ - this swaps buffers and sets refill flag
+        dma_pipeline.handleAudioFiq();
+        return;
+    }
+
+    // Handle any other FIQ sources (shouldn't happen normally)
+    // Clear any unexpected FIQ sources to prevent infinite loop
+    if (is_arm) {
+        const fiq_sources = reg.readReg(u32, reg.CPU_INT_PRIO);
+        const pending_fiq = status & fiq_sources;
+        if (pending_fiq != 0) {
+            reg.writeReg(u32, reg.CPU_INT_CLR, pending_fiq);
+        }
+    }
 }
 
 // ============================================================

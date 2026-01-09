@@ -297,13 +297,15 @@ pub const imdct_win_start = [_]i32{
 /// IMDCT window for stop block (transition short->long)
 pub const imdct_win_stop = [_]i32{
     // First 6: zeros
-    0, 0, 0, 0, 0, 0,
-    // Next 12: short window ascending
-    3212, 12540, 20860, 27246, 31164, 32768,
-    // Last 18: sine window descending
+    0,     0,     0,     0,     0,     0,
+    // Next 6: short window ascending part 1
+    3212,  12540, 20860, 27246, 31164, 32768,
+    // Next 6: flat at 1.0
     32768, 32768, 32768, 32768, 32768, 32768,
+    // Last 18: sine window descending
     32412, 32724, 32724, 32412, 31785, 30852,
     29621, 28105, 26319, 24279, 22005, 19519,
+    16846, 14010, 11039, 7962,  4808,  1608,
 };
 
 /// IMDCT cosine table for 36-point transform

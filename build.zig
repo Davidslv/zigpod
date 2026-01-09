@@ -200,10 +200,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_file_integration = b.addRunArtifact(file_integration_tests);
 
+    // MP3 Decoder Integration Tests
+    const mp3_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/mp3_decoder_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigpod", .module = test_root_module },
+            },
+        }),
+    });
+    const run_mp3_integration = b.addRunArtifact(mp3_integration_tests);
+
     const integration_step = b.step("test-integration", "Run integration tests");
     integration_step.dependOn(&run_audio_integration.step);
     integration_step.dependOn(&run_ui_integration.step);
     integration_step.dependOn(&run_file_integration.step);
+    integration_step.dependOn(&run_mp3_integration.step);
+
+    // Dedicated MP3 test step
+    const mp3_test_step = b.step("test-mp3", "Run MP3 decoder tests");
+    mp3_test_step.dependOn(&run_mp3_integration.step);
 
     // All tests step
     const all_tests_step = b.step("test-all", "Run all tests (unit + integration)");
@@ -211,6 +229,7 @@ pub fn build(b: *std.Build) void {
     all_tests_step.dependOn(&run_audio_integration.step);
     all_tests_step.dependOn(&run_ui_integration.step);
     all_tests_step.dependOn(&run_file_integration.step);
+    all_tests_step.dependOn(&run_mp3_integration.step);
 
     // ============================================================
     // Format Check

@@ -7,6 +7,7 @@ pub const flac = @import("flac.zig");
 pub const mp3 = @import("mp3.zig");
 pub const aiff = @import("aiff.zig");
 pub const aac = @import("aac.zig");
+pub const id3 = @import("id3.zig");
 
 /// Audio decoder type for runtime codec selection
 pub const DecoderType = enum {

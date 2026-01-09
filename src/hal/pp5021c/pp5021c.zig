@@ -9,6 +9,9 @@
 const std = @import("std");
 const reg = @import("registers.zig");
 const hal_types = @import("../hal.zig");
+
+/// Interrupt handling module - public for direct access to FIQ/audio setup
+pub const interrupts = @import("interrupts.zig");
 const Hal = hal_types.Hal;
 const HalError = hal_types.HalError;
 const GpioDirection = hal_types.GpioDirection;
@@ -52,17 +55,13 @@ var pmu_initialized: bool = false;
 // ============================================================
 
 fn hwSystemInit() HalError!void {
-    // Disable all interrupts first
-    hwIrqDisable();
-    reg.writeReg(u32, reg.CPU_INT_EN, 0);
-    reg.writeReg(u32, reg.COP_INT_EN, 0);
-    reg.writeReg(u32, reg.CPU_HI_INT_EN, 0);
-    reg.writeReg(u32, reg.COP_HI_INT_EN, 0);
+    // Initialize interrupt system (installs vector table, clears pending)
+    interrupts.init();
 
-    // Clear pending interrupts
-    reg.writeReg(u32, reg.CPU_INT_CLR, 0xFFFFFFFF);
+    // Disable COP interrupts (we only use CPU core)
+    reg.writeReg(u32, reg.COP_INT_EN, 0);
+    reg.writeReg(u32, reg.COP_HI_INT_EN, 0);
     reg.writeReg(u32, reg.COP_INT_CLR, 0xFFFFFFFF);
-    reg.writeReg(u32, reg.CPU_HI_INT_CLR, 0xFFFFFFFF);
     reg.writeReg(u32, reg.COP_HI_INT_CLR, 0xFFFFFFFF);
 
     // Disable GPIO interrupts on all ports
@@ -1772,27 +1771,37 @@ fn hwCacheEnable(enable: bool) void {
 // ============================================================
 
 fn hwIrqEnable() void {
-    asm volatile ("cpsie i");
+    interrupts.enableIrq();
 }
 
 fn hwIrqDisable() void {
-    asm volatile ("cpsid i");
+    interrupts.disableIrq();
 }
 
 fn hwIrqEnabled() bool {
-    var cpsr: u32 = undefined;
-    asm volatile ("mrs %[cpsr], cpsr"
-        : [cpsr] "=r" (cpsr),
-    );
-    return (cpsr & 0x80) == 0; // IRQ bit is 0 when enabled
+    return interrupts.isIrqEnabled();
 }
 
-var irq_handlers: [32]?*const fn () void = [_]?*const fn () void{null} ** 32;
+/// Handler storage for the HAL's irq_register function
+var hal_irq_handlers: [32]?*const fn () void = [_]?*const fn () void{null} ** 32;
 
 fn hwIrqRegister(irq: u8, handler: *const fn () void) void {
     if (irq < 32) {
-        irq_handlers[irq] = handler;
+        // Store handler in local table
+        hal_irq_handlers[irq] = handler;
+
+        // Enable the IRQ source at the controller
+        const bit = @as(u32, 1) << @as(u5, @truncate(irq));
+        reg.modifyReg(reg.CPU_INT_EN, 0, bit);
     }
+}
+
+/// Get registered handler for IRQ (used by boot.zig dispatcher)
+pub fn getIrqHandler(irq: u8) ?*const fn () void {
+    if (irq < 32) {
+        return hal_irq_handlers[irq];
+    }
+    return null;
 }
 
 // ============================================================

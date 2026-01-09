@@ -248,6 +248,7 @@ const BitReader = struct {
 pub const Mp3Decoder = struct {
     data: []const u8,
     position: usize,
+    audio_start: usize, // Byte offset where audio data begins (after ID3v2)
     track_info: audio.TrackInfo,
     current_header: ?FrameHeader,
 
@@ -286,6 +287,7 @@ pub const Mp3Decoder = struct {
         var decoder = Mp3Decoder{
             .data = data,
             .position = 0,
+            .audio_start = 0,
             .track_info = undefined,
             .current_header = null,
             .main_data = [_]u8{0} ** MAIN_DATA_SIZE,
@@ -298,13 +300,14 @@ pub const Mp3Decoder = struct {
         };
 
         decoder.skipId3v2();
+        decoder.audio_start = decoder.position; // Mark where audio data begins
 
         const header = decoder.findNextFrame() orelse return Error.InvalidHeader;
         decoder.current_header = header;
         decoder.track_info = decoder.calculateTrackInfo(header);
 
-        decoder.position = 0;
-        decoder.skipId3v2();
+        // Reset to start of audio data
+        decoder.position = decoder.audio_start;
 
         return decoder;
     }
@@ -743,7 +746,8 @@ pub const Mp3Decoder = struct {
         @memset(&self.samples[ch], 0);
 
         // Get region boundaries
-        const big_values = gr_info.big_values * 2;
+        // Cast to usize to avoid overflow (big_values is u9, max 511 * 2 = 1022)
+        const big_values: usize = @as(usize, gr_info.big_values) * 2;
         var region1_start: usize = 0;
         var region2_start: usize = 0;
 
@@ -1159,7 +1163,12 @@ pub const Mp3Decoder = struct {
         const header = self.current_header orelse return 0;
         const frame_size = header.frameSize();
         if (frame_size == 0) return 0;
-        const frames_played = self.position / frame_size;
+        // Calculate position relative to audio start
+        const audio_bytes = if (self.position > self.audio_start)
+            self.position - self.audio_start
+        else
+            0;
+        const frames_played = audio_bytes / frame_size;
         return frames_played * header.samplesPerFrame();
     }
 
@@ -1174,8 +1183,7 @@ pub const Mp3Decoder = struct {
     }
 
     pub fn reset(self: *Mp3Decoder) void {
-        self.position = 0;
-        self.skipId3v2();
+        self.position = self.audio_start; // Reset to start of audio data
         self.main_data_size = 0;
         @memset(&self.overlap[0], 0);
         @memset(&self.overlap[1], 0);
@@ -1221,6 +1229,7 @@ test "mp3 frame header parsing" {
     var decoder = Mp3Decoder{
         .data = &valid_header,
         .position = 0,
+        .audio_start = 0,
         .track_info = undefined,
         .current_header = null,
         .main_data = [_]u8{0} ** MAIN_DATA_SIZE,
