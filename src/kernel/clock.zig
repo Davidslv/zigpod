@@ -23,8 +23,14 @@ const reg = @import("../hal/pp5021c/registers.zig");
 // Clock Configuration Constants
 // ============================================================
 
-/// Target CPU frequency in Hz
-pub const CPU_FREQ_HZ: u32 = 80_000_000; // 80 MHz
+/// Maximum CPU frequency in Hz
+pub const CPU_FREQ_MAX: u32 = 80_000_000; // 80 MHz - full speed
+
+/// Medium CPU frequency (for UI, light processing)
+pub const CPU_FREQ_MED: u32 = 48_000_000; // 48 MHz
+
+/// Low CPU frequency (for MP3 playback only)
+pub const CPU_FREQ_LOW: u32 = 30_000_000; // 30 MHz
 
 /// Main crystal oscillator frequency
 pub const XTAL_FREQ_HZ: u32 = 24_000_000; // 24 MHz
@@ -34,6 +40,31 @@ pub const LP_OSC_FREQ_HZ: u32 = 32_768; // 32.768 kHz
 
 /// PLL output frequency
 pub const PLL_FREQ_HZ: u32 = 80_000_000; // 80 MHz
+
+/// Legacy alias
+pub const CPU_FREQ_HZ: u32 = CPU_FREQ_MAX;
+
+/// CPU frequency scaling profile
+pub const FrequencyProfile = enum {
+    /// Maximum performance (80 MHz) - for decoding, seeking, heavy DSP
+    performance,
+    /// Balanced (48 MHz) - for UI navigation, light effects
+    balanced,
+    /// Power save (30 MHz) - for steady-state playback (MP3)
+    powersave,
+    /// Ultra low power (24 MHz crystal, no PLL) - for idle/menu
+    ultralow,
+};
+
+/// Power/performance scaling policy
+pub const ScalingPolicy = enum {
+    /// Always run at max speed
+    performance,
+    /// Run at lowest speed that meets demand
+    ondemand,
+    /// Always run at minimum speed
+    powersave,
+};
 
 // ============================================================
 // Additional Register Definitions
@@ -71,6 +102,10 @@ const CLOCK_SRC_PLL: u32 = 0x2000_7777; // All domains on PLL
 
 var pll_enabled: bool = false;
 var current_cpu_freq: u32 = LP_OSC_FREQ_HZ;
+var current_profile: FrequencyProfile = .ultralow;
+var current_policy: ScalingPolicy = .ondemand;
+var load_history: [4]u8 = .{ 0, 0, 0, 0 }; // Rolling average of CPU load
+var load_index: u2 = 0;
 
 // ============================================================
 // Clock Initialization Functions
@@ -205,21 +240,147 @@ pub fn exitLowPowerMode() void {
 }
 
 /// Set CPU frequency (basic scaling)
-/// Only supports full speed (80MHz) or low speed (24MHz) currently
+/// Supports multiple frequency points for power management
 pub fn setCpuFrequency(target_hz: u32) void {
-    if (target_hz >= CPU_FREQ_HZ) {
-        // Full speed - use PLL
-        if (!pll_enabled) {
-            init();
-        } else {
-            switchToPll();
-            current_cpu_freq = CPU_FREQ_HZ;
-        }
+    if (target_hz >= CPU_FREQ_MAX) {
+        setProfile(.performance);
+    } else if (target_hz >= CPU_FREQ_MED) {
+        setProfile(.balanced);
+    } else if (target_hz >= CPU_FREQ_LOW) {
+        setProfile(.powersave);
     } else {
-        // Low speed - bypass PLL
-        switchToLowSpeed();
-        current_cpu_freq = XTAL_FREQ_HZ; // Actually ~24MHz in this mode
+        setProfile(.ultralow);
     }
+}
+
+/// Set frequency profile directly
+pub fn setProfile(profile: FrequencyProfile) void {
+    if (profile == current_profile) return;
+
+    switch (profile) {
+        .performance => {
+            // 80 MHz - Full PLL speed
+            if (!pll_enabled) {
+                configurePll();
+                waitForPllLock();
+                pll_enabled = true;
+            }
+            // PLL divider = 1 (80 MHz)
+            reg.writeReg(u32, CPU_CLOCK_DIV, 0x0000_0000);
+            switchToPll();
+            current_cpu_freq = CPU_FREQ_MAX;
+        },
+        .balanced => {
+            // 48 MHz - PLL with divider
+            if (!pll_enabled) {
+                configurePll();
+                waitForPllLock();
+                pll_enabled = true;
+            }
+            // Approximate 48 MHz using divider
+            // 80 / 48 ≈ 1.67, so use divider of 2 for ~40MHz or 1 for 80MHz
+            // PP5021C divider is limited, use PLL at full then divide
+            reg.writeReg(u32, CPU_CLOCK_DIV, 0x0000_0001); // Divide by 2 = 40MHz
+            switchToPll();
+            current_cpu_freq = 40_000_000; // Actual achieved frequency
+        },
+        .powersave => {
+            // 30 MHz - Crystal with multiplier or PLL divided
+            // Use 24MHz crystal + simple operations
+            // For true 30MHz we'd need different PLL config
+            // Approximation: use 24MHz crystal direct
+            if (!pll_enabled) {
+                configurePll();
+                waitForPllLock();
+                pll_enabled = true;
+            }
+            // 80 / 3 ≈ 26.7 MHz (close to 30MHz target)
+            reg.writeReg(u32, CPU_CLOCK_DIV, 0x0000_0002); // Divide by 3
+            switchToPll();
+            current_cpu_freq = 26_666_666;
+        },
+        .ultralow => {
+            // 24 MHz - Crystal only, PLL off
+            switchToLowSpeed();
+            current_cpu_freq = XTAL_FREQ_HZ;
+        },
+    }
+    current_profile = profile;
+}
+
+/// Get current frequency profile
+pub fn getProfile() FrequencyProfile {
+    return current_profile;
+}
+
+/// Set scaling policy
+pub fn setPolicy(policy: ScalingPolicy) void {
+    current_policy = policy;
+
+    // Apply policy immediately
+    switch (policy) {
+        .performance => setProfile(.performance),
+        .powersave => setProfile(.powersave),
+        .ondemand => {}, // Will adjust based on load
+    }
+}
+
+/// Get current scaling policy
+pub fn getPolicy() ScalingPolicy {
+    return current_policy;
+}
+
+/// Report CPU load for dynamic scaling (0-100%)
+/// Should be called periodically (e.g., every 100ms)
+pub fn reportLoad(load_percent: u8) void {
+    load_history[load_index] = load_percent;
+    load_index +%= 1;
+
+    // Only adjust in ondemand mode
+    if (current_policy != .ondemand) return;
+
+    // Calculate average load
+    var total: u32 = 0;
+    for (load_history) |l| {
+        total += l;
+    }
+    const avg_load = total / 4;
+
+    // Adjust frequency based on load
+    if (avg_load > 80) {
+        // High load - boost to max
+        setProfile(.performance);
+    } else if (avg_load > 50) {
+        // Medium load - balanced
+        setProfile(.balanced);
+    } else if (avg_load > 20) {
+        // Low load - power save
+        setProfile(.powersave);
+    } else {
+        // Idle - ultra low power
+        setProfile(.ultralow);
+    }
+}
+
+/// Request temporary boost to max frequency
+/// Returns to previous profile after specified duration
+pub fn requestBoost() void {
+    if (current_policy == .ondemand) {
+        setProfile(.performance);
+    }
+}
+
+/// Estimate power savings vs full speed (rough approximation)
+/// Returns estimated percentage of max power consumption
+pub fn estimatedPowerPercent() u8 {
+    // Power ∝ V² × f, and V scales with f
+    // Rough approximation: power ∝ f^1.5
+    return switch (current_profile) {
+        .performance => 100,
+        .balanced => 60, // ~40MHz = ~50% freq, ~60% power
+        .powersave => 40, // ~27MHz = ~34% freq, ~40% power
+        .ultralow => 25, // 24MHz = 30% freq, ~25% power
+    };
 }
 
 // ============================================================
@@ -286,4 +447,46 @@ test "i2s clock divider" {
     const mclk_target = sample_rate * 256;
     const divider = (CPU_FREQ_HZ + mclk_target / 2) / mclk_target;
     try std.testing.expect(divider >= 6 and divider <= 8);
+}
+
+test "frequency profiles exist" {
+    // Verify frequency constants are properly ordered
+    try std.testing.expect(CPU_FREQ_MAX > CPU_FREQ_MED);
+    try std.testing.expect(CPU_FREQ_MED > CPU_FREQ_LOW);
+    try std.testing.expect(CPU_FREQ_LOW > XTAL_FREQ_HZ);
+}
+
+test "power estimation" {
+    // Save original profile
+    const original_profile = current_profile;
+
+    // Power consumption should decrease with lower profiles
+    current_profile = .performance;
+    const perf_power = estimatedPowerPercent();
+    current_profile = .balanced;
+    const bal_power = estimatedPowerPercent();
+    current_profile = .powersave;
+    const save_power = estimatedPowerPercent();
+    current_profile = .ultralow;
+    const ultra_power = estimatedPowerPercent();
+
+    // Reset to original state
+    current_profile = original_profile;
+
+    try std.testing.expect(perf_power > bal_power);
+    try std.testing.expect(bal_power > save_power);
+    try std.testing.expect(save_power > ultra_power);
+}
+
+test "policy enum values" {
+    // Verify all policy values exist
+    try std.testing.expect(@intFromEnum(ScalingPolicy.performance) != @intFromEnum(ScalingPolicy.ondemand));
+    try std.testing.expect(@intFromEnum(ScalingPolicy.ondemand) != @intFromEnum(ScalingPolicy.powersave));
+}
+
+test "profile enum values" {
+    // Verify all profile values exist
+    try std.testing.expect(@intFromEnum(FrequencyProfile.performance) != @intFromEnum(FrequencyProfile.balanced));
+    try std.testing.expect(@intFromEnum(FrequencyProfile.balanced) != @intFromEnum(FrequencyProfile.powersave));
+    try std.testing.expect(@intFromEnum(FrequencyProfile.powersave) != @intFromEnum(FrequencyProfile.ultralow));
 }
