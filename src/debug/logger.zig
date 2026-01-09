@@ -263,12 +263,22 @@ fn routeLog(level: Level, category: Category, line: []const u8, msg: []const u8)
 
     // Fatal - record in crash store
     if (level == .fatal) {
+        const pc = getProgramCounter();
+        crash_store.recordCrash(.panic, pc, 0, 0, 0, 0, msg);
+    }
+}
+
+/// Get program counter (ARM only, returns 0 on other platforms)
+fn getProgramCounter() u32 {
+    const builtin = @import("builtin");
+    if (builtin.cpu.arch == .arm or builtin.cpu.arch == .thumb) {
         var pc: u32 = 0;
         asm volatile ("mov %[pc], pc"
             : [pc] "=r" (pc)
         );
-        crash_store.recordCrash(.panic, pc, 0, 0, 0, 0, msg);
+        return pc;
     }
+    return 0; // Not available on non-ARM
 }
 
 // ============================================================

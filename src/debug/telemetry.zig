@@ -180,7 +180,7 @@ pub const TelemetryBuffer = struct {
         const event = Event.init(event_type, data, extended);
         self.events[self.header.write_index] = event;
 
-        self.header.write_index = (self.header.write_index + 1) % MAX_EVENTS;
+        self.header.write_index = @intCast((self.header.write_index + 1) % MAX_EVENTS);
         self.header.total_events += 1;
         if (self.header.event_count < MAX_EVENTS) {
             self.header.event_count += 1;
@@ -193,7 +193,7 @@ pub const TelemetryBuffer = struct {
         event.flags = flags;
         self.events[self.header.write_index] = event;
 
-        self.header.write_index = (self.header.write_index + 1) % MAX_EVENTS;
+        self.header.write_index = @intCast((self.header.write_index + 1) % MAX_EVENTS);
         self.header.total_events += 1;
         if (self.header.event_count < MAX_EVENTS) {
             self.header.event_count += 1;
@@ -249,7 +249,7 @@ pub const EventIterator = struct {
     pub fn next(self: *EventIterator) ?*const Event {
         if (self.remaining == 0) return null;
         const event = &self.buffer.events[self.index];
-        self.index = (self.index + 1) % MAX_EVENTS;
+        self.index = @intCast((self.index + 1) % MAX_EVENTS);
         self.remaining -= 1;
         return event;
     }

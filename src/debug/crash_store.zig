@@ -67,15 +67,15 @@ pub const CrashEntry = extern struct {
     r: [13]u32 = [_]u32{0} ** 13,
 
     /// Error/exception code
-    exception_type: ExceptionType = .unknown,
     error_code: u32 = 0,
+    exception_type: ExceptionType = .unknown,
 
     /// Crash reason message
     message: [MAX_MESSAGE_LEN]u8 = [_]u8{0} ** MAX_MESSAGE_LEN,
     message_len: u8 = 0,
 
-    /// Padding to 256 bytes
-    _padding: [7]u8 = [_]u8{0} ** 7,
+    /// Padding to 256 bytes (calculated: 256 - 4 - 4 - 8 - 16 - 52 - 4 - 1 - 128 - 1 = 38)
+    _padding: [38]u8 = [_]u8{0} ** 38,
 
     pub const ExceptionType = enum(u8) {
         unknown = 0,
@@ -362,13 +362,16 @@ pub fn recordPanic(pc: u32, message: []const u8) void {
     var lr: u32 = 0;
     var sp: u32 = 0;
 
-    // ARM assembly to get LR and SP
-    asm volatile (
-        \\mov %[lr], lr
-        \\mov %[sp], sp
-        : [lr] "=r" (lr),
-          [sp] "=r" (sp)
-    );
+    // ARM assembly to get LR and SP (only on ARM targets)
+    const builtin = @import("builtin");
+    if (builtin.cpu.arch == .arm or builtin.cpu.arch == .thumb) {
+        asm volatile (
+            \\mov %[lr], lr
+            \\mov %[sp], sp
+            : [lr] "=r" (lr),
+              [sp] "=r" (sp)
+        );
+    }
 
     recordCrash(.panic, pc, lr, sp, 0, 0, message);
 }
@@ -379,9 +382,12 @@ pub fn recordAssertion(file: []const u8, line: u32, message: []const u8) void {
     const msg = std.fmt.bufPrint(&buf, "{s}:{d}: {s}", .{ file, line, message }) catch message;
 
     var pc: u32 = 0;
-    asm volatile ("mov %[pc], pc"
-        : [pc] "=r" (pc)
-    );
+    const builtin = @import("builtin");
+    if (builtin.cpu.arch == .arm or builtin.cpu.arch == .thumb) {
+        asm volatile ("mov %[pc], pc"
+            : [pc] "=r" (pc)
+        );
+    }
 
     recordCrash(.assertion, pc, 0, 0, 0, line, msg);
 }
@@ -471,7 +477,7 @@ test "crash store ring buffer" {
 
     // Fill beyond capacity
     for (0..MAX_ENTRIES + 5) |i| {
-        var entry = CrashEntry{
+        const entry = CrashEntry{
             .pc = @intCast(i),
             .exception_type = .panic,
         };

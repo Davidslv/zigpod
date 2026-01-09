@@ -11,6 +11,10 @@
 
 const std = @import("std");
 const hal = @import("../hal/hal.zig");
+
+// Logging - see docs/LOGGING_GUIDE.md for usage
+const log = @import("../debug/logger.zig").scoped(.audio);
+const telemetry = @import("../debug/telemetry.zig");
 const RingBuffer = @import("../lib/ring_buffer.zig").RingBuffer;
 const fixed = @import("../lib/fixed_point.zig");
 const codec = @import("../drivers/audio/codec.zig");
@@ -288,8 +292,11 @@ fn current_position() u64 {
 
 /// Initialize the audio engine
 pub fn init() hal.HalError!void {
+    log.info("Initializing audio engine", .{});
+
     // Initialize codec (pre-init phase)
     try codec.preinit();
+    log.debug("Codec pre-init complete", .{});
 
     // Initialize I2S
     try i2s.init(.{
@@ -297,28 +304,34 @@ pub fn init() hal.HalError!void {
         .format = .i2s_standard,
         .sample_size = .bits_16,
     });
+    log.debug("I2S initialized at {d}Hz", .{DEFAULT_SAMPLE_RATE});
 
     // Enable I2S output
     i2s.enable();
 
     // Codec post-init
     try codec.postinit();
+    log.debug("Codec post-init complete", .{});
 
     // Set initial volume
     try codec.setVolume(volume_left, volume_right);
 
     initialized = true;
     state = .stopped;
+
+    log.info("Audio engine ready (buffer={d} samples)", .{BUFFER_SIZE});
 }
 
 /// Shutdown the audio engine
 pub fn shutdown() void {
     if (!initialized) return;
 
+    log.info("Shutting down audio engine", .{});
     stop();
     i2s.disable();
     codec.shutdown() catch {};
     initialized = false;
+    log.debug("Audio engine shutdown complete", .{});
 }
 
 /// Check if audio engine is initialized
@@ -342,7 +355,12 @@ pub const LoadError = error{
 /// Load and play an audio file from the filesystem
 /// This is the main entry point for playing a file from the UI
 pub fn loadFile(path: []const u8) LoadError!void {
-    if (!initialized) return LoadError.NotInitialized;
+    log.info("Loading file: {s}", .{path});
+
+    if (!initialized) {
+        log.err("Cannot load file - audio engine not initialized", .{});
+        return LoadError.NotInitialized;
+    }
 
     // Stop any current playback
     stop();
@@ -353,21 +371,32 @@ pub fn loadFile(path: []const u8) LoadError!void {
 
     // Read file from FAT32
     file_buffer_len = fat32.readFile(path, &file_buffer) catch |err| {
+        log.err("Failed to read file: {s}", .{@errorName(err)});
         return switch (err) {
             fat32.FatError.file_not_found => LoadError.FileNotFound,
             else => LoadError.ReadError,
         };
     };
 
-    if (file_buffer_len == 0) return LoadError.ReadError;
-    if (file_buffer_len > MAX_FILE_SIZE) return LoadError.FileTooLarge;
+    if (file_buffer_len == 0) {
+        log.err("File is empty", .{});
+        return LoadError.ReadError;
+    }
+    if (file_buffer_len > MAX_FILE_SIZE) {
+        log.err("File too large: {d} bytes (max {d})", .{ file_buffer_len, MAX_FILE_SIZE });
+        return LoadError.FileTooLarge;
+    }
+
+    log.debug("Read {d} bytes from file", .{file_buffer_len});
 
     // Detect format and initialize decoder
     const format = decoders.detectFormat(file_buffer[0..file_buffer_len]);
+    log.debug("Detected format: {s}", .{@tagName(format)});
 
     switch (format) {
         .wav => {
             var wav_decoder = decoders.wav.WavDecoder.init(file_buffer[0..file_buffer_len]) catch {
+                log.err("Failed to initialize WAV decoder", .{});
                 return LoadError.DecoderError;
             };
             current_decoder = .{ .wav = wav_decoder };
@@ -382,15 +411,26 @@ pub fn loadFile(path: []const u8) LoadError!void {
 
             // Start playback with decoder callback
             const track_info = wav_decoder.getTrackInfo();
+            log.info("Playing WAV: {d}Hz, {d}-bit, {d}ch, {d}ms", .{
+                track_info.sample_rate,
+                track_info.bits_per_sample,
+                track_info.channels,
+                track_info.duration_ms,
+            });
+
             play(wavDecodeCallback, track_info) catch {
+                log.err("Failed to start playback", .{});
                 return LoadError.DecoderError;
             };
         },
         .flac, .mp3, .aiff, .aac, .m4a => {
-            // TODO: Implement other decoders
+            log.warn("Unsupported format: {s}", .{@tagName(format)});
             return LoadError.UnsupportedFormat;
         },
-        .unknown => return LoadError.UnsupportedFormat,
+        .unknown => {
+            log.err("Unknown audio format", .{});
+            return LoadError.UnsupportedFormat;
+        },
     }
 }
 
@@ -527,6 +567,9 @@ pub fn isGaplessEnabled() bool {
 
 /// Stop playback
 pub fn stop() void {
+    if (state != .stopped) {
+        log.info("Stopping playback", .{});
+    }
     state = .stopped;
     slots[0].reset();
     slots[1].reset();
@@ -537,6 +580,7 @@ pub fn stop() void {
 /// Pause playback
 pub fn pause() void {
     if (state == .playing) {
+        log.info("Pausing playback", .{});
         state = .paused;
     }
 }
@@ -544,6 +588,7 @@ pub fn pause() void {
 /// Resume playback
 pub fn resumePlayback() void {
     if (state == .paused) {
+        log.info("Resuming playback", .{});
         state = .playing;
     }
 }
@@ -770,6 +815,10 @@ pub fn dspUnmute(percent: u8) void {
 // Audio Processing (called from main loop or interrupt)
 // ============================================================
 
+// Track buffer underrun statistics
+var underrun_count: u32 = 0;
+var last_buffer_level: usize = 0;
+
 /// Process audio - call this regularly from main loop
 pub fn process() hal.HalError!void {
     if (!initialized or state != .playing) return;
@@ -781,10 +830,20 @@ pub fn process() hal.HalError!void {
         fillSlotBuffer(active_slot);
     }
 
+    // Detect buffer underrun (buffer critically low while playing)
+    const buffer_level = slot.buffer.len();
+    if (buffer_level == 0 and last_buffer_level > 0 and slot.state == .active) {
+        underrun_count += 1;
+        log.warn("Buffer underrun detected (count={d})", .{underrun_count});
+        telemetry.record(.audio_buffer_underrun, @truncate(underrun_count), @truncate(buffer_level));
+    }
+    last_buffer_level = buffer_level;
+
     // Check if we need to request next track for gapless playback
     if (gapless_enabled and !next_track_requested) {
         const remaining = slot.remainingSamples();
         if (remaining < GAPLESS_THRESHOLD and remaining > 0) {
+            log.debug("Requesting next track for gapless (remaining={d} samples)", .{remaining});
             // Request next track from playlist controller
             if (next_track_callback) |callback| {
                 next_track_requested = true;
@@ -813,18 +872,31 @@ pub fn process() hal.HalError!void {
         if (finished) {
             // Mark current slot as finished
             slot.state = .finishing;
+            log.debug("Track finished, attempting gapless transition", .{});
 
             // Attempt gapless transition
             if (gapless_enabled and tryGaplessTransition()) {
                 // Successfully transitioned to next track
+                log.info("Gapless transition successful", .{});
                 next_track_requested = false;
             } else {
                 // No next track, stop playback
+                log.info("Playback complete (no next track)", .{});
                 state = .stopped;
                 slot.state = .empty;
             }
         }
     }
+}
+
+/// Get buffer underrun count (for diagnostics)
+pub fn getUnderrunCount() u32 {
+    return underrun_count;
+}
+
+/// Reset underrun counter
+pub fn resetUnderrunCount() void {
+    underrun_count = 0;
 }
 
 /// Attempt gapless transition to next track
