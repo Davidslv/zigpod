@@ -19,8 +19,9 @@ pub const MAX_GAIN_DB: i8 = 12;
 /// Minimum gain in dB
 pub const MIN_GAIN_DB: i8 = -12;
 
-/// Sample rate (assumed 44100 Hz)
-pub const SAMPLE_RATE: u32 = 44100;
+/// Default sample rate (44100 Hz)
+/// Note: EQ bands can be configured for different sample rates via setSampleRate()
+pub const DEFAULT_SAMPLE_RATE: u32 = 44100;
 
 /// Stereo sample pair used throughout DSP processing
 pub const StereoSample = struct {
@@ -39,6 +40,8 @@ pub const EqBand = struct {
     gain_db: i8,
     /// Q factor (bandwidth) - Q16.16 fixed point
     q: i32,
+    /// Sample rate for coefficient calculation (default 44100)
+    sample_rate: u32 = DEFAULT_SAMPLE_RATE,
     /// Filter coefficients (biquad)
     a0: i32,
     a1: i32,
@@ -56,12 +59,18 @@ pub const EqBand = struct {
     y1_r: i32 = 0,
     y2_r: i32 = 0,
 
-    /// Initialize band with default coefficients
+    /// Initialize band with default coefficients at default sample rate
     pub fn init(frequency: u16, gain_db: i8, q: i32) EqBand {
+        return initWithSampleRate(frequency, gain_db, q, DEFAULT_SAMPLE_RATE);
+    }
+
+    /// Initialize band with coefficients calculated for a specific sample rate
+    pub fn initWithSampleRate(frequency: u16, gain_db: i8, q: i32, sample_rate: u32) EqBand {
         var band = EqBand{
             .frequency = frequency,
             .gain_db = gain_db,
             .q = q,
+            .sample_rate = sample_rate,
             .a0 = 0x10000, // 1.0 in Q16.16
             .a1 = 0,
             .a2 = 0,
@@ -72,13 +81,22 @@ pub const EqBand = struct {
         return band;
     }
 
-    /// Update filter coefficients based on frequency, gain, and Q
+    /// Set sample rate and recalculate coefficients
+    /// Call this when switching between tracks with different sample rates
+    pub fn setSampleRate(self: *EqBand, sample_rate: u32) void {
+        if (self.sample_rate != sample_rate) {
+            self.sample_rate = sample_rate;
+            self.updateCoefficients();
+        }
+    }
+
+    /// Update filter coefficients based on frequency, gain, Q, and sample rate
     pub fn updateCoefficients(self: *EqBand) void {
         // Calculate angular frequency: w0 = 2 * pi * f / fs
         // Using fixed point approximation
         const pi_fp: i64 = 205887; // pi in Q16.16
         const freq_fp: i64 = @as(i64, self.frequency) << 16;
-        const sample_rate_fp: i64 = @as(i64, SAMPLE_RATE) << 16;
+        const sample_rate_fp: i64 = @as(i64, self.sample_rate) << 16;
 
         // w0 = 2 * pi * f / fs (result in Q16.16)
         const w0: i64 = @divTrunc(2 * pi_fp * freq_fp, sample_rate_fp);
@@ -219,6 +237,20 @@ pub const Equalizer = struct {
             return self.bands[band].gain_db;
         }
         return 0;
+    }
+
+    /// Set sample rate for all bands and recalculate coefficients
+    /// Call this when switching to a track with a different sample rate
+    /// to ensure EQ center frequencies remain correct
+    pub fn setSampleRate(self: *Equalizer, sample_rate: u32) void {
+        for (&self.bands) |*band| {
+            band.setSampleRate(sample_rate);
+        }
+    }
+
+    /// Get current sample rate (from first band)
+    pub fn getSampleRate(self: *const Equalizer) u32 {
+        return self.bands[0].sample_rate;
     }
 
     /// Set preamp gain
@@ -363,6 +395,8 @@ pub const BassBoost = struct {
     boost_db: i8,
     /// Cutoff frequency
     cutoff_hz: u16,
+    /// Sample rate for coefficient calculation
+    sample_rate: u32 = DEFAULT_SAMPLE_RATE,
     /// Low-pass filter state
     lp_state_l: i32,
     lp_state_r: i32,
@@ -374,6 +408,7 @@ pub const BassBoost = struct {
         var bb = BassBoost{
             .boost_db = 0,
             .cutoff_hz = 120,
+            .sample_rate = DEFAULT_SAMPLE_RATE,
             .lp_state_l = 0,
             .lp_state_r = 0,
             .alpha = 0,
@@ -394,12 +429,20 @@ pub const BassBoost = struct {
         self.updateCoefficient();
     }
 
+    /// Set sample rate and recalculate coefficient
+    pub fn setSampleRate(self: *BassBoost, sample_rate: u32) void {
+        if (self.sample_rate != sample_rate) {
+            self.sample_rate = sample_rate;
+            self.updateCoefficient();
+        }
+    }
+
     fn updateCoefficient(self: *BassBoost) void {
         // Simple RC low-pass: alpha = dt / (RC + dt)
         // where RC = 1 / (2 * pi * cutoff)
-        // Simplified for fixed sample rate
+        // Simplified using configurable sample rate
         const cutoff_fp: i64 = @as(i64, self.cutoff_hz) << 16;
-        self.alpha = @intCast(@divTrunc(cutoff_fp * 6, SAMPLE_RATE));
+        self.alpha = @intCast(@divTrunc(cutoff_fp * 6, self.sample_rate));
     }
 
     pub fn process(self: *BassBoost, left: i16, right: i16) StereoSample {
@@ -757,6 +800,8 @@ pub const VolumeRamper = struct {
     current_volume: i32,
     /// Ramp rate per sample (higher = faster transition)
     ramp_rate: i32,
+    /// Sample rate for time-based calculations
+    sample_rate: u32 = DEFAULT_SAMPLE_RATE,
     /// Whether ramping is enabled
     enabled: bool,
 
@@ -768,6 +813,7 @@ pub const VolumeRamper = struct {
             .target_volume = 0x10000, // Unity gain
             .current_volume = 0x10000,
             .ramp_rate = 0x10000 / DEFAULT_RAMP_SAMPLES,
+            .sample_rate = DEFAULT_SAMPLE_RATE,
             .enabled = true,
         };
     }
@@ -783,9 +829,14 @@ pub const VolumeRamper = struct {
         self.target_volume = std.math.clamp(volume_fp, 0, 0x20000);
     }
 
+    /// Set sample rate for time-based calculations
+    pub fn setSampleRate(self: *VolumeRamper, sample_rate: u32) void {
+        self.sample_rate = sample_rate;
+    }
+
     /// Set ramp time in milliseconds
     pub fn setRampTimeMs(self: *VolumeRamper, ms: u16) void {
-        const samples = @divTrunc(@as(i32, ms) * SAMPLE_RATE, 1000);
+        const samples = @divTrunc(@as(i32, ms) * @as(i32, @intCast(self.sample_rate)), 1000);
         if (samples > 0) {
             self.ramp_rate = @divTrunc(0x10000, samples);
         }
@@ -937,6 +988,22 @@ pub const DspChain = struct {
     /// Unmute audio with smooth fade in
     pub fn unmute(self: *DspChain, percent: u8) void {
         self.volume.unmute(percent);
+    }
+
+    /// Set sample rate for all sample-rate-dependent components
+    /// Call this when loading a track with a different sample rate
+    /// to ensure EQ, filters, and timing operate correctly
+    pub fn setSampleRate(self: *DspChain, sample_rate: u32) void {
+        self.equalizer.setSampleRate(sample_rate);
+        self.bass_boost.setSampleRate(sample_rate);
+        self.volume.setSampleRate(sample_rate);
+        // Stereo widener is sample-rate-independent
+        // (operates on sample relationships, not absolute frequencies)
+    }
+
+    /// Get current sample rate from EQ
+    pub fn getSampleRate(self: *const DspChain) u32 {
+        return self.equalizer.getSampleRate();
     }
 };
 
