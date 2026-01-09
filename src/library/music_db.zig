@@ -350,6 +350,276 @@ pub fn getScanProgress() u8 {
 }
 
 // ============================================================
+// Library Scanner
+// ============================================================
+
+/// Scan error types
+pub const ScanError = error{
+    storage_not_ready,
+    scan_in_progress,
+    io_error,
+};
+
+/// Scan the music library starting from the given path
+/// Recursively scans directories for audio files and extracts metadata
+pub fn scanLibrary(root_path: []const u8) ScanError!void {
+    if (!fat32.isInitialized()) {
+        global_db.scan_error = "Storage not initialized";
+        return ScanError.storage_not_ready;
+    }
+
+    // Clear existing database
+    global_db.clear();
+    global_db.scan_progress = 0;
+    global_db.scan_error = null;
+
+    // Scan the directory tree
+    scanDirectory(root_path, 0) catch |err| {
+        global_db.scan_error = switch (err) {
+            fat32.FatError.file_not_found => "Music folder not found",
+            fat32.FatError.not_a_directory => "Invalid music path",
+            fat32.FatError.io_error => "Storage read error",
+            else => "Scan failed",
+        };
+        return ScanError.io_error;
+    };
+
+    global_db.scan_complete = true;
+    global_db.scan_progress = 100;
+}
+
+/// Recursively scan a directory for audio files
+fn scanDirectory(path: []const u8, depth: u8) fat32.FatError!void {
+    // Limit recursion depth to prevent stack overflow
+    if (depth > 8) return;
+
+    var entries: [64]fat32.DirEntryInfo = undefined;
+    const count = try fat32.listDirectory(path, &entries);
+
+    for (entries[0..count]) |*entry| {
+        // Build full path
+        var full_path: [MAX_PATH_LEN]u8 = undefined;
+        const path_len = buildPath(&full_path, path, entry.getName());
+        if (path_len == 0) continue;
+
+        if (entry.is_directory) {
+            // Skip . and .. directories
+            const name = entry.getName();
+            if (name.len == 1 and name[0] == '.') continue;
+            if (name.len == 2 and name[0] == '.' and name[1] == '.') continue;
+
+            // Recurse into subdirectory
+            scanDirectory(full_path[0..path_len], depth + 1) catch continue;
+        } else {
+            // Check if it's an audio file
+            if (isAudioFile(entry.getName())) {
+                addAudioFile(full_path[0..path_len], entry.size);
+
+                // Update progress (rough estimate based on track count)
+                if (global_db.track_count < MAX_TRACKS) {
+                    global_db.scan_progress = @intCast(@min(99, (global_db.track_count * 100) / MAX_TRACKS));
+                }
+            }
+        }
+    }
+}
+
+/// Build a full path from directory and filename
+fn buildPath(buffer: []u8, dir: []const u8, name: []const u8) usize {
+    if (dir.len + 1 + name.len >= buffer.len) return 0;
+
+    var pos: usize = 0;
+
+    // Copy directory
+    @memcpy(buffer[0..dir.len], dir);
+    pos = dir.len;
+
+    // Add separator if needed
+    if (pos > 0 and buffer[pos - 1] != '/') {
+        buffer[pos] = '/';
+        pos += 1;
+    }
+
+    // Copy filename
+    @memcpy(buffer[pos .. pos + name.len], name);
+    pos += name.len;
+
+    return pos;
+}
+
+/// Check if a filename has an audio extension
+fn isAudioFile(name: []const u8) bool {
+    if (name.len < 4) return false;
+
+    // Get extension (last 4 chars including dot)
+    const ext = name[name.len - 4 ..];
+
+    // Check common extensions
+    if (caseInsensitiveEqual(ext, ".mp3")) return true;
+    if (caseInsensitiveEqual(ext, ".wav")) return true;
+    if (caseInsensitiveEqual(ext, ".m4a")) return true;
+    if (caseInsensitiveEqual(ext, ".aac")) return true;
+
+    // Check 5-char extensions
+    if (name.len >= 5) {
+        const ext5 = name[name.len - 5 ..];
+        if (caseInsensitiveEqual(ext5, ".flac")) return true;
+    }
+
+    return false;
+}
+
+/// Add an audio file to the database, extracting metadata
+fn addAudioFile(path: []const u8, file_size: u32) void {
+    if (global_db.track_count >= MAX_TRACKS) return;
+
+    // Default metadata (filename-based)
+    var title: []const u8 = extractFilename(path);
+    var artist: []const u8 = "Unknown Artist";
+    var album: []const u8 = extractParentFolder(path);
+    var track_num: u8 = 0;
+
+    // Try to extract ID3 metadata for MP3 files
+    if (isMp3File(path)) {
+        extractMp3Metadata(path, file_size, &title, &artist, &album, &track_num);
+    }
+
+    // Add track to database
+    if (global_db.addTrack(path, title, artist, album)) |track| {
+        track.track_number = track_num;
+    }
+}
+
+/// Check if file is an MP3
+fn isMp3File(path: []const u8) bool {
+    if (path.len < 4) return false;
+    const ext = path[path.len - 4 ..];
+    return caseInsensitiveEqual(ext, ".mp3");
+}
+
+/// Extract filename without extension from path
+fn extractFilename(path: []const u8) []const u8 {
+    // Find last separator
+    var start: usize = 0;
+    for (path, 0..) |c, i| {
+        if (c == '/') start = i + 1;
+    }
+
+    // Find extension
+    var end: usize = path.len;
+    var i: usize = path.len;
+    while (i > start) : (i -= 1) {
+        if (path[i - 1] == '.') {
+            end = i - 1;
+            break;
+        }
+    }
+
+    if (end <= start) return path[start..];
+    return path[start..end];
+}
+
+/// Extract parent folder name from path
+fn extractParentFolder(path: []const u8) []const u8 {
+    // Find last separator
+    var last_sep: usize = 0;
+    var second_last_sep: usize = 0;
+
+    for (path, 0..) |c, i| {
+        if (c == '/') {
+            second_last_sep = last_sep;
+            last_sep = i;
+        }
+    }
+
+    if (last_sep > second_last_sep + 1) {
+        return path[second_last_sep + 1 .. last_sep];
+    }
+
+    return "Unknown Album";
+}
+
+/// Extract metadata from MP3 file using ID3 tags
+fn extractMp3Metadata(path: []const u8, file_size: u32, title: *[]const u8, artist: *[]const u8, album: *[]const u8, track_num: *u8) void {
+    // Read beginning of file for ID3v2 tags
+    const read_size: usize = @min(file_size, 4096);
+    var buffer: [4096]u8 = undefined;
+
+    const bytes_read = fat32.readFile(path, buffer[0..read_size]) catch return;
+    if (bytes_read < 10) return;
+
+    // Parse ID3 tags
+    const metadata = decoders.id3.parse(buffer[0..bytes_read]);
+
+    if (metadata.hasMetadata()) {
+        if (metadata.title_len > 0) {
+            // Store in static buffers (not ideal but works for scanning)
+            const t = metadata.getTitle();
+            if (t.len > 0) {
+                @memcpy(title_buffer[0..t.len], t);
+                title.* = title_buffer[0..t.len];
+            }
+        }
+        if (metadata.artist_len > 0) {
+            const a = metadata.getArtist();
+            if (a.len > 0) {
+                @memcpy(artist_buffer[0..a.len], a);
+                artist.* = artist_buffer[0..a.len];
+            }
+        }
+        if (metadata.album_len > 0) {
+            const ab = metadata.getAlbum();
+            if (ab.len > 0) {
+                @memcpy(album_buffer[0..ab.len], ab);
+                album.* = album_buffer[0..ab.len];
+            }
+        }
+        track_num.* = metadata.track;
+    }
+}
+
+// Static buffers for metadata extraction (reused per file)
+var title_buffer: [MAX_NAME_LEN]u8 = undefined;
+var artist_buffer: [MAX_NAME_LEN]u8 = undefined;
+var album_buffer: [MAX_NAME_LEN]u8 = undefined;
+
+/// Start a background scan (non-blocking)
+/// Call getScanProgress() to check progress
+pub fn startScan(root_path: []const u8) void {
+    // For now, do synchronous scan
+    // TODO: Implement async scanning with progress callback
+    scanLibrary(root_path) catch {};
+}
+
+/// Scan default music directories
+pub fn scanDefaultPaths() void {
+    // Try common music folder locations
+    const paths = [_][]const u8{
+        "/MUSIC",
+        "/Music",
+        "/music",
+        "/iPod_Control/Music",
+    };
+
+    for (paths) |path| {
+        if (fat32.isInitialized()) {
+            // Try to open directory to see if it exists
+            var entries: [1]fat32.DirEntryInfo = undefined;
+            if (fat32.listDirectory(path, &entries)) |_| {
+                scanLibrary(path) catch continue;
+                if (global_db.track_count > 0) return; // Found music
+            } else |_| {
+                continue;
+            }
+        }
+    }
+
+    // If no music found, mark scan complete anyway
+    global_db.scan_complete = true;
+    global_db.scan_progress = 100;
+}
+
+// ============================================================
 // Utility Functions
 // ============================================================
 
@@ -435,4 +705,43 @@ test "track get title fallback" {
     // With explicit title
     track.setTitle("My Song");
     try std.testing.expectEqualStrings("My Song", track.getTitle());
+}
+
+test "extract filename" {
+    try std.testing.expectEqualStrings("song", extractFilename("/MUSIC/album/song.mp3"));
+    try std.testing.expectEqualStrings("track01", extractFilename("/track01.wav"));
+    try std.testing.expectEqualStrings("My Song", extractFilename("/MUSIC/Artist/Album/My Song.flac"));
+}
+
+test "extract parent folder" {
+    try std.testing.expectEqualStrings("album", extractParentFolder("/MUSIC/album/song.mp3"));
+    try std.testing.expectEqualStrings("Album", extractParentFolder("/MUSIC/Artist/Album/song.mp3"));
+    try std.testing.expectEqualStrings("Unknown Album", extractParentFolder("/song.mp3"));
+}
+
+test "is audio file" {
+    try std.testing.expect(isAudioFile("song.mp3"));
+    try std.testing.expect(isAudioFile("TRACK.MP3"));
+    try std.testing.expect(isAudioFile("song.wav"));
+    try std.testing.expect(isAudioFile("song.WAV"));
+    try std.testing.expect(isAudioFile("song.flac"));
+    try std.testing.expect(isAudioFile("song.FLAC"));
+    try std.testing.expect(isAudioFile("song.m4a"));
+    try std.testing.expect(isAudioFile("song.aac"));
+    try std.testing.expect(!isAudioFile("song.txt"));
+    try std.testing.expect(!isAudioFile("song.jpg"));
+    try std.testing.expect(!isAudioFile("readme"));
+}
+
+test "build path" {
+    var buffer: [256]u8 = undefined;
+
+    var len = buildPath(&buffer, "/MUSIC", "song.mp3");
+    try std.testing.expectEqualStrings("/MUSIC/song.mp3", buffer[0..len]);
+
+    len = buildPath(&buffer, "/MUSIC/", "song.mp3");
+    try std.testing.expectEqualStrings("/MUSIC/song.mp3", buffer[0..len]);
+
+    len = buildPath(&buffer, "/", "song.mp3");
+    try std.testing.expectEqualStrings("/song.mp3", buffer[0..len]);
 }
