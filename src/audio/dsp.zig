@@ -545,6 +545,206 @@ pub const Ditherer = struct {
 };
 
 // ============================================================
+// Sample Rate Converter
+// ============================================================
+
+/// Linear interpolation resampler for sample rate conversion
+/// Supports conversion between any pair of common sample rates
+/// Uses fixed-point math for ARM7TDMI efficiency
+pub const Resampler = struct {
+    /// Source sample rate
+    input_rate: u32,
+    /// Target sample rate
+    output_rate: u32,
+    /// Phase accumulator (Q16.16 fixed-point)
+    phase: u32,
+    /// Phase increment per output sample
+    phase_inc: u32,
+    /// Previous sample for interpolation (left)
+    prev_l: i16,
+    /// Previous sample for interpolation (right)
+    prev_r: i16,
+    /// Current sample for interpolation (left)
+    curr_l: i16,
+    /// Current sample for interpolation (right)
+    curr_r: i16,
+    /// Whether resampling is needed (rates differ)
+    enabled: bool,
+
+    /// Common sample rates
+    pub const RATE_8000: u32 = 8000;
+    pub const RATE_11025: u32 = 11025;
+    pub const RATE_16000: u32 = 16000;
+    pub const RATE_22050: u32 = 22050;
+    pub const RATE_32000: u32 = 32000;
+    pub const RATE_44100: u32 = 44100;
+    pub const RATE_48000: u32 = 48000;
+    pub const RATE_96000: u32 = 96000;
+
+    pub fn init() Resampler {
+        return Resampler{
+            .input_rate = RATE_44100,
+            .output_rate = RATE_44100,
+            .phase = 0,
+            .phase_inc = 0x10000, // 1.0 in Q16.16
+            .prev_l = 0,
+            .prev_r = 0,
+            .curr_l = 0,
+            .curr_r = 0,
+            .enabled = false,
+        };
+    }
+
+    /// Configure resampler for specific input/output rates
+    pub fn configure(self: *Resampler, input_rate: u32, output_rate: u32) void {
+        self.input_rate = input_rate;
+        self.output_rate = output_rate;
+
+        if (input_rate == output_rate) {
+            self.enabled = false;
+            self.phase_inc = 0x10000;
+        } else {
+            self.enabled = true;
+            // phase_inc = input_rate / output_rate in Q16.16
+            // For accuracy: (input_rate << 16) / output_rate
+            self.phase_inc = @truncate((@as(u64, input_rate) << 16) / output_rate);
+        }
+
+        self.reset();
+    }
+
+    /// Reset resampler state
+    pub fn reset(self: *Resampler) void {
+        self.phase = 0;
+        self.prev_l = 0;
+        self.prev_r = 0;
+        self.curr_l = 0;
+        self.curr_r = 0;
+    }
+
+    /// Push a new input sample pair
+    pub fn pushSample(self: *Resampler, left: i16, right: i16) void {
+        self.prev_l = self.curr_l;
+        self.prev_r = self.curr_r;
+        self.curr_l = left;
+        self.curr_r = right;
+    }
+
+    /// Generate next output sample using linear interpolation
+    /// Returns null if no output sample is ready (need more input)
+    pub fn pullSample(self: *Resampler) ?StereoSample {
+        if (!self.enabled) {
+            return .{ .left = self.curr_l, .right = self.curr_r };
+        }
+
+        // Check if we've passed the current input sample
+        if (self.phase >= 0x10000) {
+            return null; // Need more input samples
+        }
+
+        // Linear interpolation: output = prev + (curr - prev) * phase
+        const frac: i32 = @intCast(self.phase & 0xFFFF);
+        const inv_frac: i32 = 0x10000 - frac;
+
+        const left = @as(i32, self.prev_l) * inv_frac + @as(i32, self.curr_l) * frac;
+        const right = @as(i32, self.prev_r) * inv_frac + @as(i32, self.curr_r) * frac;
+
+        // Advance phase
+        self.phase += self.phase_inc;
+
+        return .{
+            .left = @intCast(left >> 16),
+            .right = @intCast(right >> 16),
+        };
+    }
+
+    /// Advance phase and check if we need next input sample
+    pub fn needsInput(self: *const Resampler) bool {
+        return self.phase >= 0x10000;
+    }
+
+    /// Consume input sample (call after pushSample when phase indicates)
+    pub fn consumeInput(self: *Resampler) void {
+        if (self.phase >= 0x10000) {
+            self.phase -= 0x10000;
+        }
+    }
+
+    /// Resample a buffer of stereo samples
+    /// Input buffer is in format [L0, R0, L1, R1, ...]
+    /// Returns number of output samples written
+    pub fn resampleBuffer(
+        self: *Resampler,
+        input: []const i16,
+        output: []i16,
+    ) usize {
+        if (!self.enabled) {
+            // No resampling needed, just copy
+            const to_copy = @min(input.len, output.len);
+            @memcpy(output[0..to_copy], input[0..to_copy]);
+            return to_copy / 2; // Return stereo samples
+        }
+
+        var in_idx: usize = 0;
+        var out_idx: usize = 0;
+
+        while (out_idx + 1 < output.len) {
+            // Generate output samples while phase < 1.0
+            while (self.phase < 0x10000 and out_idx + 1 < output.len) {
+                const frac: i32 = @intCast(self.phase & 0xFFFF);
+                const inv_frac: i32 = 0x10000 - frac;
+
+                const left = @as(i32, self.prev_l) * inv_frac + @as(i32, self.curr_l) * frac;
+                const right = @as(i32, self.prev_r) * inv_frac + @as(i32, self.curr_r) * frac;
+
+                output[out_idx] = @intCast(left >> 16);
+                output[out_idx + 1] = @intCast(right >> 16);
+                out_idx += 2;
+
+                self.phase += self.phase_inc;
+            }
+
+            // Need next input sample
+            if (self.phase >= 0x10000) {
+                self.phase -= 0x10000;
+
+                if (in_idx + 1 < input.len) {
+                    self.prev_l = self.curr_l;
+                    self.prev_r = self.curr_r;
+                    self.curr_l = input[in_idx];
+                    self.curr_r = input[in_idx + 1];
+                    in_idx += 2;
+                } else {
+                    break; // No more input
+                }
+            }
+        }
+
+        return out_idx / 2;
+    }
+
+    /// Get ratio for buffer size calculation
+    /// Returns the ratio as Q16.16 fixed-point
+    pub fn getRatio(self: *const Resampler) u32 {
+        if (!self.enabled) return 0x10000;
+        return @truncate((@as(u64, self.output_rate) << 16) / self.input_rate);
+    }
+
+    /// Calculate required output buffer size for given input size
+    pub fn calcOutputSize(self: *const Resampler, input_samples: usize) usize {
+        if (!self.enabled) return input_samples;
+        const ratio = self.getRatio();
+        return @intCast((@as(u64, input_samples) * ratio + 0xFFFF) >> 16);
+    }
+
+    /// Calculate required input buffer size for given output size
+    pub fn calcInputSize(self: *const Resampler, output_samples: usize) usize {
+        if (!self.enabled) return output_samples;
+        return @intCast((@as(u64, output_samples) * self.phase_inc + 0xFFFF) >> 16);
+    }
+};
+
+// ============================================================
 // Volume Ramping
 // ============================================================
 
@@ -956,4 +1156,63 @@ test "ditherer disabled pass-through" {
     // With dithering disabled, should just truncate
     const out = dither.ditherToI16(0x40000000);
     try std.testing.expectEqual(@as(i16, 0x4000), out);
+}
+
+test "resampler initialization" {
+    const resampler = Resampler.init();
+    try std.testing.expectEqual(@as(u32, 44100), resampler.input_rate);
+    try std.testing.expectEqual(@as(u32, 44100), resampler.output_rate);
+    try std.testing.expect(!resampler.enabled);
+}
+
+test "resampler same rate passthrough" {
+    var resampler = Resampler.init();
+    resampler.configure(44100, 44100);
+
+    try std.testing.expect(!resampler.enabled);
+    try std.testing.expectEqual(@as(u32, 0x10000), resampler.phase_inc);
+}
+
+test "resampler 48k to 44.1k" {
+    var resampler = Resampler.init();
+    resampler.configure(48000, 44100);
+
+    try std.testing.expect(resampler.enabled);
+    // phase_inc = 48000/44100 ≈ 1.088 in Q16.16 = ~71330
+    try std.testing.expect(resampler.phase_inc > 0x10000);
+    try std.testing.expect(resampler.phase_inc < 0x12000);
+}
+
+test "resampler 22050 to 44100" {
+    var resampler = Resampler.init();
+    resampler.configure(22050, 44100);
+
+    try std.testing.expect(resampler.enabled);
+    // phase_inc = 22050/44100 = 0.5 in Q16.16 = 0x8000
+    try std.testing.expectEqual(@as(u32, 0x8000), resampler.phase_inc);
+}
+
+test "resampler buffer upsampling" {
+    var resampler = Resampler.init();
+    resampler.configure(22050, 44100); // 2x upsampling
+
+    // Input: 2 stereo samples
+    const input = [_]i16{ 1000, 2000, 3000, 4000 };
+    var output: [8]i16 = undefined;
+
+    const count = resampler.resampleBuffer(&input, &output);
+
+    // Should produce approximately 4 stereo samples (2x input)
+    try std.testing.expect(count >= 2);
+    try std.testing.expect(count <= 4);
+}
+
+test "resampler calc output size" {
+    var resampler = Resampler.init();
+    resampler.configure(44100, 48000);
+
+    const out_size = resampler.calcOutputSize(100);
+    // 100 samples at 44100 -> ~109 samples at 48000
+    try std.testing.expect(out_size >= 108);
+    try std.testing.expect(out_size <= 110);
 }
