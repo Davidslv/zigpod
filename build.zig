@@ -226,6 +226,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_mock_fat32 = b.addRunArtifact(mock_fat32_tests);
 
+    // MP3 Playback Integration Tests
+    const mp3_playback_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/mp3_playback_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigpod", .module = test_root_module },
+            },
+        }),
+    });
+    const run_mp3_playback = b.addRunArtifact(mp3_playback_tests);
+
+    // MP3 playback test step
+    const mp3_playback_step = b.step("test-mp3-playback", "Run MP3 playback integration tests");
+    mp3_playback_step.dependOn(&run_mp3_playback.step);
+
     const integration_step = b.step("test-integration", "Run integration tests");
     integration_step.dependOn(&run_audio_integration.step);
     integration_step.dependOn(&run_ui_integration.step);
