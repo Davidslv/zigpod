@@ -315,12 +315,10 @@ test "audio position formatting" {
 // Simulator Integration Tests
 // ============================================================
 
-test "simulator with LCD visualization" {
+test "simulator with LCD framebuffer" {
     const allocator = std.testing.allocator;
 
-    try simulator.initSimulator(allocator, .{
-        .lcd_visualization = false, // Don't actually render to terminal in tests
-    });
+    try simulator.initSimulator(allocator, .{});
     defer simulator.shutdownSimulator();
 
     const state = simulator.getSimulatorState();

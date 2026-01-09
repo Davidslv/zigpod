@@ -100,7 +100,6 @@ pub fn main() !void {
 
     // Initialize simulator
     const config = simulator.SimulatorConfig{
-        .lcd_visualization = !options.headless,
         .debug_logging = options.debug,
         .disk_image_path = options.disk_image,
         .audio_samples_path = options.audio_samples,
@@ -411,7 +410,7 @@ fn runInteractive(state: *SimulatorState, options: Options, out: *Output) void {
     var auto_run = false;
     var frame_count: u64 = 0;
 
-    out.write("Commands: [r]un, [s]tep, [c]ontinue, [p]rint regs, [m]emory, [l]cd, [q]uit\n");
+    out.write("Commands: [r]un, [s]tep, [c]ontinue, [p]rint regs, [m]emory, [q]uit\n");
     out.write("Press Enter to step, 'r' to run continuously\n\n");
 
     while (running) {
@@ -469,8 +468,6 @@ fn runInteractive(state: *SimulatorState, options: Options, out: *Output) void {
             } else |_| {
                 out.write("Invalid address\n");
             }
-        } else if (std.mem.eql(u8, cmd, "l") or std.mem.eql(u8, cmd, "lcd")) {
-            state.renderLcdToTerminal();
         } else if (std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "help")) {
             out.write("Commands:\n");
             out.write("  r, run       - Run continuously\n");
@@ -478,7 +475,6 @@ fn runInteractive(state: *SimulatorState, options: Options, out: *Output) void {
             out.write("  c, continue  - Run for one frame\n");
             out.write("  p, regs      - Print registers\n");
             out.write("  m <addr>     - Print memory at address\n");
-            out.write("  l, lcd       - Show LCD display\n");
             out.write("  q, quit      - Exit\n");
         } else {
             out.print("Unknown command: '{s}' (type 'h' for help)\n", .{cmd});

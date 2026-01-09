@@ -65,8 +65,6 @@ pub const profiler_mod = struct {
 // ============================================================
 
 pub const SimulatorConfig = struct {
-    /// Enable LCD visualization in terminal
-    lcd_visualization: bool = true,
     /// Enable audio output to file
     audio_to_file: bool = true,
     /// Audio output file path
@@ -295,70 +293,6 @@ pub const SimulatorState = struct {
         if (x < 320 and y < 240) {
             self.lcd_framebuffer[@as(usize, y) * 320 + x] = color;
         }
-    }
-
-    /// Render LCD to terminal (ASCII art)
-    pub fn renderLcdToTerminal(self: *SimulatorState) void {
-        if (!self.config.lcd_visualization) return;
-
-        const stdout = std.fs.File.stdout();
-
-        // Clear screen and move cursor to top
-        _ = stdout.write("\x1B[2J\x1B[H") catch {};
-
-        // Draw top border
-        _ = stdout.write("+" ++ ("-" ** 80) ++ "+\n") catch {};
-
-        // Draw scaled framebuffer (320x240 -> 80x24)
-        const x_scale = 4;
-        const y_scale = 10;
-
-        // Build line buffer for efficient output
-        // Format: '|' + 80 pixels + '|' + '\n' = 83 bytes
-        var line_buf: [83]u8 = undefined;
-        line_buf[0] = '|';
-
-        var y: usize = 0;
-        while (y < 240) : (y += y_scale) {
-            var x: usize = 0;
-            var buf_idx: usize = 1;
-            while (x < 320) : (x += x_scale) {
-                const pixel = self.lcd_framebuffer[y * 320 + x];
-                line_buf[buf_idx] = colorToChar(pixel);
-                buf_idx += 1;
-            }
-            line_buf[buf_idx] = '|';
-            line_buf[buf_idx + 1] = '\n';
-            _ = stdout.write(line_buf[0 .. buf_idx + 2]) catch {};
-        }
-
-        // Draw bottom border
-        _ = stdout.write("+" ++ ("-" ** 80) ++ "+\n") catch {};
-
-        // Status line
-        var status_buf: [128]u8 = undefined;
-        const status = std.fmt.bufPrint(&status_buf, "Backlight: {s} | Wheel: {d} | Buttons: 0x{X:0>2}\n", .{
-            if (self.lcd_backlight) "ON " else "OFF",
-            self.wheel_position,
-            self.button_state,
-        }) catch return;
-        _ = stdout.write(status) catch {};
-    }
-
-    /// Convert RGB565 color to ASCII character
-    fn colorToChar(color: u16) u8 {
-        // Extract RGB components
-        const r = (color >> 11) & 0x1F;
-        const g = (color >> 5) & 0x3F;
-        const b = color & 0x1F;
-
-        // Calculate approximate luminance
-        const lum = (@as(u16, r) * 2 + @as(u16, g) + @as(u16, b) * 2) / 6;
-
-        // Map to ASCII characters
-        const chars = " .:-=+*#%@";
-        const idx = @min(lum * chars.len / 32, chars.len - 1);
-        return chars[idx];
     }
 
     /// Process simulated input from keyboard
