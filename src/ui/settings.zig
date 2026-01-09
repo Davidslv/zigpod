@@ -40,8 +40,11 @@ pub const Settings = struct {
     language: Language = .english,
 
     // Apply audio settings to codec
+    // Note: Audio setting errors are non-fatal - playback continues with defaults
     pub fn applyAudioSettings(self: *const Settings) void {
+        // Volume setting failed - continue with current volume
         audio.setVolumeMono(self.volume) catch {};
+        // Bass/treble settings - continue with current levels on failure
         codec.setBass(self.bass) catch {};
         codec.setTreble(self.treble) catch {};
         _ = self.bass_cutoff; // TODO: Implement cutoff frequency setting

@@ -139,13 +139,14 @@ fn showBootScreen() void {
 
     // Draw loading bar
     lcd.drawProgressBar(60, 140, 200, 12, 0, theme.accent, theme.disabled);
+    // Boot display errors are non-fatal - continue boot sequence
     lcd.update() catch {};
 
     // Simulate loading with progress
     var progress: u8 = 0;
     while (progress < 100) : (progress += 5) {
         lcd.drawProgressBar(60, 140, 200, 12, progress, theme.accent, theme.disabled);
-        lcd.update() catch {};
+        lcd.update() catch {}; // Continue boot even if display fails
         kernel.timer.delayMs(30);
     }
 
@@ -157,7 +158,7 @@ fn showLowBatteryWarning() void {
     lcd.clear(lcd.Colors.RED);
     lcd.drawStringCentered(100, "LOW BATTERY", lcd.Colors.WHITE, lcd.Colors.RED);
     lcd.drawStringCentered(120, "Please charge", lcd.Colors.WHITE, lcd.Colors.RED);
-    lcd.update() catch {};
+    lcd.update() catch {}; // Display warning even if update fails
     kernel.timer.delayMs(3000);
 }
 
@@ -203,13 +204,18 @@ fn shutdown() void {
 
     // Clear screen
     lcd.clear(lcd.Colors.BLACK);
-    lcd.update() catch {};
+    lcd.update() catch {}; // Best effort - shutting down anyway
 
     // Disable interrupts
     kernel.interrupts.disableGlobal();
 
-    // Power off
-    power.setState(.off) catch {};
+    // Power off - this is the final operation, no recovery possible
+    power.setState(.off) catch {
+        // If power off fails, halt the CPU
+        while (true) {
+            asm volatile ("wfi");
+        }
+    };
 }
 
 // ============================================================
@@ -233,7 +239,7 @@ fn handleFatalError(message: []const u8, err: anyerror) void {
 
     lcd.drawString(10, 80, "Press any button to reboot", lcd.Colors.WHITE, lcd.Colors.RED);
 
-    lcd.update() catch {};
+    lcd.update() catch {}; // Best effort for error display
 
     // Wait for button press
     while (true) {

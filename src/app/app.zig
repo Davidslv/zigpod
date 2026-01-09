@@ -37,10 +37,45 @@ pub const Screen = enum {
 // Application State
 // ============================================================
 
+/// Error severity levels for tracking system health
+pub const ErrorSeverity = enum {
+    none,
+    warning, // Recoverable, operation continues
+    significant, // Significant but non-fatal
+    critical, // May affect system stability
+};
+
+/// System error state for tracking errors
+pub const ErrorState = struct {
+    severity: ErrorSeverity = .none,
+    error_count: u32 = 0,
+    last_error_source: []const u8 = "",
+
+    pub fn record(self: *ErrorState, source: []const u8, severity: ErrorSeverity) void {
+        self.error_count += 1;
+        self.last_error_source = source;
+        // Keep highest severity
+        if (@intFromEnum(severity) > @intFromEnum(self.severity)) {
+            self.severity = severity;
+        }
+    }
+
+    pub fn clear(self: *ErrorState) void {
+        self.severity = .none;
+    }
+
+    pub fn hasErrors(self: *const ErrorState) bool {
+        return self.severity != .none;
+    }
+};
+
 pub const AppState = struct {
     current_screen: Screen = .boot,
     previous_screen: Screen = .boot,
     needs_redraw: bool = true,
+
+    // Error tracking for system health
+    error_state: ErrorState = .{},
 
     // Screen-specific state
     main_menu: ui.Menu = undefined,
@@ -148,14 +183,18 @@ pub fn update() void {
         app_state.needs_redraw = true;
     }
 
-    // Process audio
-    audio.process() catch {};
+    // Process audio - errors are non-fatal, continue playback
+    audio.process() catch {
+        app_state.error_state.record("audio.process", .warning);
+    };
 
     // Check power management
     power.checkBacklightTimeout();
     if (power.checkSleepTimer()) {
         audio.pause();
-        power.setState(.standby) catch {};
+        power.setState(.standby) catch {
+            app_state.error_state.record("power.setState", .significant);
+        };
     }
 
     // Draw if needed
@@ -203,7 +242,9 @@ fn handleMainMenuInput(event: clickwheel.InputEvent) void {
             0 => app_state.pushScreen(.music),
             1 => app_state.pushScreen(.playlists),
             2 => {
-                app_state.file_browser.refresh() catch {};
+                app_state.file_browser.refresh() catch {
+                    app_state.error_state.record("file_browser.refresh", .warning);
+                };
                 app_state.pushScreen(.file_browser);
             },
             3 => app_state.pushScreen(.now_playing),
@@ -307,7 +348,9 @@ fn handleNowPlayingInput(event: clickwheel.InputEvent) void {
         .volume_up, .volume_down => {
             // Volume is already adjusted in handleInput
             const vol_db: i16 = @as(i16, @intCast(app_state.now_playing_state.volume)) - 50;
-            audio.setVolumeMono(vol_db) catch {};
+            audio.setVolumeMono(vol_db) catch {
+                app_state.error_state.record("audio.setVolumeMono", .warning);
+            };
             // Show volume overlay
             const timestamp: u32 = @intCast(hal.getTicksUs() / 1000);
             ui.getOverlay().showVolume(app_state.now_playing_state.volume, timestamp);
@@ -377,7 +420,9 @@ fn draw() void {
     const timestamp: u32 = @intCast(hal.getTicksUs() / 1000);
     ui.drawOverlay(timestamp);
 
-    lcd.update() catch {};
+    lcd.update() catch {
+        app_state.error_state.record("lcd.update", .warning);
+    };
 }
 
 fn drawBootScreen() void {
@@ -467,7 +512,9 @@ pub fn playFile(path: []const u8) !void {
 /// Show a temporary message
 pub fn showMessage(title: []const u8, message: []const u8) void {
     ui.drawMessageBox(title, message);
-    lcd.update() catch {};
+    lcd.update() catch {
+        app_state.error_state.record("lcd.update", .warning);
+    };
 }
 
 // ============================================================
