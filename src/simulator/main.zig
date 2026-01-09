@@ -18,6 +18,13 @@ const gui = if (build_options.enable_sdl2) @import("gui/gui.zig") else struct {
 };
 const sdl_backend = if (build_options.enable_sdl2) @import("gui/sdl_backend.zig") else struct {};
 const audio_player = if (build_options.enable_sdl2) @import("audio/audio_player.zig") else struct {};
+const sim_ui = if (build_options.enable_sdl2) @import("gui/sim_ui.zig") else struct {
+    pub const SimulatorUI = struct {
+        pub fn init() @This() {
+            return .{};
+        }
+    };
+};
 
 /// Simple output writer for Zig 0.15
 const Output = struct {
@@ -156,10 +163,9 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
     out.write("Controls:\n");
     out.write("  Arrow keys / Click wheel: Navigate\n");
     out.write("  Enter / Center button: Select\n");
-    out.write("  M / Escape: Menu\n");
+    out.write("  M / Escape: Menu/Back\n");
     out.write("  Space: Play/Pause\n");
-    out.write("  Mouse: Click and drag on wheel\n");
-    out.write("  Scroll wheel: Rotate click wheel (or adjust volume when playing)\n");
+    out.write("  Mouse scroll: Navigate menus / Adjust volume\n");
     out.write("  Q / Close window: Quit\n\n");
 
     // Initialize SDL2 backend
@@ -183,9 +189,10 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
     var player = audio_player.AudioPlayer.init(allocator);
     defer player.deinit();
 
-    var audio_mode = false;
+    // Initialize UI state
+    var ui = sim_ui.SimulatorUI.init();
 
-    // Load audio file if provided
+    // Load audio file if provided via command line (skip UI and go straight to playback)
     if (options.audio_file) |audio_path| {
         out.print("Loading audio: {s}\n", .{audio_path});
         player.loadWav(audio_path) catch |err| {
@@ -193,25 +200,23 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
         };
         const info = player.getTrackInfo();
         if (info.duration_ms > 0) {
-            audio_mode = true;
+            ui.screen = .now_playing;
+            ui.audio_playing = true;
             out.print("Track: {s}\n", .{info.getTitle()});
             out.print("Duration: {d}ms, Sample rate: {d}Hz, Channels: {d}\n", .{
                 info.duration_ms,
                 info.sample_rate,
                 info.channels,
             });
-            out.print("Audio device ID: {d}\n", .{player.audio_device});
             player.play();
-            out.print("Playback started, state: {s}\n", .{@tagName(player.getState())});
-        } else {
-            out.write("Failed to parse audio file\n");
+            out.print("Playback started\n", .{});
         }
     }
 
     // Main GUI loop
     var frame_count: u64 = 0;
     var running = true;
-    var sim_paused = false;
+    var wheel_accum: i8 = 0;
 
     while (running and gui_interface.isOpen()) {
         // Process GUI events
@@ -222,49 +227,55 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
                 },
                 .button_press => {
                     if (event.button) |button| {
-                        if (audio_mode) {
-                            handleAudioButton(&player, button);
-                        } else {
-                            handleButtonPress(state, button, &sim_paused);
+                        const ui_button = mapGuiButton(button);
+                        if (ui.handleInput(ui_button, 0)) |action| {
+                            handleUiAction(&ui, &player, action, allocator, out);
                         }
                     }
                 },
-                .button_release => {
-                    // Could handle button release if needed
-                },
+                .button_release => {},
                 .wheel_turn => {
-                    if (audio_mode) {
-                        // Adjust volume with wheel
-                        const current_vol: i16 = player.volume;
-                        const new_vol = std.math.clamp(current_vol + event.wheel_delta, 0, 100);
-                        player.setVolume(@intCast(new_vol));
-                    } else {
-                        // Update simulator wheel position
-                        const new_pos = @as(i16, state.wheel_position) + event.wheel_delta;
-                        state.wheel_position = @truncate(@as(u16, @bitCast(@as(i16, @truncate(new_pos)))));
+                    // Accumulate wheel for UI navigation
+                    wheel_accum += event.wheel_delta;
+                    if (wheel_accum >= 3 or wheel_accum <= -3) {
+                        const delta: i8 = if (wheel_accum > 0) 1 else -1;
+                        wheel_accum = 0;
+                        if (ui.handleInput(.none, delta)) |action| {
+                            handleUiAction(&ui, &player, action, allocator, out);
+                        }
                     }
                 },
                 .key_down => {
-                    // Check for quit key
                     if (event.keycode == 'q') {
                         running = false;
+                    } else if (event.keycode == 0x40000052) { // SDL_SCANCODE_UP
+                        // Arrow up for navigation
+                        if (ui.handleInput(.none, -1)) |action| {
+                            handleUiAction(&ui, &player, action, allocator, out);
+                        }
+                    } else if (event.keycode == 0x40000051) { // SDL_SCANCODE_DOWN
+                        // Arrow down for navigation
+                        if (ui.handleInput(.none, 1)) |action| {
+                            handleUiAction(&ui, &player, action, allocator, out);
+                        }
                     }
                 },
                 else => {},
             }
         }
 
-        // Update display based on mode
-        if (audio_mode) {
-            // Render Now Playing UI to framebuffer
-            audio_player.renderNowPlaying(&state.lcd_framebuffer, &player);
-        } else {
-            // Run simulation if not paused
-            if (!sim_paused) {
-                _ = state.run(options.cycles_per_frame);
-                frame_count += 1;
-            }
-        }
+        // Build player info for UI
+        const player_info = sim_ui.PlayerInfo{
+            .title = player.getTrackInfo().getTitle(),
+            .artist = player.getTrackInfo().getArtist(),
+            .position_ms = player.getPositionMs(),
+            .duration_ms = player.getTrackInfo().duration_ms,
+            .is_playing = player.getState() == .playing,
+            .volume = player.volume,
+        };
+
+        // Render UI to framebuffer
+        sim_ui.render(&state.lcd_framebuffer, &ui, player_info);
 
         // Update GUI with LCD framebuffer
         gui_interface.updateLcd(&state.lcd_framebuffer);
@@ -272,15 +283,60 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
 
         // Present frame
         gui_interface.present();
+        frame_count += 1;
     }
 
     player.stop();
 
-    out.print("\nSimulator exited. Frames: {d}, Total cycles: {d}, instructions: {d}\n", .{
-        frame_count,
-        state.getCpuCycles(),
-        state.getCpuInstructions(),
-    });
+    out.print("\nSimulator exited. Frames: {d}\n", .{frame_count});
+}
+
+/// Map GUI button to UI button
+fn mapGuiButton(button: gui.Button) sim_ui.Button {
+    return switch (button) {
+        .menu => .menu,
+        .play_pause => .play_pause,
+        .prev => .left,
+        .next => .right,
+        .select => .select,
+        else => .none,
+    };
+}
+
+/// Handle UI action (play file, toggle play, etc.)
+fn handleUiAction(ui: *sim_ui.SimulatorUI, player: *audio_player.AudioPlayer, action: sim_ui.Action, allocator: std.mem.Allocator, out: *Output) void {
+    _ = allocator;
+    switch (action) {
+        .toggle_play => {
+            player.togglePause();
+        },
+        .play_file => |path| {
+            out.print("Loading: {s}\n", .{path});
+            player.loadWav(path) catch |err| {
+                out.print("Failed to load: {}\n", .{err});
+                return;
+            };
+            const info = player.getTrackInfo();
+            if (info.duration_ms > 0) {
+                ui.screen = .now_playing;
+                ui.audio_playing = true;
+                player.play();
+                out.print("Playing: {s} ({d}ms)\n", .{ info.getTitle(), info.duration_ms });
+            }
+        },
+        .seek_forward => {
+            const pos = player.getPositionMs();
+            const duration = player.getTrackInfo().duration_ms;
+            if (pos + 10000 < duration) {
+                player.seekMs(pos + 10000);
+            }
+        },
+        .volume_change => |delta| {
+            const current: i16 = player.volume;
+            const new_vol = std.math.clamp(current + delta, 0, 100);
+            player.setVolume(@intCast(new_vol));
+        },
+    }
 }
 
 /// Handle button press in audio playback mode
