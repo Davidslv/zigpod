@@ -245,12 +245,406 @@ pub fn getSettings() *Settings {
 
 /// Settings menu categories
 pub const SettingsCategory = enum {
+    main,
     display,
     audio,
     playback,
     system,
     about,
 };
+
+// ============================================================
+// Settings Browser State
+// ============================================================
+
+pub const SettingsBrowser = struct {
+    category: SettingsCategory = .main,
+    selected_index: usize = 0,
+    scroll_offset: usize = 0,
+    editing: bool = false, // True when adjusting a value
+
+    /// Initialize browser
+    pub fn init() SettingsBrowser {
+        return SettingsBrowser{};
+    }
+
+    /// Get item count for current category
+    pub fn getItemCount(self: *const SettingsBrowser) usize {
+        return switch (self.category) {
+            .main => 6, // Display, Audio, Playback, System, separator, About
+            .display => 3, // Brightness, Backlight timeout, Theme
+            .audio => 4, // Volume, Bass, Treble, Channel
+            .playback => 4, // Shuffle, Repeat, Gapless, ReplayGain
+            .system => 3, // Sleep timer, Hold action, Language
+            .about => 0,
+        };
+    }
+
+    /// Move selection up
+    pub fn selectPrevious(self: *SettingsBrowser) void {
+        if (self.selected_index > 0) {
+            self.selected_index -= 1;
+        }
+    }
+
+    /// Move selection down
+    pub fn selectNext(self: *SettingsBrowser) void {
+        const count = self.getItemCount();
+        if (self.selected_index + 1 < count) {
+            self.selected_index += 1;
+        }
+    }
+
+    /// Go back to previous level
+    pub fn goBack(self: *SettingsBrowser) SettingsAction {
+        if (self.editing) {
+            self.editing = false;
+            return .none;
+        }
+
+        switch (self.category) {
+            .main => return .exit,
+            else => {
+                self.category = .main;
+                self.selected_index = 0;
+                self.scroll_offset = 0;
+                return .none;
+            },
+        }
+    }
+
+    /// Handle selection
+    pub fn select(self: *SettingsBrowser) SettingsAction {
+        if (self.editing) {
+            self.editing = false;
+            return .none;
+        }
+
+        return switch (self.category) {
+            .main => self.handleMainSelect(),
+            .display => self.handleDisplaySelect(),
+            .audio => self.handleAudioSelect(),
+            .playback => self.handlePlaybackSelect(),
+            .system => self.handleSystemSelect(),
+            .about => .none,
+        };
+    }
+
+    fn handleMainSelect(self: *SettingsBrowser) SettingsAction {
+        switch (self.selected_index) {
+            0 => { // Display
+                self.category = .display;
+                self.selected_index = 0;
+            },
+            1 => { // Audio
+                self.category = .audio;
+                self.selected_index = 0;
+            },
+            2 => { // Playback
+                self.category = .playback;
+                self.selected_index = 0;
+            },
+            3 => { // System
+                self.category = .system;
+                self.selected_index = 0;
+            },
+            // 4 is separator
+            5 => { // About
+                return .show_about;
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handleDisplaySelect(self: *SettingsBrowser) SettingsAction {
+        switch (self.selected_index) {
+            0 => self.editing = true, // Brightness
+            1 => self.editing = true, // Backlight timeout
+            2 => { // Theme - cycle
+                cycleTheme();
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handleAudioSelect(self: *SettingsBrowser) SettingsAction {
+        switch (self.selected_index) {
+            0 => self.editing = true, // Volume
+            1 => self.editing = true, // Bass
+            2 => self.editing = true, // Treble
+            3 => { // Channel - cycle
+                const settings = getSettings();
+                settings.channel_mix = settings.channel_mix.next();
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handlePlaybackSelect(self: *SettingsBrowser) SettingsAction {
+        switch (self.selected_index) {
+            0 => toggleShuffle(),
+            1 => cycleRepeat(),
+            2 => toggleGapless(),
+            3 => { // ReplayGain - cycle
+                const settings = getSettings();
+                settings.replay_gain = settings.replay_gain.next();
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handleSystemSelect(self: *SettingsBrowser) SettingsAction {
+        switch (self.selected_index) {
+            0 => self.editing = true, // Sleep timer
+            1 => { // Hold action - cycle
+                const settings = getSettings();
+                settings.hold_action = settings.hold_action.next();
+            },
+            2 => { // Language - cycle
+                const settings = getSettings();
+                settings.language = settings.language.next();
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    /// Handle wheel for value adjustment
+    pub fn adjustValue(self: *SettingsBrowser, delta: i8) void {
+        if (!self.editing) return;
+
+        switch (self.category) {
+            .display => switch (self.selected_index) {
+                0 => adjustBrightness(delta),
+                1 => { // Backlight timeout
+                    const settings = getSettings();
+                    if (delta > 0) {
+                        settings.backlight_timeout = @min(300, settings.backlight_timeout + 5);
+                    } else {
+                        settings.backlight_timeout = if (settings.backlight_timeout > 5) settings.backlight_timeout - 5 else 0;
+                    }
+                },
+                else => {},
+            },
+            .audio => switch (self.selected_index) {
+                0 => adjustVolume(delta),
+                1 => adjustBass(delta),
+                2 => adjustTreble(delta),
+                else => {},
+            },
+            .system => switch (self.selected_index) {
+                0 => { // Sleep timer
+                    const settings = getSettings();
+                    if (delta > 0) {
+                        settings.sleep_timer = @min(120, settings.sleep_timer + 5);
+                    } else {
+                        settings.sleep_timer = if (settings.sleep_timer > 5) settings.sleep_timer - 5 else 0;
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    /// Get title for current category
+    pub fn getTitle(self: *const SettingsBrowser) []const u8 {
+        return switch (self.category) {
+            .main => "Settings",
+            .display => "Display",
+            .audio => "Audio",
+            .playback => "Playback",
+            .system => "System",
+            .about => "About",
+        };
+    }
+};
+
+pub const SettingsAction = enum {
+    none,
+    exit,
+    show_about,
+};
+
+/// Draw the settings browser screen
+pub fn drawSettingsBrowser(browser: *const SettingsBrowser) void {
+    const theme = ui.getTheme();
+    const settings = getSettings();
+
+    lcd.clear(theme.background);
+    ui.drawHeader(browser.getTitle());
+
+    switch (browser.category) {
+        .main => {
+            const items = [_][]const u8{ "Display", "Audio", "Playback", "System", "", "About ZigPod" };
+            const icons = [_][]const u8{ "[D]", "[A]", "[P]", "[S]", "", "[i]" };
+
+            for (items, 0..) |item, i| {
+                const y = ui.CONTENT_START_Y + @as(u16, @intCast(i)) * ui.MENU_ITEM_HEIGHT;
+                const selected = i == browser.selected_index;
+
+                if (item.len == 0) {
+                    // Separator
+                    lcd.drawHLine(20, y + ui.MENU_ITEM_HEIGHT / 2, ui.SCREEN_WIDTH - 40, theme.disabled);
+                    continue;
+                }
+
+                const bg = if (selected) theme.selected_bg else theme.background;
+                const fg = if (selected) theme.selected_fg else theme.foreground;
+
+                lcd.fillRect(0, y, ui.SCREEN_WIDTH, ui.MENU_ITEM_HEIGHT, bg);
+                lcd.drawString(4, y + 6, icons[i], theme.disabled, bg);
+                lcd.drawString(32, y + 6, item, fg, bg);
+                lcd.drawString(ui.SCREEN_WIDTH - 16, y + 6, ">", theme.disabled, bg);
+            }
+        },
+        .display => {
+            drawSettingItem(0, "Brightness", formatPercent(settings.brightness), browser.selected_index == 0, browser.editing and browser.selected_index == 0, theme);
+            drawSettingItem(1, "Backlight", formatTimeout(settings.backlight_timeout), browser.selected_index == 1, browser.editing and browser.selected_index == 1, theme);
+            drawSettingItem(2, "Theme", settings.getThemeName(), browser.selected_index == 2, false, theme);
+        },
+        .audio => {
+            drawSettingItem(0, "Volume", formatDb(settings.volume), browser.selected_index == 0, browser.editing and browser.selected_index == 0, theme);
+            drawSettingItem(1, "Bass", formatDbSigned(settings.bass), browser.selected_index == 1, browser.editing and browser.selected_index == 1, theme);
+            drawSettingItem(2, "Treble", formatDbSigned(settings.treble), browser.selected_index == 2, browser.editing and browser.selected_index == 2, theme);
+            drawSettingItem(3, "Channel", settings.channel_mix.toString(), browser.selected_index == 3, false, theme);
+        },
+        .playback => {
+            drawSettingItem(0, "Shuffle", if (settings.shuffle) "On" else "Off", browser.selected_index == 0, false, theme);
+            drawSettingItem(1, "Repeat", settings.repeat.toString(), browser.selected_index == 1, false, theme);
+            drawSettingItem(2, "Gapless", if (settings.gapless) "On" else "Off", browser.selected_index == 2, false, theme);
+            drawSettingItem(3, "ReplayGain", settings.replay_gain.toString(), browser.selected_index == 3, false, theme);
+        },
+        .system => {
+            drawSettingItem(0, "Sleep Timer", formatTimeout(settings.sleep_timer), browser.selected_index == 0, browser.editing and browser.selected_index == 0, theme);
+            drawSettingItem(1, "Hold Action", settings.hold_action.toString(), browser.selected_index == 1, false, theme);
+            drawSettingItem(2, "Language", settings.language.toString(), browser.selected_index == 2, false, theme);
+        },
+        .about => {},
+    }
+
+    // Footer hint
+    if (browser.editing) {
+        ui.drawFooter("Wheel: Adjust  Select: Done");
+    } else {
+        ui.drawFooter("Select: Enter  Menu: Back");
+    }
+}
+
+fn drawSettingItem(index: usize, label: []const u8, value: []const u8, selected: bool, editing: bool, theme: ui.Theme) void {
+    const y = ui.CONTENT_START_Y + @as(u16, @intCast(index)) * ui.MENU_ITEM_HEIGHT;
+    const bg = if (selected) theme.selected_bg else theme.background;
+    const fg = if (selected) theme.selected_fg else theme.foreground;
+    const value_fg = if (editing) theme.accent else if (selected) fg else theme.disabled;
+
+    lcd.fillRect(0, y, ui.SCREEN_WIDTH, ui.MENU_ITEM_HEIGHT, bg);
+
+    // Selection indicator
+    if (selected) {
+        lcd.drawString(4, y + 6, ">", fg, bg);
+    }
+
+    // Label
+    lcd.drawString(16, y + 6, label, fg, bg);
+
+    // Value (right-aligned)
+    const value_x = ui.SCREEN_WIDTH - @as(u16, @intCast(value.len * ui.CHAR_WIDTH + 16));
+    lcd.drawString(value_x, y + 6, value, value_fg, bg);
+
+    // Editing brackets
+    if (editing) {
+        lcd.drawString(value_x - 12, y + 6, "[", theme.accent, bg);
+        lcd.drawString(value_x + @as(u16, @intCast(value.len * ui.CHAR_WIDTH)), y + 6, "]", theme.accent, bg);
+    }
+}
+
+// Format helpers
+fn formatPercent(value: u8) []const u8 {
+    return formatPercentBuf(value);
+}
+
+var percent_buf: [8]u8 = undefined;
+fn formatPercentBuf(value: u8) []const u8 {
+    return std.fmt.bufPrint(&percent_buf, "{d}%", .{value}) catch "?";
+}
+
+fn formatTimeout(secs: u16) []const u8 {
+    return formatTimeoutBuf(secs);
+}
+
+var timeout_buf: [16]u8 = undefined;
+fn formatTimeoutBuf(secs: u16) []const u8 {
+    if (secs == 0) return "Off";
+    if (secs < 60) {
+        return std.fmt.bufPrint(&timeout_buf, "{d}s", .{secs}) catch "?";
+    } else {
+        return std.fmt.bufPrint(&timeout_buf, "{d}m", .{secs / 60}) catch "?";
+    }
+}
+
+fn formatDb(value: i16) []const u8 {
+    return formatDbBuf(value);
+}
+
+var db_buf: [16]u8 = undefined;
+fn formatDbBuf(value: i16) []const u8 {
+    return std.fmt.bufPrint(&db_buf, "{d} dB", .{value}) catch "?";
+}
+
+fn formatDbSigned(value: i8) []const u8 {
+    return formatDbSignedBuf(value);
+}
+
+var db_signed_buf: [16]u8 = undefined;
+fn formatDbSignedBuf(value: i8) []const u8 {
+    if (value >= 0) {
+        return std.fmt.bufPrint(&db_signed_buf, "+{d} dB", .{value}) catch "?";
+    } else {
+        return std.fmt.bufPrint(&db_signed_buf, "{d} dB", .{value}) catch "?";
+    }
+}
+
+/// Handle input for settings browser
+pub fn handleSettingsBrowserInput(browser: *SettingsBrowser, buttons: u8, wheel_delta: i8) SettingsAction {
+    const clickwheel = @import("../drivers/input/clickwheel.zig");
+
+    // Wheel handling - navigation or value adjustment
+    if (wheel_delta != 0) {
+        if (browser.editing) {
+            browser.adjustValue(wheel_delta);
+        } else {
+            if (wheel_delta > 0) {
+                browser.selectNext();
+            } else {
+                browser.selectPrevious();
+            }
+        }
+        return .none;
+    }
+
+    // Button handling
+    if (buttons & clickwheel.Button.SELECT != 0) {
+        return browser.select();
+    }
+
+    if (buttons & clickwheel.Button.RIGHT != 0) {
+        return browser.select();
+    }
+
+    if (buttons & clickwheel.Button.LEFT != 0) {
+        return browser.goBack();
+    }
+
+    if (buttons & clickwheel.Button.MENU != 0) {
+        return browser.goBack();
+    }
+
+    return .none;
+}
 
 /// Create the main settings menu
 pub fn createMainMenu() ui.Menu {

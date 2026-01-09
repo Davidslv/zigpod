@@ -345,6 +345,154 @@ pub const File = struct {
 };
 
 // ============================================================
+// High-Level File Access
+// ============================================================
+
+pub const FatError = error{
+    file_not_found,
+    not_a_file,
+    path_too_long,
+    io_error,
+    not_initialized,
+};
+
+/// Global filesystem instance (initialized by kernel)
+var global_fs: ?Fat32 = null;
+
+/// Initialize global filesystem
+pub fn initGlobal(fs: Fat32) void {
+    global_fs = fs;
+}
+
+/// Check if filesystem is initialized
+pub fn isInitialized() bool {
+    return global_fs != null;
+}
+
+/// Read an entire file into a buffer
+/// Returns the number of bytes read
+pub fn readFile(path: []const u8, buffer: []u8) FatError!usize {
+    var fs = global_fs orelse return FatError.not_initialized;
+
+    // Parse path and find file
+    const file = try openFile(&fs, path);
+    var f = file;
+
+    // Read entire file
+    const bytes_read = f.read(buffer) catch return FatError.io_error;
+    return bytes_read;
+}
+
+/// Open a file by path (e.g., "/MUSIC/song.wav")
+pub fn openFile(fs: *Fat32, path: []const u8) FatError!File {
+    if (path.len == 0) return FatError.file_not_found;
+
+    var current_dir = fs.openRootDir();
+    var remaining_path = path;
+
+    // Skip leading slash
+    if (remaining_path[0] == '/') {
+        remaining_path = remaining_path[1..];
+    }
+
+    // Navigate through path components
+    while (remaining_path.len > 0) {
+        // Find next path separator
+        var component_end: usize = 0;
+        while (component_end < remaining_path.len and remaining_path[component_end] != '/') {
+            component_end += 1;
+        }
+
+        const component = remaining_path[0..component_end];
+        if (component.len == 0) break;
+
+        // Find entry in current directory
+        current_dir.rewind();
+        const entry = findEntry(&current_dir, component) catch return FatError.io_error;
+        if (entry == null) return FatError.file_not_found;
+
+        // Move past this component
+        if (component_end < remaining_path.len) {
+            remaining_path = remaining_path[component_end + 1 ..];
+        } else {
+            remaining_path = remaining_path[remaining_path.len..];
+        }
+
+        // If there's more path, this must be a directory
+        if (remaining_path.len > 0) {
+            if (!entry.?.isDirectory()) {
+                return FatError.file_not_found;
+            }
+            // Enter directory
+            current_dir = Directory{
+                .fs = fs,
+                .first_cluster = entry.?.getCluster(),
+                .current_cluster = entry.?.getCluster(),
+                .position = 0,
+            };
+        } else {
+            // This is the final component - must be a file
+            if (!entry.?.isFile()) {
+                return FatError.not_a_file;
+            }
+            return File{
+                .fs = fs,
+                .first_cluster = entry.?.getCluster(),
+                .current_cluster = entry.?.getCluster(),
+                .file_size = entry.?.file_size,
+                .position = 0,
+            };
+        }
+    }
+
+    return FatError.file_not_found;
+}
+
+/// Find a directory entry by name
+fn findEntry(dir: *Directory, name: []const u8) hal.HalError!?DirEntry {
+    while (try dir.readEntry()) |entry| {
+        // Convert 8.3 name to comparable format
+        var entry_name: [12]u8 = undefined;
+        var entry_name_len: usize = 0;
+
+        // Copy filename part (first 8 chars, trimmed)
+        var i: usize = 0;
+        while (i < 8 and entry.name[i] != ' ') : (i += 1) {
+            entry_name[entry_name_len] = entry.name[i];
+            entry_name_len += 1;
+        }
+
+        // Add extension if present
+        if (entry.name[8] != ' ') {
+            entry_name[entry_name_len] = '.';
+            entry_name_len += 1;
+            i = 8;
+            while (i < 11 and entry.name[i] != ' ') : (i += 1) {
+                entry_name[entry_name_len] = entry.name[i];
+                entry_name_len += 1;
+            }
+        }
+
+        // Case-insensitive compare
+        if (caseInsensitiveEqual(entry_name[0..entry_name_len], name)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+/// Case-insensitive string comparison
+fn caseInsensitiveEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        const la = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
+        const lb = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
+        if (la != lb) return false;
+    }
+    return true;
+}
+
+// ============================================================
 // Tests
 // ============================================================
 

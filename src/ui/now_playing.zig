@@ -81,6 +81,14 @@ pub const NowPlayingState = struct {
             self.total_time_ms = info.duration_ms;
         }
 
+        // Update metadata from loaded track
+        if (audio.hasLoadedTrack()) {
+            const track_info = audio.getLoadedTrackInfo();
+            self.metadata.title = track_info.getTitle();
+            self.metadata.artist = track_info.getArtist();
+            self.metadata.album = track_info.getAlbum();
+        }
+
         const vol = audio.getVolume();
         // Convert dB (-89 to +6) to percentage (0-100)
         const db = @divFloor(vol.left + vol.right, 2);

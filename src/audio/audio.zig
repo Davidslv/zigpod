@@ -28,6 +28,9 @@ pub const dsp = @import("dsp.zig");
 // Export audio hardware (DMA-based output)
 pub const audio_hw = @import("audio_hw.zig");
 
+// Import FAT32 for file reading
+const fat32 = @import("../drivers/storage/fat32.zig");
+
 // ============================================================
 // Audio Constants
 // ============================================================
@@ -167,6 +170,90 @@ var next_track_callback: ?NextTrackCallback = null;
 var gapless_enabled: bool = true;
 var next_track_requested: bool = false; // Prevent duplicate requests
 
+// ============================================================
+// File Loading State
+// ============================================================
+
+/// Maximum file size we can load (2MB - reasonable for embedded)
+pub const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
+
+/// File buffer for current track
+var file_buffer: [MAX_FILE_SIZE]u8 = undefined;
+var file_buffer_len: usize = 0;
+
+/// Current decoder state
+var current_decoder: CurrentDecoder = .{ .none = {} };
+
+pub const CurrentDecoder = union(enum) {
+    none: void,
+    wav: decoders.wav.WavDecoder,
+    // Future: flac, mp3, etc.
+};
+
+/// Track metadata from loaded file
+pub const LoadedTrackInfo = struct {
+    title: [64]u8 = [_]u8{0} ** 64,
+    title_len: u8 = 0,
+    artist: [64]u8 = [_]u8{0} ** 64,
+    artist_len: u8 = 0,
+    album: [64]u8 = [_]u8{0} ** 64,
+    album_len: u8 = 0,
+    path: [256]u8 = [_]u8{0} ** 256,
+    path_len: u16 = 0,
+
+    pub fn getTitle(self: *const LoadedTrackInfo) []const u8 {
+        if (self.title_len > 0) return self.title[0..self.title_len];
+        // Fall back to filename from path
+        return self.getFilename();
+    }
+
+    pub fn getArtist(self: *const LoadedTrackInfo) []const u8 {
+        if (self.artist_len > 0) return self.artist[0..self.artist_len];
+        return "Unknown Artist";
+    }
+
+    pub fn getAlbum(self: *const LoadedTrackInfo) []const u8 {
+        if (self.album_len > 0) return self.album[0..self.album_len];
+        return "Unknown Album";
+    }
+
+    pub fn getFilename(self: *const LoadedTrackInfo) []const u8 {
+        const path = self.path[0..self.path_len];
+        // Find last '/'
+        var i: usize = self.path_len;
+        while (i > 0) : (i -= 1) {
+            if (path[i - 1] == '/') break;
+        }
+        return path[i..self.path_len];
+    }
+
+    pub fn setTitle(self: *LoadedTrackInfo, title: []const u8) void {
+        const len = @min(title.len, self.title.len);
+        @memcpy(self.title[0..len], title[0..len]);
+        self.title_len = @intCast(len);
+    }
+
+    pub fn setArtist(self: *LoadedTrackInfo, artist: []const u8) void {
+        const len = @min(artist.len, self.artist.len);
+        @memcpy(self.artist[0..len], artist[0..len]);
+        self.artist_len = @intCast(len);
+    }
+
+    pub fn setAlbum(self: *LoadedTrackInfo, album: []const u8) void {
+        const len = @min(album.len, self.album.len);
+        @memcpy(self.album[0..len], album[0..len]);
+        self.album_len = @intCast(len);
+    }
+
+    pub fn setPath(self: *LoadedTrackInfo, path: []const u8) void {
+        const len = @min(path.len, self.path.len);
+        @memcpy(self.path[0..len], path[0..len]);
+        self.path_len = @intCast(len);
+    }
+};
+
+var loaded_track_info: LoadedTrackInfo = .{};
+
 // Legacy compatibility - these now reference the active slot
 fn current_track() ?TrackInfo {
     return slots[active_slot].track_info;
@@ -218,6 +305,125 @@ pub fn shutdown() void {
 /// Check if audio engine is initialized
 pub fn isInitialized() bool {
     return initialized;
+}
+
+// ============================================================
+// File Loading
+// ============================================================
+
+pub const LoadError = error{
+    FileNotFound,
+    FileTooLarge,
+    ReadError,
+    UnsupportedFormat,
+    DecoderError,
+    NotInitialized,
+};
+
+/// Load and play an audio file from the filesystem
+/// This is the main entry point for playing a file from the UI
+pub fn loadFile(path: []const u8) LoadError!void {
+    if (!initialized) return LoadError.NotInitialized;
+
+    // Stop any current playback
+    stop();
+
+    // Store path in track info
+    loaded_track_info = .{};
+    loaded_track_info.setPath(path);
+
+    // Read file from FAT32
+    file_buffer_len = fat32.readFile(path, &file_buffer) catch |err| {
+        return switch (err) {
+            fat32.FatError.file_not_found => LoadError.FileNotFound,
+            else => LoadError.ReadError,
+        };
+    };
+
+    if (file_buffer_len == 0) return LoadError.ReadError;
+    if (file_buffer_len > MAX_FILE_SIZE) return LoadError.FileTooLarge;
+
+    // Detect format and initialize decoder
+    const format = decoders.detectFormat(file_buffer[0..file_buffer_len]);
+
+    switch (format) {
+        .wav => {
+            var wav_decoder = decoders.wav.WavDecoder.init(file_buffer[0..file_buffer_len]) catch {
+                return LoadError.DecoderError;
+            };
+            current_decoder = .{ .wav = wav_decoder };
+
+            // Extract title from filename (remove extension)
+            const filename = loaded_track_info.getFilename();
+            if (filename.len > 4) {
+                loaded_track_info.setTitle(filename[0 .. filename.len - 4]);
+            } else {
+                loaded_track_info.setTitle(filename);
+            }
+
+            // Start playback with decoder callback
+            const track_info = wav_decoder.getTrackInfo();
+            play(wavDecodeCallback, track_info) catch {
+                return LoadError.DecoderError;
+            };
+        },
+        .flac, .mp3, .aiff, .aac, .m4a => {
+            // TODO: Implement other decoders
+            return LoadError.UnsupportedFormat;
+        },
+        .unknown => return LoadError.UnsupportedFormat,
+    }
+}
+
+/// WAV decoder callback for audio engine
+fn wavDecodeCallback(output: []i16) usize {
+    switch (current_decoder) {
+        .wav => |*decoder| {
+            return decoder.decode(output);
+        },
+        .none => return 0,
+    }
+}
+
+/// Get current loaded track metadata
+pub fn getLoadedTrackInfo() *const LoadedTrackInfo {
+    return &loaded_track_info;
+}
+
+/// Check if a file is loaded and ready
+pub fn hasLoadedTrack() bool {
+    return current_decoder != .none;
+}
+
+/// Restart current track from beginning
+pub fn restartTrack() void {
+    switch (current_decoder) {
+        .wav => |*decoder| {
+            decoder.seek(0);
+            slots[active_slot].position = 0;
+            slots[active_slot].buffer.clear();
+        },
+        .none => {},
+    }
+}
+
+/// Skip to next track (requires playlist, for now just stops)
+pub fn nextTrack() void {
+    // For now, stop playback - full implementation needs playlist
+    stop();
+}
+
+/// Go to previous track or restart current
+/// Restarts if more than 3 seconds into track, otherwise would go to previous
+pub fn prevTrack() void {
+    const position_ms = getPositionMs();
+    if (position_ms > 3000) {
+        // More than 3 seconds in - restart current track
+        restartTrack();
+    } else {
+        // Less than 3 seconds - for now just restart (needs playlist for prev)
+        restartTrack();
+    }
 }
 
 // ============================================================

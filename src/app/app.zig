@@ -12,6 +12,7 @@ const clickwheel = @import("../drivers/input/clickwheel.zig");
 const power = @import("../drivers/power.zig");
 const now_playing = @import("../ui/now_playing.zig");
 const file_browser = @import("../ui/file_browser.zig");
+const music_browser = @import("../ui/music_browser.zig");
 const settings_ui = @import("../ui/settings.zig");
 
 // ============================================================
@@ -44,6 +45,8 @@ pub const AppState = struct {
     // Screen-specific state
     main_menu: ui.Menu = undefined,
     file_browser: file_browser.FileBrowser = undefined,
+    music_browser_state: music_browser.MusicBrowser = undefined,
+    settings_browser_state: settings_ui.SettingsBrowser = undefined,
     now_playing_state: now_playing.NowPlayingState = .{},
 
     // Navigation stack (for back button)
@@ -106,6 +109,12 @@ pub fn init() void {
     // Initialize file browser
     app_state.file_browser = file_browser.FileBrowser.init();
 
+    // Initialize music browser
+    app_state.music_browser_state = music_browser.MusicBrowser.init();
+
+    // Initialize settings browser
+    app_state.settings_browser_state = settings_ui.SettingsBrowser.init();
+
     // Set initial screen
     app_state.current_screen = .main_menu;
     app_state.needs_redraw = true;
@@ -161,8 +170,22 @@ pub fn update() void {
 // ============================================================
 
 fn handleInput(event: clickwheel.InputEvent) void {
+    // Global PLAY button shortcut - jump to Now Playing from anywhere
+    // (except when already on Now Playing screen)
+    if (app_state.current_screen != .now_playing) {
+        if (event.buttonPressed(clickwheel.Button.PLAY)) {
+            // If something is playing/paused, go to Now Playing
+            if (audio.hasLoadedTrack()) {
+                app_state.pushScreen(.now_playing);
+                app_state.needs_redraw = true;
+                return;
+            }
+        }
+    }
+
     switch (app_state.current_screen) {
         .main_menu => handleMainMenuInput(event),
+        .music => handleMusicBrowserInput(event),
         .file_browser => handleFileBrowserInput(event),
         .now_playing => handleNowPlayingInput(event),
         .settings => handleSettingsInput(event),
@@ -192,6 +215,36 @@ fn handleMainMenuInput(event: clickwheel.InputEvent) void {
     app_state.needs_redraw = true;
 }
 
+fn handleMusicBrowserInput(event: clickwheel.InputEvent) void {
+    const action = music_browser.handleInput(
+        &app_state.music_browser_state,
+        event.buttons,
+        event.wheel_delta,
+    );
+
+    switch (action) {
+        .exit_browser => app_state.popScreen(),
+        .play_track => {
+            // Update now playing metadata
+            const track_info = audio.getLoadedTrackInfo();
+            app_state.now_playing_state.metadata.title = track_info.getTitle();
+            app_state.now_playing_state.metadata.artist = track_info.getArtist();
+            app_state.now_playing_state.metadata.album = track_info.getAlbum();
+            app_state.pushScreen(.now_playing);
+        },
+        .play_error => {
+            showMessage("Error", "Could not play track");
+        },
+        .shuffle_all => {
+            // TODO: Implement shuffle all
+            showMessage("Shuffle", "Coming soon");
+        },
+        .none => {},
+    }
+
+    app_state.needs_redraw = true;
+}
+
 fn handleFileBrowserInput(event: clickwheel.InputEvent) void {
     const action = file_browser.handleInput(
         &app_state.file_browser,
@@ -201,8 +254,33 @@ fn handleFileBrowserInput(event: clickwheel.InputEvent) void {
 
     switch (action) {
         .play_file => {
-            // TODO: Load and play the selected file
-            app_state.pushScreen(.now_playing);
+            // Get the full path of the selected file
+            var path_buffer: [256]u8 = undefined;
+            if (app_state.file_browser.getSelectedPath(&path_buffer)) |path| {
+                // Load and play the file
+                audio.loadFile(path) catch |err| {
+                    // Show error message
+                    const msg = switch (err) {
+                        audio.LoadError.FileNotFound => "File not found",
+                        audio.LoadError.UnsupportedFormat => "Unsupported format",
+                        audio.LoadError.FileTooLarge => "File too large",
+                        audio.LoadError.DecoderError => "Decoder error",
+                        audio.LoadError.NotInitialized => "Audio not ready",
+                        else => "Load failed",
+                    };
+                    showMessage("Error", msg);
+                    return;
+                };
+
+                // Update now playing metadata from loaded track
+                const track_info = audio.getLoadedTrackInfo();
+                app_state.now_playing_state.metadata.title = track_info.getTitle();
+                app_state.now_playing_state.metadata.artist = track_info.getArtist();
+                app_state.now_playing_state.metadata.album = track_info.getAlbum();
+
+                // Switch to now playing screen
+                app_state.pushScreen(.now_playing);
+            }
         },
         .back => app_state.popScreen(),
         else => {},
@@ -221,15 +299,18 @@ fn handleNowPlayingInput(event: clickwheel.InputEvent) void {
     switch (action) {
         .toggle_play => audio.togglePause(),
         .next_track => {
-            // TODO: Skip to next track
+            audio.nextTrack();
         },
         .prev_track => {
-            // TODO: Skip to previous track or restart current
+            audio.prevTrack();
         },
         .volume_up, .volume_down => {
             // Volume is already adjusted in handleInput
             const vol_db: i16 = @as(i16, @intCast(app_state.now_playing_state.volume)) - 50;
             audio.setVolumeMono(vol_db) catch {};
+            // Show volume overlay
+            const timestamp: u32 = @intCast(hal.getTicksUs() / 1000);
+            ui.getOverlay().showVolume(app_state.now_playing_state.volume, timestamp);
         },
         .open_menu => app_state.popScreen(),
         .back => app_state.popScreen(),
@@ -240,10 +321,21 @@ fn handleNowPlayingInput(event: clickwheel.InputEvent) void {
 }
 
 fn handleSettingsInput(event: clickwheel.InputEvent) void {
-    // Use back button to go back
-    if (event.buttonPressed(clickwheel.Button.MENU)) {
-        app_state.popScreen();
+    const action = settings_ui.handleSettingsBrowserInput(
+        &app_state.settings_browser_state,
+        event.buttons,
+        event.wheel_delta,
+    );
+
+    switch (action) {
+        .exit => app_state.popScreen(),
+        .show_about => {
+            app_state.settings_browser_state.category = .about;
+            app_state.pushScreen(.about);
+        },
+        .none => {},
     }
+
     app_state.needs_redraw = true;
 }
 
@@ -270,15 +362,20 @@ fn draw() void {
     switch (app_state.current_screen) {
         .boot => drawBootScreen(),
         .main_menu => ui.drawMenu(&app_state.main_menu),
+        .music => music_browser.draw(&app_state.music_browser_state),
         .file_browser => file_browser.draw(&app_state.file_browser),
         .now_playing => now_playing.draw(&app_state.now_playing_state),
-        .settings => drawSettingsScreen(),
+        .settings => settings_ui.drawSettingsBrowser(&app_state.settings_browser_state),
         .about => settings_ui.drawAboutScreen(),
         else => drawPlaceholder(),
     }
 
     // Draw battery indicator in header
     drawBatteryIndicator();
+
+    // Draw overlay (volume, battery warning, etc.) on top of all screens
+    const timestamp: u32 = @intCast(hal.getTicksUs() / 1000);
+    ui.drawOverlay(timestamp);
 
     lcd.update() catch {};
 }
@@ -343,15 +440,27 @@ fn drawBatteryIndicator() void {
 
 /// Play a file from the file browser
 pub fn playFile(path: []const u8) !void {
-    _ = path;
-    // TODO: Implement file loading and playback
-    // 1. Read file header to detect format
-    // 2. Initialize appropriate decoder
-    // 3. Get track info
-    // 4. Start playback
-    // 5. Switch to Now Playing screen
+    // Load and play the file
+    audio.loadFile(path) catch |err| {
+        const msg = switch (err) {
+            audio.LoadError.FileNotFound => "File not found",
+            audio.LoadError.UnsupportedFormat => "Unsupported format",
+            audio.LoadError.FileTooLarge => "File too large",
+            audio.LoadError.DecoderError => "Decoder error",
+            audio.LoadError.NotInitialized => "Audio not ready",
+            else => "Load failed",
+        };
+        showMessage("Error", msg);
+        return err;
+    };
 
-    app_state.now_playing_state.metadata.title = "Loading...";
+    // Update now playing metadata from loaded track
+    const track_info = audio.getLoadedTrackInfo();
+    app_state.now_playing_state.metadata.title = track_info.getTitle();
+    app_state.now_playing_state.metadata.artist = track_info.getArtist();
+    app_state.now_playing_state.metadata.album = track_info.getAlbum();
+
+    // Switch to Now Playing screen
     app_state.goToScreen(.now_playing);
 }
 
