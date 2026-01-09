@@ -163,11 +163,91 @@ fn showLowBatteryWarning() void {
 }
 
 // ============================================================
+// Frame Rate Limiting
+// ============================================================
+
+/// Frame rate limiter with idle detection for power efficiency
+const FrameLimiter = struct {
+    const TARGET_FPS: u32 = 60;
+    const FRAME_TIME_US: u64 = 1_000_000 / TARGET_FPS; // ~16,667us per frame
+    const IDLE_FRAME_TIME_US: u64 = 50_000; // 50ms when idle (20fps)
+    const IDLE_THRESHOLD_FRAMES: u8 = 30; // Frames without activity before entering idle
+
+    frame_start_us: u64 = 0,
+    idle_frame_count: u8 = 0,
+    is_idle: bool = false,
+    last_needs_redraw: bool = true,
+
+    /// Start frame timing
+    pub fn startFrame(self: *FrameLimiter) void {
+        self.frame_start_us = kernel.timer.getTimeUs();
+    }
+
+    /// End frame and sleep for remaining time
+    /// Returns true if frame was processed in time
+    pub fn endFrame(self: *FrameLimiter, had_input: bool, needs_redraw: bool, is_playing: bool) bool {
+        // Update idle state
+        const has_activity = had_input or needs_redraw or is_playing or self.last_needs_redraw;
+        self.last_needs_redraw = needs_redraw;
+
+        if (has_activity) {
+            self.idle_frame_count = 0;
+            if (self.is_idle) {
+                self.is_idle = false;
+                // Wake from idle - could notify power management
+            }
+        } else {
+            if (self.idle_frame_count < IDLE_THRESHOLD_FRAMES) {
+                self.idle_frame_count += 1;
+            } else if (!self.is_idle) {
+                self.is_idle = true;
+                // Enter idle - could notify power management
+            }
+        }
+
+        // Calculate elapsed time
+        const elapsed_us = kernel.timer.elapsedUs(self.frame_start_us);
+
+        // Determine target frame time based on idle state
+        const target_us = if (self.is_idle) IDLE_FRAME_TIME_US else FRAME_TIME_US;
+
+        // Sleep for remaining time
+        if (elapsed_us < target_us) {
+            const sleep_us = target_us - elapsed_us;
+            // Use delayUs for sub-millisecond precision, delayMs for longer sleeps
+            if (sleep_us >= 1000) {
+                kernel.timer.delayMs(@intCast(sleep_us / 1000));
+                // Sleep remaining sub-millisecond portion
+                const remaining_us = sleep_us % 1000;
+                if (remaining_us > 100) {
+                    kernel.timer.delayUs(@intCast(remaining_us));
+                }
+            } else if (sleep_us > 100) {
+                kernel.timer.delayUs(@intCast(sleep_us));
+            }
+            return true; // Frame completed in time
+        }
+
+        return false; // Frame took longer than target
+    }
+
+    /// Check if currently in idle state
+    pub fn isIdle(self: *const FrameLimiter) bool {
+        return self.is_idle;
+    }
+};
+
+var frame_limiter = FrameLimiter{};
+
+// ============================================================
 // Main Loop
 // ============================================================
 
 fn mainLoop() void {
     while (system_state == .running) {
+        // Start frame timing
+        frame_limiter.startFrame();
+
         // Update application
         app.update();
 
@@ -176,8 +256,14 @@ fn mainLoop() void {
             break;
         }
 
-        // Yield to other tasks
-        kernel.timer.delayMs(16); // ~60 FPS
+        // Get state for frame limiter
+        const app_state = app.getState();
+        const had_input = false; // Input is handled in app.update(), could track this
+        const needs_redraw = app_state.needs_redraw;
+        const is_playing = audio.isPlaying();
+
+        // End frame with proper sleep timing
+        _ = frame_limiter.endFrame(had_input, needs_redraw, is_playing);
     }
 }
 
@@ -275,4 +361,68 @@ pub fn requestShutdown() void {
 test "system state transitions" {
     // Initial state should be booting
     try std.testing.expectEqual(SystemState.booting, system_state);
+}
+
+test "frame limiter idle detection" {
+    var limiter = FrameLimiter{};
+    // Clear initial last_needs_redraw state for clean test
+    limiter.last_needs_redraw = false;
+
+    // Initially not idle
+    try std.testing.expect(!limiter.isIdle());
+
+    // Simulate frames without activity
+    var i: u8 = 0;
+    while (i < FrameLimiter.IDLE_THRESHOLD_FRAMES + 5) : (i += 1) {
+        limiter.frame_start_us = 0;
+        _ = limiter.endFrame(false, false, false);
+    }
+
+    // Should now be idle
+    try std.testing.expect(limiter.isIdle());
+
+    // Activity should wake from idle
+    limiter.frame_start_us = 0;
+    _ = limiter.endFrame(true, false, false);
+    try std.testing.expect(!limiter.isIdle());
+    try std.testing.expectEqual(@as(u8, 0), limiter.idle_frame_count);
+}
+
+test "frame limiter activity resets idle count" {
+    var limiter = FrameLimiter{};
+    // Clear initial last_needs_redraw state
+    limiter.last_needs_redraw = false;
+
+    // Build up some idle frames
+    var i: u8 = 0;
+    while (i < 10) : (i += 1) {
+        limiter.frame_start_us = 0;
+        _ = limiter.endFrame(false, false, false);
+    }
+    try std.testing.expectEqual(@as(u8, 10), limiter.idle_frame_count);
+
+    // Input resets
+    limiter.frame_start_us = 0;
+    _ = limiter.endFrame(true, false, false);
+    try std.testing.expectEqual(@as(u8, 0), limiter.idle_frame_count);
+
+    // Redraw resets
+    i = 0;
+    while (i < 5) : (i += 1) {
+        limiter.frame_start_us = 0;
+        _ = limiter.endFrame(false, false, false);
+    }
+    limiter.frame_start_us = 0;
+    _ = limiter.endFrame(false, true, false);
+    try std.testing.expectEqual(@as(u8, 0), limiter.idle_frame_count);
+
+    // Playing audio resets
+    i = 0;
+    while (i < 5) : (i += 1) {
+        limiter.frame_start_us = 0;
+        _ = limiter.endFrame(false, false, false);
+    }
+    limiter.frame_start_us = 0;
+    _ = limiter.endFrame(false, false, true);
+    try std.testing.expectEqual(@as(u8, 0), limiter.idle_frame_count);
 }
