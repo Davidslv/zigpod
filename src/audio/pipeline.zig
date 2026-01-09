@@ -110,133 +110,14 @@ pub const AudioPipeline = struct {
     output_fill: usize,
 
     /// Union of possible decoder states
+    /// Now uses actual decoder implementations instead of placeholder stubs
     pub const DecoderState = union(enum) {
         none: void,
         wav: decoders.wav.WavDecoder,
-        flac: FlacDecoderWrapper,
-        mp3: Mp3DecoderWrapper,
-        aiff: AiffDecoderWrapper,
-        aac: AacDecoderWrapper,
-    };
-
-    /// Wrapper for FLAC decoder (placeholder for full implementation)
-    pub const FlacDecoderWrapper = struct {
-        data: []const u8,
-        position: usize,
-
-        pub fn init(data: []const u8) !FlacDecoderWrapper {
-            if (!decoders.flac.isFlacFile(data)) return error.InvalidFormat;
-            return FlacDecoderWrapper{ .data = data, .position = 0 };
-        }
-
-        pub fn decode(self: *FlacDecoderWrapper, output: []i16) usize {
-            _ = self;
-            _ = output;
-            // TODO: Implement FLAC decoding
-            return 0;
-        }
-
-        pub fn getTrackInfo(self: *const FlacDecoderWrapper) audio.TrackInfo {
-            _ = self;
-            return audio.TrackInfo{
-                .sample_rate = 44100,
-                .channels = 2,
-                .bits_per_sample = 16,
-                .total_samples = 0,
-                .duration_ms = 0,
-                .format = .s16_le,
-            };
-        }
-    };
-
-    /// Wrapper for MP3 decoder
-    pub const Mp3DecoderWrapper = struct {
-        data: []const u8,
-        position: usize,
-
-        pub fn init(data: []const u8) !Mp3DecoderWrapper {
-            if (!decoders.mp3.isMp3File(data)) return error.InvalidFormat;
-            return Mp3DecoderWrapper{ .data = data, .position = 0 };
-        }
-
-        pub fn decode(self: *Mp3DecoderWrapper, output: []i16) usize {
-            _ = self;
-            _ = output;
-            // TODO: Implement MP3 decoding
-            return 0;
-        }
-
-        pub fn getTrackInfo(self: *const Mp3DecoderWrapper) audio.TrackInfo {
-            _ = self;
-            return audio.TrackInfo{
-                .sample_rate = 44100,
-                .channels = 2,
-                .bits_per_sample = 16,
-                .total_samples = 0,
-                .duration_ms = 0,
-                .format = .s16_le,
-            };
-        }
-    };
-
-    /// Wrapper for AIFF decoder
-    pub const AiffDecoderWrapper = struct {
-        data: []const u8,
-        position: usize,
-
-        pub fn init(data: []const u8) !AiffDecoderWrapper {
-            if (!decoders.aiff.isAiffFile(data)) return error.InvalidFormat;
-            return AiffDecoderWrapper{ .data = data, .position = 0 };
-        }
-
-        pub fn decode(self: *AiffDecoderWrapper, output: []i16) usize {
-            _ = self;
-            _ = output;
-            // TODO: Implement AIFF decoding
-            return 0;
-        }
-
-        pub fn getTrackInfo(self: *const AiffDecoderWrapper) audio.TrackInfo {
-            _ = self;
-            return audio.TrackInfo{
-                .sample_rate = 44100,
-                .channels = 2,
-                .bits_per_sample = 16,
-                .total_samples = 0,
-                .duration_ms = 0,
-                .format = .s16_le,
-            };
-        }
-    };
-
-    /// Wrapper for AAC decoder
-    pub const AacDecoderWrapper = struct {
-        data: []const u8,
-        position: usize,
-
-        pub fn init(data: []const u8) !AacDecoderWrapper {
-            if (!decoders.aac.isAacFile(data)) return error.InvalidFormat;
-            return AacDecoderWrapper{ .data = data, .position = 0 };
-        }
-
-        pub fn decode(self: *AacDecoderWrapper, output: []i16) usize {
-            _ = self;
-            _ = output;
-            // TODO: Implement AAC decoding
-            return 0;
-        }
-
-        pub fn getTrackInfo(self: *const AacDecoderWrapper) audio.TrackInfo {
-            _ = self;
-            return audio.TrackInfo{
-                .sample_rate = 44100,
-                .channels = 2,
-                .bits_per_sample = 16,
-                .total_samples = 0,
-                .duration_ms = 0,
-                .format = .s16_le,
-            };
-        }
+        flac: decoders.flac.FlacDecoder,
+        mp3: decoders.mp3.Mp3Decoder,
+        aiff: decoders.aiff.AiffDecoder,
+        aac: decoders.aac.AacDecoder,
     };
 
     /// Initialize pipeline with default configuration
@@ -269,6 +150,7 @@ pub const AudioPipeline = struct {
     }
 
     /// Load audio data and auto-detect format
+    /// Now properly initializes actual decoder implementations
     pub fn load(self: *AudioPipeline, data: []const u8) !void {
         // Stop any current playback
         self.stop();
@@ -276,7 +158,7 @@ pub const AudioPipeline = struct {
         // Detect format
         self.decoder_type = decoders.detectFormat(data);
 
-        // Initialize appropriate decoder
+        // Initialize appropriate decoder using actual implementations
         switch (self.decoder_type) {
             .wav => {
                 const wav_decoder = try decoders.wav.WavDecoder.init(data);
@@ -286,28 +168,28 @@ pub const AudioPipeline = struct {
                 self.input_bits = info.bits_per_sample;
             },
             .flac => {
-                const flac_decoder = try FlacDecoderWrapper.init(data);
+                const flac_decoder = try decoders.flac.FlacDecoder.init(data);
                 self.decoder = .{ .flac = flac_decoder };
                 const info = flac_decoder.getTrackInfo();
                 self.input_sample_rate = info.sample_rate;
                 self.input_bits = info.bits_per_sample;
             },
             .mp3 => {
-                const mp3_decoder = try Mp3DecoderWrapper.init(data);
+                const mp3_decoder = try decoders.mp3.Mp3Decoder.init(data);
                 self.decoder = .{ .mp3 = mp3_decoder };
                 const info = mp3_decoder.getTrackInfo();
                 self.input_sample_rate = info.sample_rate;
                 self.input_bits = info.bits_per_sample;
             },
             .aiff => {
-                const aiff_decoder = try AiffDecoderWrapper.init(data);
+                const aiff_decoder = try decoders.aiff.AiffDecoder.init(data);
                 self.decoder = .{ .aiff = aiff_decoder };
                 const info = aiff_decoder.getTrackInfo();
                 self.input_sample_rate = info.sample_rate;
                 self.input_bits = info.bits_per_sample;
             },
             .aac, .m4a => {
-                const aac_decoder = try AacDecoderWrapper.init(data);
+                const aac_decoder = try decoders.aac.AacDecoder.init(data);
                 self.decoder = .{ .aac = aac_decoder };
                 const info = aac_decoder.getTrackInfo();
                 self.input_sample_rate = info.sample_rate;
@@ -396,11 +278,12 @@ pub const AudioPipeline = struct {
     }
 
     /// Decode samples from the current source
+    /// Handles different return types from decoders (FLAC returns error union)
     fn decodeFromSource(self: *AudioPipeline, output: []i16) usize {
         return switch (self.decoder) {
             .none => 0,
             .wav => |*d| d.decode(output),
-            .flac => |*d| d.decode(output),
+            .flac => |*d| d.decode(output) catch 0, // FLAC returns error union
             .mp3 => |*d| d.decode(output),
             .aiff => |*d| d.decode(output),
             .aac => |*d| d.decode(output),
