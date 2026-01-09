@@ -958,6 +958,208 @@ pub fn resetToDefaults() void {
     current_settings = Settings{};
     current_settings.applyDisplaySettings();
     current_settings.applyAudioSettings();
+    saveSettings(); // Persist the reset
+}
+
+// ============================================================
+// Settings Persistence
+// ============================================================
+
+/// Settings file path on storage
+pub const SETTINGS_FILE_PATH = "/.zigpod/settings.bin";
+
+/// Settings file magic number for validation
+const SETTINGS_MAGIC: u32 = 0x5A504F44; // "ZPOD"
+
+/// Settings file version for forward compatibility
+const SETTINGS_VERSION: u8 = 1;
+
+/// Serialized settings structure (packed for storage)
+const SerializedSettings = extern struct {
+    magic: u32 = SETTINGS_MAGIC,
+    version: u8 = SETTINGS_VERSION,
+    _reserved: [3]u8 = [_]u8{0} ** 3,
+
+    // Display settings
+    brightness: u8,
+    backlight_timeout_lo: u8,
+    backlight_timeout_hi: u8,
+    theme_index: u8,
+
+    // Audio settings (volume is i16, split into two bytes)
+    volume_lo: u8,
+    volume_hi: u8,
+    bass: i8,
+    treble: i8,
+    bass_cutoff: u8,
+    treble_cutoff: u8,
+    channel_mix: u8,
+    _pad1: u8 = 0,
+
+    // Playback settings
+    shuffle: u8,
+    repeat: u8,
+    gapless: u8,
+    replay_gain: u8,
+
+    // System settings
+    sleep_timer_lo: u8,
+    sleep_timer_hi: u8,
+    hold_action: u8,
+    language: u8,
+
+    // Checksum for data integrity
+    checksum: u8,
+    _pad2: [3]u8 = [_]u8{0} ** 3,
+
+    /// Calculate checksum of settings data
+    fn calculateChecksum(self: *const SerializedSettings) u8 {
+        const bytes: [*]const u8 = @ptrCast(self);
+        var sum: u8 = 0;
+        // Sum all bytes except the checksum field itself
+        for (0..@offsetOf(SerializedSettings, "checksum")) |i| {
+            sum +%= bytes[i];
+        }
+        return sum;
+    }
+
+    /// Validate the serialized settings
+    fn isValid(self: *const SerializedSettings) bool {
+        if (self.magic != SETTINGS_MAGIC) return false;
+        if (self.version > SETTINGS_VERSION) return false;
+        if (self.checksum != self.calculateChecksum()) return false;
+        return true;
+    }
+};
+
+/// Convert Settings to serialized format
+fn serializeSettings(settings: *const Settings) SerializedSettings {
+    var s = SerializedSettings{
+        .brightness = settings.brightness,
+        .backlight_timeout_lo = @truncate(settings.backlight_timeout),
+        .backlight_timeout_hi = @truncate(settings.backlight_timeout >> 8),
+        .theme_index = settings.theme_index,
+
+        .volume_lo = @bitCast(@as(u8, @truncate(@as(u16, @bitCast(settings.volume))))),
+        .volume_hi = @bitCast(@as(u8, @truncate(@as(u16, @bitCast(settings.volume)) >> 8))),
+        .bass = settings.bass,
+        .treble = settings.treble,
+        .bass_cutoff = @intFromEnum(settings.bass_cutoff),
+        .treble_cutoff = @intFromEnum(settings.treble_cutoff),
+        .channel_mix = @intFromEnum(settings.channel_mix),
+
+        .shuffle = if (settings.shuffle) 1 else 0,
+        .repeat = @intFromEnum(settings.repeat),
+        .gapless = if (settings.gapless) 1 else 0,
+        .replay_gain = @intFromEnum(settings.replay_gain),
+
+        .sleep_timer_lo = @truncate(settings.sleep_timer),
+        .sleep_timer_hi = @truncate(settings.sleep_timer >> 8),
+        .hold_action = @intFromEnum(settings.hold_action),
+        .language = @intFromEnum(settings.language),
+
+        .checksum = 0,
+    };
+    s.checksum = s.calculateChecksum();
+    return s;
+}
+
+/// Convert serialized format back to Settings
+fn deserializeSettings(s: *const SerializedSettings) Settings {
+    return Settings{
+        .brightness = s.brightness,
+        .backlight_timeout = @as(u16, s.backlight_timeout_hi) << 8 | s.backlight_timeout_lo,
+        .theme_index = s.theme_index,
+
+        .volume = @bitCast(@as(u16, s.volume_hi) << 8 | s.volume_lo),
+        .bass = s.bass,
+        .treble = s.treble,
+        .bass_cutoff = @enumFromInt(s.bass_cutoff),
+        .treble_cutoff = @enumFromInt(s.treble_cutoff),
+        .channel_mix = @enumFromInt(s.channel_mix),
+
+        .shuffle = s.shuffle != 0,
+        .repeat = @enumFromInt(s.repeat),
+        .gapless = s.gapless != 0,
+        .replay_gain = @enumFromInt(s.replay_gain),
+
+        .sleep_timer = @as(u16, s.sleep_timer_hi) << 8 | s.sleep_timer_lo,
+        .hold_action = @enumFromInt(s.hold_action),
+        .language = @enumFromInt(s.language),
+    };
+}
+
+/// Storage interface for settings persistence
+/// TODO: Implement actual storage when FAT32 write support is added
+const SettingsStorage = struct {
+    /// Write settings to storage
+    fn write(data: []const u8) bool {
+        // TODO: Implement when FAT32 write support is available
+        // For now, settings are volatile (lost on power off)
+        _ = data;
+        return false;
+    }
+
+    /// Read settings from storage
+    fn read(buffer: []u8) ?usize {
+        // TODO: Implement when FAT32 read for config files is available
+        _ = buffer;
+        return null;
+    }
+};
+
+/// Save current settings to storage
+pub fn saveSettings() void {
+    const serialized = serializeSettings(&current_settings);
+    const bytes: [*]const u8 = @ptrCast(&serialized);
+    _ = SettingsStorage.write(bytes[0..@sizeOf(SerializedSettings)]);
+}
+
+/// Load settings from storage
+/// Returns true if settings were loaded successfully
+pub fn loadSettings() bool {
+    var buffer: [@sizeOf(SerializedSettings)]u8 = undefined;
+
+    const bytes_read = SettingsStorage.read(&buffer) orelse return false;
+    if (bytes_read != @sizeOf(SerializedSettings)) return false;
+
+    const serialized: *const SerializedSettings = @ptrCast(@alignCast(&buffer));
+    if (!serialized.isValid()) return false;
+
+    current_settings = deserializeSettings(serialized);
+    current_settings.applyDisplaySettings();
+    current_settings.applyAudioSettings();
+    return true;
+}
+
+/// Initialize settings - try to load from storage, fall back to defaults
+pub fn initSettings() void {
+    if (!loadSettings()) {
+        // Use defaults
+        current_settings = Settings{};
+    }
+    current_settings.applyDisplaySettings();
+    current_settings.applyAudioSettings();
+}
+
+/// Mark settings as dirty (needs save)
+/// Call this after any setting change
+var settings_dirty: bool = false;
+
+pub fn markDirty() void {
+    settings_dirty = true;
+}
+
+pub fn isDirty() bool {
+    return settings_dirty;
+}
+
+/// Save if dirty and clear the flag
+pub fn saveIfDirty() void {
+    if (settings_dirty) {
+        saveSettings();
+        settings_dirty = false;
+    }
 }
 
 // ============================================================
@@ -1020,4 +1222,85 @@ test "brightness clamping" {
     current_settings.brightness = 10;
     adjustBrightness(-10);
     try std.testing.expectEqual(@as(u8, 10), current_settings.brightness);
+}
+
+test "settings serialization roundtrip" {
+    // Create settings with non-default values
+    const original = Settings{
+        .brightness = 75,
+        .backlight_timeout = 45,
+        .theme_index = 1,
+        .volume = -20,
+        .bass = 6,
+        .treble = -3,
+        .bass_cutoff = .hz_130,
+        .treble_cutoff = .hz_8k,
+        .channel_mix = .mono,
+        .shuffle = true,
+        .repeat = .all,
+        .gapless = false,
+        .replay_gain = .album,
+        .sleep_timer = 60,
+        .hold_action = .pause,
+        .language = .french,
+    };
+
+    // Serialize
+    const serialized = serializeSettings(&original);
+
+    // Validate magic and checksum
+    try std.testing.expectEqual(SETTINGS_MAGIC, serialized.magic);
+    try std.testing.expectEqual(SETTINGS_VERSION, serialized.version);
+    try std.testing.expect(serialized.isValid());
+
+    // Deserialize
+    const restored = deserializeSettings(&serialized);
+
+    // Verify all fields match
+    try std.testing.expectEqual(original.brightness, restored.brightness);
+    try std.testing.expectEqual(original.backlight_timeout, restored.backlight_timeout);
+    try std.testing.expectEqual(original.theme_index, restored.theme_index);
+    try std.testing.expectEqual(original.volume, restored.volume);
+    try std.testing.expectEqual(original.bass, restored.bass);
+    try std.testing.expectEqual(original.treble, restored.treble);
+    try std.testing.expectEqual(original.bass_cutoff, restored.bass_cutoff);
+    try std.testing.expectEqual(original.treble_cutoff, restored.treble_cutoff);
+    try std.testing.expectEqual(original.channel_mix, restored.channel_mix);
+    try std.testing.expectEqual(original.shuffle, restored.shuffle);
+    try std.testing.expectEqual(original.repeat, restored.repeat);
+    try std.testing.expectEqual(original.gapless, restored.gapless);
+    try std.testing.expectEqual(original.replay_gain, restored.replay_gain);
+    try std.testing.expectEqual(original.sleep_timer, restored.sleep_timer);
+    try std.testing.expectEqual(original.hold_action, restored.hold_action);
+    try std.testing.expectEqual(original.language, restored.language);
+}
+
+test "settings checksum validation" {
+    const settings = Settings{};
+    var serialized = serializeSettings(&settings);
+
+    // Valid checksum
+    try std.testing.expect(serialized.isValid());
+
+    // Corrupt data - should fail validation
+    serialized.brightness = 50;
+    try std.testing.expect(!serialized.isValid());
+
+    // Fix checksum
+    serialized.checksum = serialized.calculateChecksum();
+    try std.testing.expect(serialized.isValid());
+}
+
+test "settings invalid magic" {
+    var serialized = serializeSettings(&Settings{});
+
+    // Corrupt magic
+    serialized.magic = 0x12345678;
+    try std.testing.expect(!serialized.isValid());
+}
+
+test "serialized settings size" {
+    // Ensure the serialized struct is a reasonable size
+    try std.testing.expect(@sizeOf(SerializedSettings) <= 64);
+    try std.testing.expect(@sizeOf(SerializedSettings) >= 24);
 }
