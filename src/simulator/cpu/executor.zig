@@ -519,18 +519,20 @@ fn executeBlockTransfer(bt: std.meta.TagPayload(Instruction, .block_transfer), r
     var cycles: u32 = 2;
 
     // Calculate start address based on addressing mode
+    // Use wrapping arithmetic to handle edge cases near address 0
     var addr: u32 = undefined;
+    const offset: u32 = reg_count * 4;
     if (bt.up) {
         if (bt.pre_index) {
-            addr = base + 4;
+            addr = base +% 4;
         } else {
             addr = base;
         }
     } else {
         if (bt.pre_index) {
-            addr = base - (reg_count * 4);
+            addr = base -% offset;
         } else {
-            addr = base - (reg_count * 4) + 4;
+            addr = base -% offset +% 4;
         }
     }
 

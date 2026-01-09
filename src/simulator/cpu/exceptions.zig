@@ -131,8 +131,9 @@ pub const ExceptionHandler = struct {
 
         // Calculate return address and save to LR
         // PC points to current instruction + 8 in ARM mode
+        // Use wrapping arithmetic to handle edge cases near address 0
         const pc = regs.getPC();
-        const lr = pc + 4 - exception.lrOffset();
+        const lr = (pc +% 4) -% exception.lrOffset();
         regs.setLR(lr);
 
         // Update CPSR
