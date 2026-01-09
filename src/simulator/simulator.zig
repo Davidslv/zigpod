@@ -314,9 +314,9 @@ pub const SimulatorState = struct {
         const y_scale = 10;
 
         // Build line buffer for efficient output
-        var line_buf: [82]u8 = undefined;
+        // Format: '|' + 80 pixels + '|' + '\n' = 83 bytes
+        var line_buf: [83]u8 = undefined;
         line_buf[0] = '|';
-        line_buf[81] = '\n';
 
         var y: usize = 0;
         while (y < 240) : (y += y_scale) {
@@ -328,6 +328,7 @@ pub const SimulatorState = struct {
                 buf_idx += 1;
             }
             line_buf[buf_idx] = '|';
+            line_buf[buf_idx + 1] = '\n';
             _ = stdout.write(line_buf[0 .. buf_idx + 2]) catch {};
         }
 
