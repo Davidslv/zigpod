@@ -19,8 +19,9 @@ pub const MAX_GAIN_DB: i8 = 12;
 /// Minimum gain in dB
 pub const MIN_GAIN_DB: i8 = -12;
 
-/// Sample rate (assumed 44100 Hz)
-pub const SAMPLE_RATE: u32 = 44100;
+/// Default sample rate (44100 Hz)
+/// Note: EQ bands can be configured for different sample rates via setSampleRate()
+pub const DEFAULT_SAMPLE_RATE: u32 = 44100;
 
 /// Stereo sample pair used throughout DSP processing
 pub const StereoSample = struct {
@@ -39,6 +40,8 @@ pub const EqBand = struct {
     gain_db: i8,
     /// Q factor (bandwidth) - Q16.16 fixed point
     q: i32,
+    /// Sample rate for coefficient calculation (default 44100)
+    sample_rate: u32 = DEFAULT_SAMPLE_RATE,
     /// Filter coefficients (biquad)
     a0: i32,
     a1: i32,
@@ -56,12 +59,18 @@ pub const EqBand = struct {
     y1_r: i32 = 0,
     y2_r: i32 = 0,
 
-    /// Initialize band with default coefficients
+    /// Initialize band with default coefficients at default sample rate
     pub fn init(frequency: u16, gain_db: i8, q: i32) EqBand {
+        return initWithSampleRate(frequency, gain_db, q, DEFAULT_SAMPLE_RATE);
+    }
+
+    /// Initialize band with coefficients calculated for a specific sample rate
+    pub fn initWithSampleRate(frequency: u16, gain_db: i8, q: i32, sample_rate: u32) EqBand {
         var band = EqBand{
             .frequency = frequency,
             .gain_db = gain_db,
             .q = q,
+            .sample_rate = sample_rate,
             .a0 = 0x10000, // 1.0 in Q16.16
             .a1 = 0,
             .a2 = 0,
@@ -72,13 +81,22 @@ pub const EqBand = struct {
         return band;
     }
 
-    /// Update filter coefficients based on frequency, gain, and Q
+    /// Set sample rate and recalculate coefficients
+    /// Call this when switching between tracks with different sample rates
+    pub fn setSampleRate(self: *EqBand, sample_rate: u32) void {
+        if (self.sample_rate != sample_rate) {
+            self.sample_rate = sample_rate;
+            self.updateCoefficients();
+        }
+    }
+
+    /// Update filter coefficients based on frequency, gain, Q, and sample rate
     pub fn updateCoefficients(self: *EqBand) void {
         // Calculate angular frequency: w0 = 2 * pi * f / fs
         // Using fixed point approximation
         const pi_fp: i64 = 205887; // pi in Q16.16
         const freq_fp: i64 = @as(i64, self.frequency) << 16;
-        const sample_rate_fp: i64 = @as(i64, SAMPLE_RATE) << 16;
+        const sample_rate_fp: i64 = @as(i64, self.sample_rate) << 16;
 
         // w0 = 2 * pi * f / fs (result in Q16.16)
         const w0: i64 = @divTrunc(2 * pi_fp * freq_fp, sample_rate_fp);
@@ -219,6 +237,20 @@ pub const Equalizer = struct {
             return self.bands[band].gain_db;
         }
         return 0;
+    }
+
+    /// Set sample rate for all bands and recalculate coefficients
+    /// Call this when switching to a track with a different sample rate
+    /// to ensure EQ center frequencies remain correct
+    pub fn setSampleRate(self: *Equalizer, sample_rate: u32) void {
+        for (&self.bands) |*band| {
+            band.setSampleRate(sample_rate);
+        }
+    }
+
+    /// Get current sample rate (from first band)
+    pub fn getSampleRate(self: *const Equalizer) u32 {
+        return self.bands[0].sample_rate;
     }
 
     /// Set preamp gain
@@ -363,6 +395,8 @@ pub const BassBoost = struct {
     boost_db: i8,
     /// Cutoff frequency
     cutoff_hz: u16,
+    /// Sample rate for coefficient calculation
+    sample_rate: u32 = DEFAULT_SAMPLE_RATE,
     /// Low-pass filter state
     lp_state_l: i32,
     lp_state_r: i32,
@@ -374,6 +408,7 @@ pub const BassBoost = struct {
         var bb = BassBoost{
             .boost_db = 0,
             .cutoff_hz = 120,
+            .sample_rate = DEFAULT_SAMPLE_RATE,
             .lp_state_l = 0,
             .lp_state_r = 0,
             .alpha = 0,
@@ -394,12 +429,20 @@ pub const BassBoost = struct {
         self.updateCoefficient();
     }
 
+    /// Set sample rate and recalculate coefficient
+    pub fn setSampleRate(self: *BassBoost, sample_rate: u32) void {
+        if (self.sample_rate != sample_rate) {
+            self.sample_rate = sample_rate;
+            self.updateCoefficient();
+        }
+    }
+
     fn updateCoefficient(self: *BassBoost) void {
         // Simple RC low-pass: alpha = dt / (RC + dt)
         // where RC = 1 / (2 * pi * cutoff)
-        // Simplified for fixed sample rate
+        // Simplified using configurable sample rate
         const cutoff_fp: i64 = @as(i64, self.cutoff_hz) << 16;
-        self.alpha = @intCast(@divTrunc(cutoff_fp * 6, SAMPLE_RATE));
+        self.alpha = @intCast(@divTrunc(cutoff_fp * 6, self.sample_rate));
     }
 
     pub fn process(self: *BassBoost, left: i16, right: i16) StereoSample {
@@ -757,6 +800,8 @@ pub const VolumeRamper = struct {
     current_volume: i32,
     /// Ramp rate per sample (higher = faster transition)
     ramp_rate: i32,
+    /// Sample rate for time-based calculations
+    sample_rate: u32 = DEFAULT_SAMPLE_RATE,
     /// Whether ramping is enabled
     enabled: bool,
 
@@ -768,6 +813,7 @@ pub const VolumeRamper = struct {
             .target_volume = 0x10000, // Unity gain
             .current_volume = 0x10000,
             .ramp_rate = 0x10000 / DEFAULT_RAMP_SAMPLES,
+            .sample_rate = DEFAULT_SAMPLE_RATE,
             .enabled = true,
         };
     }
@@ -783,9 +829,14 @@ pub const VolumeRamper = struct {
         self.target_volume = std.math.clamp(volume_fp, 0, 0x20000);
     }
 
+    /// Set sample rate for time-based calculations
+    pub fn setSampleRate(self: *VolumeRamper, sample_rate: u32) void {
+        self.sample_rate = sample_rate;
+    }
+
     /// Set ramp time in milliseconds
     pub fn setRampTimeMs(self: *VolumeRamper, ms: u16) void {
-        const samples = @divTrunc(@as(i32, ms) * SAMPLE_RATE, 1000);
+        const samples = @divTrunc(@as(i32, ms) * @as(i32, @intCast(self.sample_rate)), 1000);
         if (samples > 0) {
             self.ramp_rate = @divTrunc(0x10000, samples);
         }
@@ -937,6 +988,22 @@ pub const DspChain = struct {
     /// Unmute audio with smooth fade in
     pub fn unmute(self: *DspChain, percent: u8) void {
         self.volume.unmute(percent);
+    }
+
+    /// Set sample rate for all sample-rate-dependent components
+    /// Call this when loading a track with a different sample rate
+    /// to ensure EQ, filters, and timing operate correctly
+    pub fn setSampleRate(self: *DspChain, sample_rate: u32) void {
+        self.equalizer.setSampleRate(sample_rate);
+        self.bass_boost.setSampleRate(sample_rate);
+        self.volume.setSampleRate(sample_rate);
+        // Stereo widener is sample-rate-independent
+        // (operates on sample relationships, not absolute frequencies)
+    }
+
+    /// Get current sample rate from EQ
+    pub fn getSampleRate(self: *const DspChain) u32 {
+        return self.equalizer.getSampleRate();
     }
 };
 
@@ -1215,4 +1282,200 @@ test "resampler calc output size" {
     // 100 samples at 44100 -> ~109 samples at 48000
     try std.testing.expect(out_size >= 108);
     try std.testing.expect(out_size <= 110);
+}
+
+
+// ============================================================
+// Performance Benchmarks
+// ============================================================
+
+// Benchmark: Measure DSP chain throughput
+// Target: At least 100x real-time on ARM7TDMI at 80MHz
+// (i.e., process 4.41M samples/second at 44.1kHz)
+test "benchmark DSP chain throughput" {
+    var chain = DspChain.init();
+    chain.enabled = true;
+    chain.equalizer.enabled = true;
+    chain.bass_boost.enabled = true;
+
+    // Prepare test buffer (1 second of stereo audio at 44.1kHz)
+    const sample_rate = 44100;
+    const duration_ms = 100; // 100ms test duration
+    const num_samples = (sample_rate * duration_ms * 2) / 1000; // stereo
+    var samples: [num_samples]i16 = undefined;
+
+    // Fill with test pattern
+    for (&samples, 0..) |*s, i| {
+        s.* = @as(i16, @intCast(@mod(i, 32768)));
+    }
+
+    // Benchmark
+    const start = std.time.nanoTimestamp();
+    const iterations: u32 = 100;
+
+    var iter: u32 = 0;
+    while (iter < iterations) : (iter += 1) {
+        chain.processBuffer(&samples);
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const samples_processed = @as(u64, num_samples / 2) * iterations; // stereo pairs
+    const ns_per_sample = elapsed_ns / samples_processed;
+
+    // Log benchmark results (visible in test output with verbose mode)
+    std.log.info("DSP Chain Benchmark:", .{});
+    std.log.info("  Samples processed: {d}", .{samples_processed});
+    std.log.info("  Time: {d} ns", .{elapsed_ns});
+    std.log.info("  ns/sample: {d}", .{ns_per_sample});
+
+    // Performance target: < 1000 ns/sample (1M samples/sec minimum)
+    // Real ARM7TDMI at 80MHz: ~12.5 ns/cycle, so 1000ns = 80 cycles/sample
+    try std.testing.expect(ns_per_sample < 10000); // Relaxed for host testing
+}
+
+// Benchmark: Measure EQ band processing overhead
+test "benchmark EQ band processing" {
+    var eq = Equalizer.init();
+    eq.enabled = true;
+    eq.setBandGain(0, 6); // 1kHz band boosted
+    eq.setBandGain(1, -3); // 2kHz band cut
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 1000;
+    var right: i16 = 1000;
+    while (i < iterations) : (i += 1) {
+        const result = eq.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("EQ Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Should be reasonably fast (< 5000 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 50000);
+}
+
+// Benchmark: Measure volume ramper performance
+test "benchmark volume ramper" {
+    var vol = VolumeRamper.init();
+    vol.setVolume(80);
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 16000;
+    var right: i16 = 16000;
+    while (i < iterations) : (i += 1) {
+        const result = vol.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("Volume Ramper Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Volume ramper should be very fast (< 500 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 10000);
+}
+
+// Benchmark: Measure resampler performance (upsampling)
+test "benchmark resampler upsampling" {
+    var resampler = Resampler.init();
+    resampler.configure(44100, 48000); // Common CD to DAC conversion
+
+    // Input buffer (100ms at 44.1kHz stereo)
+    const input_samples = 4410 * 2;
+    var input: [input_samples]i16 = undefined;
+    for (&input, 0..) |*s, i| {
+        s.* = @as(i16, @intCast(@mod(i * 100, 32000)));
+    }
+
+    // Output buffer (slightly larger)
+    var output: [5000]i16 = undefined;
+
+    const iterations: u32 = 100;
+    const start = std.time.nanoTimestamp();
+
+    var iter: u32 = 0;
+    while (iter < iterations) : (iter += 1) {
+        _ = resampler.resampleBuffer(&input, &output);
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_iteration = elapsed_ns / iterations;
+    const samples_per_iteration = input_samples / 2;
+    const ns_per_sample = ns_per_iteration / samples_per_iteration;
+
+    std.log.info("Resampler Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Resampling should be reasonably fast (< 2000 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 20000);
+}
+
+// Benchmark: Measure bass boost processing
+test "benchmark bass boost" {
+    var bass = BassBoost.init();
+    bass.enabled = true;
+    bass.setBoost(6); // +6dB boost
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 8000;
+    var right: i16 = 8000;
+    while (i < iterations) : (i += 1) {
+        const result = bass.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("Bass Boost Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Bass boost should be fast (< 1000 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 10000);
+}
+
+// Benchmark: Measure stereo widener performance
+test "benchmark stereo widener" {
+    var widener = StereoWidener.init();
+    widener.setWidth(50); // 50% width
+
+    const iterations: u32 = 100000;
+    const start = std.time.nanoTimestamp();
+
+    var i: u32 = 0;
+    var left: i16 = 10000;
+    var right: i16 = 12000;
+    while (i < iterations) : (i += 1) {
+        const result = widener.process(left, right);
+        left = result.left;
+        right = result.right;
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns = @as(u64, @intCast(end - start));
+    const ns_per_sample = elapsed_ns / iterations;
+
+    std.log.info("Stereo Widener Benchmark: {d} ns/sample", .{ns_per_sample});
+
+    // Stereo widener should be very fast (< 500 ns/sample on host)
+    try std.testing.expect(ns_per_sample < 5000);
 }

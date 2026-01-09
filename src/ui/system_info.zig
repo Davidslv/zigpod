@@ -180,7 +180,7 @@ pub const SystemInfoScreen = struct {
         var y: u16 = HEADER_HEIGHT + PADDING;
 
         // ZigPod logo/name
-        lcd.drawText(80, y, "ZigPod OS", lcd.Colors.WHITE);
+        lcd.drawString(80, y, "ZigPod OS", lcd.Colors.WHITE, null);
         y += LINE_HEIGHT + 5;
 
         drawLabelValue(PADDING, y, "Version:", "0.1.0");
@@ -193,13 +193,13 @@ pub const SystemInfoScreen = struct {
         y += LINE_HEIGHT;
 
         y += 10;
-        lcd.drawText(PADDING, y, "github.com/zigpod", lcd.Colors.GRAY);
+        lcd.drawString(PADDING, y, "github.com/zigpod", lcd.Colors.GRAY, null);
         y += LINE_HEIGHT + 10;
 
-        lcd.drawText(PADDING, y, "Made with Zig for iPod", lcd.Colors.GRAY);
+        lcd.drawString(PADDING, y, "Made with Zig for iPod", lcd.Colors.GRAY, null);
         y += LINE_HEIGHT;
 
-        lcd.drawText(PADDING, y, "5th Generation", lcd.Colors.GRAY);
+        lcd.drawString(PADDING, y, "5th Generation", lcd.Colors.GRAY, null);
     }
 
     /// Handle input events
@@ -262,22 +262,22 @@ fn drawHeader(page: SystemInfoScreen.Page) void {
         .storage => "Storage",
         .about => "About",
     };
-    lcd.drawText(10, 3, title, lcd.Colors.WHITE);
+    lcd.drawString(10, 3, title, lcd.Colors.WHITE, null);
 
     // Page indicator
     const page_num = @intFromEnum(page) + 1;
     var buf: [8]u8 = undefined;
     const page_str = std.fmt.bufPrint(&buf, "{d}/4", .{page_num}) catch "?/4";
-    lcd.drawText(280, 3, page_str, lcd.Colors.GRAY);
+    lcd.drawString(280, 3, page_str, lcd.Colors.GRAY, null);
 }
 
 fn drawNavigationHint() void {
-    lcd.drawText(10, 220, "Scroll: Pages  Menu: Back", lcd.Colors.GRAY);
+    lcd.drawString(10, 220, "Scroll: Pages  Menu: Back", lcd.Colors.GRAY, null);
 }
 
 fn drawLabelValue(x: u16, y: u16, label: []const u8, value: []const u8) void {
-    lcd.drawText(x, y, label, lcd.Colors.GRAY);
-    lcd.drawText(x + 100, y, value, lcd.Colors.WHITE);
+    lcd.drawString(x, y, label, lcd.Colors.GRAY, null);
+    lcd.drawString(x + 100, y, value, lcd.Colors.WHITE, null);
 }
 
 fn drawBatteryIcon(x: u16, y: u16, percentage: u8) void {
@@ -305,7 +305,7 @@ fn drawBatteryIcon(x: u16, y: u16, percentage: u8) void {
     // Percentage text
     var buf: [8]u8 = undefined;
     const pct_str = std.fmt.bufPrint(&buf, "{d}%", .{percentage}) catch "?";
-    lcd.drawText(x + width / 2 - 10, y + 8, pct_str, lcd.Colors.WHITE);
+    lcd.drawString(x + width / 2 - 10, y + 8, pct_str, lcd.Colors.WHITE, null);
 }
 
 fn drawStorageBar(x: u16, y: u16, width: u16, height: u16, used_percent: u8) void {

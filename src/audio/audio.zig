@@ -47,8 +47,20 @@ pub const BUFFER_SIZE: usize = 4096;
 /// Number of audio channels
 pub const CHANNELS: u8 = 2; // Stereo
 
-/// Threshold for triggering next track pre-buffer (samples remaining)
-/// At 44.1kHz stereo, ~2 seconds of audio
+/// Gapless pre-buffer time in milliseconds
+/// This is the time before end of track when we start loading the next track
+pub const GAPLESS_PREBUFFER_MS: u32 = 2000;
+
+/// Calculate gapless threshold in samples for a given sample rate
+/// This ensures consistent ~2 second prebuffer regardless of sample rate
+pub fn gaplessThresholdSamples(sample_rate: u32) u64 {
+    // samples = sample_rate * channels * (time_ms / 1000)
+    // For stereo: samples = sample_rate * 2 * (GAPLESS_PREBUFFER_MS / 1000)
+    return @as(u64, sample_rate) * CHANNELS * GAPLESS_PREBUFFER_MS / 1000;
+}
+
+/// Legacy constant for backwards compatibility (44.1kHz stereo)
+/// DEPRECATED: Use gaplessThresholdSamples(sample_rate) instead
 pub const GAPLESS_THRESHOLD: u64 = 88200;
 
 /// Audio format

@@ -1000,3 +1000,303 @@ test "mock ATA operations" {
     try mockAtaReadSectors(0, 1, &read_data);
     try std.testing.expectEqualSlices(u8, &write_data, &read_data);
 }
+
+test "mock USB state machine" {
+    resetState();
+    const state = getState();
+
+    // Initialize USB
+    try mockUsbInit();
+    try std.testing.expect(state.usb_initialized);
+    try std.testing.expectEqual(UsbDeviceState.powered, mockUsbGetState());
+
+    // Connect
+    mockUsbConnect();
+    try std.testing.expect(mockUsbIsConnected());
+    try std.testing.expectEqual(UsbDeviceState.attached, mockUsbGetState());
+
+    // Set address transitions to addressed state
+    mockUsbSetAddress(5);
+    try std.testing.expectEqual(@as(u7, 5), state.usb_address);
+    try std.testing.expectEqual(UsbDeviceState.addressed, mockUsbGetState());
+
+    // Zero address transitions to default state
+    mockUsbSetAddress(0);
+    try std.testing.expectEqual(UsbDeviceState.default, mockUsbGetState());
+
+    // Disconnect
+    mockUsbDisconnect();
+    try std.testing.expect(!mockUsbIsConnected());
+    try std.testing.expectEqual(UsbDeviceState.disconnected, mockUsbGetState());
+}
+
+test "mock USB endpoint operations" {
+    resetState();
+
+    try mockUsbInit();
+
+    // Configure endpoint
+    try mockUsbConfigureEndpoint(1, .bulk, .in, 512);
+
+    // Write to endpoint
+    const data = "Hello USB";
+    const written = try mockUsbWriteEndpoint(1, data);
+    try std.testing.expectEqual(data.len, written);
+
+    // Read from endpoint (mock returns empty)
+    var buffer: [64]u8 = undefined;
+    const read_count = try mockUsbReadEndpoint(1, &buffer);
+    try std.testing.expectEqual(@as(usize, 0), read_count);
+
+    // Stall/unstall (should not error)
+    mockUsbStallEndpoint(1);
+    mockUsbUnstallEndpoint(1);
+}
+
+test "mock PMU battery status" {
+    resetState();
+    const state = getState();
+
+    try mockPmuInit();
+    try std.testing.expect(state.pmu_initialized);
+
+    // Check default battery state (~70% at 3800mV)
+    const battery = mockPmuGetBatteryStatus();
+    try std.testing.expectEqual(@as(u16, 3800), battery.voltage_mv);
+    try std.testing.expect(battery.percentage > 60 and battery.percentage < 80);
+    try std.testing.expectEqual(ChargingState.not_charging, battery.charging);
+    try std.testing.expectEqual(PowerSource.battery, battery.power_source);
+
+    // Simulate charging
+    state.pmu_charging = true;
+    state.pmu_external_power = true;
+    const charging_battery = mockPmuGetBatteryStatus();
+    try std.testing.expectEqual(ChargingState.fast_charge, charging_battery.charging);
+    try std.testing.expectEqual(PowerSource.usb, charging_battery.power_source);
+}
+
+test "mock PMU battery percentage calculation" {
+    resetState();
+    const state = getState();
+
+    try mockPmuInit();
+
+    // Full battery
+    state.pmu_battery_mv = 4100;
+    try std.testing.expectEqual(@as(u8, 100), mockPmuGetBatteryPercent());
+
+    // Empty battery
+    state.pmu_battery_mv = 3000;
+    try std.testing.expectEqual(@as(u8, 0), mockPmuGetBatteryPercent());
+
+    // Mid-range battery
+    state.pmu_battery_mv = 3550; // ~50%
+    const percent = mockPmuGetBatteryPercent();
+    try std.testing.expect(percent >= 40 and percent <= 60);
+}
+
+test "mock PMU CPU voltage validation" {
+    resetState();
+
+    try mockPmuInit();
+
+    // Valid voltage range
+    try mockPmuSetCpuVoltage(1200);
+    try mockPmuSetCpuVoltage(900); // Min
+    try mockPmuSetCpuVoltage(1800); // Max
+
+    // Invalid voltages
+    try std.testing.expectError(HalError.InvalidParameter, mockPmuSetCpuVoltage(800));
+    try std.testing.expectError(HalError.InvalidParameter, mockPmuSetCpuVoltage(1900));
+}
+
+test "mock DMA channel management" {
+    resetState();
+    const state = getState();
+
+    try mockDmaInit();
+    try std.testing.expect(state.dma_initialized);
+
+    // All channels should start idle
+    for (0..4) |i| {
+        try std.testing.expectEqual(DmaChannelState.idle, mockDmaGetState(@intCast(i)));
+    }
+
+    // Start transfer (mock completes immediately)
+    try mockDmaStart(0, 0x1000, 0x2000, 256, .ram_to_peripheral, .i2s, .burst_4);
+    try std.testing.expectEqual(DmaChannelState.done, mockDmaGetState(0));
+    try std.testing.expect(!mockDmaIsBusy(0));
+
+    // Wait should not block (already complete)
+    try mockDmaWait(0);
+
+    // Abort channel
+    mockDmaAbort(1);
+    try std.testing.expectEqual(DmaChannelState.idle, mockDmaGetState(1));
+}
+
+test "mock RTC operations" {
+    resetState();
+    const state = getState();
+
+    try mockRtcInit();
+    try std.testing.expect(state.rtc_initialized);
+
+    // Set and get time
+    mockRtcSetTime(1704067200); // 2024-01-01 00:00:00
+    try std.testing.expectEqual(@as(u32, 1704067200), mockRtcGetTime());
+
+    // Alarm operations
+    mockRtcSetAlarm(1704153600); // 2024-01-02 00:00:00
+    try std.testing.expect(state.rtc_alarm_enabled);
+    try std.testing.expectEqual(@as(u32, 1704153600), state.rtc_alarm);
+
+    mockRtcClearAlarm();
+    try std.testing.expect(!state.rtc_alarm_enabled);
+    try std.testing.expect(!mockRtcAlarmTriggered());
+}
+
+test "mock watchdog operations" {
+    resetState();
+    const state = getState();
+
+    // Initialize with 5 second timeout
+    try mockWdtInit(5000);
+    try std.testing.expect(state.wdt_initialized);
+    try std.testing.expectEqual(@as(u32, 5000), state.wdt_timeout_ms);
+    try std.testing.expect(!state.wdt_enabled);
+
+    // Start watchdog
+    mockWdtStart();
+    try std.testing.expect(state.wdt_enabled);
+
+    // Refresh (no-op in mock)
+    mockWdtRefresh();
+
+    // Stop watchdog
+    mockWdtStop();
+    try std.testing.expect(!state.wdt_enabled);
+
+    // Check reset flag
+    try std.testing.expect(!mockWdtCausedReset());
+}
+
+test "mock interrupt registration" {
+    resetState();
+    const state = getState();
+
+    // IRQ initially disabled
+    try std.testing.expect(!mockIrqEnabled());
+
+    // Enable IRQ
+    mockIrqEnable();
+    try std.testing.expect(mockIrqEnabled());
+
+    // Register handler
+    const dummy_handler = struct {
+        fn handler() void {}
+    }.handler;
+    mockIrqRegister(5, dummy_handler);
+    try std.testing.expect(state.irq_handlers[5] != null);
+
+    // Disable IRQ
+    mockIrqDisable();
+    try std.testing.expect(!mockIrqEnabled());
+}
+
+test "mock GPIO port/pin boundary" {
+    resetState();
+    const state = getState();
+
+    // Test maximum valid port/pin
+    mockGpioSetDirection(11, 31, .output);
+    try std.testing.expectEqual(GpioDirection.output, state.gpio_direction[11][31]);
+
+    mockGpioWrite(11, 31, true);
+    try std.testing.expect(mockGpioRead(11, 31));
+
+    // Test minimum valid port/pin
+    mockGpioSetDirection(0, 0, .input);
+    try std.testing.expectEqual(GpioDirection.input, state.gpio_direction[0][0]);
+
+    // Test mid-range port/pin
+    mockGpioSetDirection(6, 16, .output);
+    mockGpioWrite(6, 16, true);
+    try std.testing.expect(mockGpioRead(6, 16));
+}
+
+test "mock I2C error handling" {
+    resetState();
+    const state = getState();
+
+    // Test uninitialized error
+    try std.testing.expectError(HalError.DeviceNotReady, mockI2cWrite(0x10, &[_]u8{0x00}));
+    try std.testing.expectError(HalError.DeviceNotReady, mockI2cRead(0x10, &[_]u8{}));
+
+    // Initialize
+    try mockI2cInit();
+
+    // Add device
+    try state.addI2cDevice(0x1A);
+
+    // Test NACK for non-existent device
+    try std.testing.expectError(HalError.Nack, mockI2cWrite(0x50, &[_]u8{0x00}));
+    try std.testing.expectError(HalError.Nack, mockI2cRead(0x50, &[_]u8{}));
+
+    // Test write-read operation
+    try state.setI2cRegister(0x1A, 0x05, 0xAB);
+    var buffer: [1]u8 = undefined;
+    _ = try mockI2cWriteRead(0x1A, &[_]u8{0x05}, &buffer);
+    // Note: mock doesn't implement register read, returns 0
+}
+
+test "mock I2S operations" {
+    resetState();
+    const state = getState();
+
+    // Initialize I2S
+    try mockI2sInit(48000, .i2s_standard, .bits_16);
+    try std.testing.expect(state.i2s_initialized);
+    try std.testing.expectEqual(@as(u32, 48000), state.i2s_sample_rate);
+
+    // Not enabled yet
+    try std.testing.expect(!mockI2sTxReady());
+
+    // Enable
+    mockI2sEnable(true);
+    try std.testing.expect(state.i2s_enabled);
+    try std.testing.expect(mockI2sTxReady());
+
+    // Write samples
+    const samples = [_]i16{ 0, 1000, -1000, 32767, -32768 };
+    _ = try mockI2sWrite(&samples);
+
+    // Check free slots
+    try std.testing.expectEqual(@as(usize, 256), mockI2sTxFreeSlots());
+
+    // Disable
+    mockI2sEnable(false);
+    try std.testing.expect(!mockI2sTxReady());
+    try std.testing.expectError(HalError.DeviceNotReady, mockI2sWrite(&samples));
+}
+
+test "mock cache operations" {
+    resetState();
+    const state = getState();
+
+    // Cache should start disabled
+    try std.testing.expect(!state.cache_enabled);
+
+    // Enable cache
+    mockCacheEnable(true);
+    try std.testing.expect(state.cache_enabled);
+
+    // Cache operations (no-ops, should not crash)
+    mockCacheInvalidateIcache();
+    mockCacheInvalidateDcache();
+    mockCacheFlushDcache();
+
+    // Disable cache
+    mockCacheEnable(false);
+    try std.testing.expect(!state.cache_enabled);
+}
