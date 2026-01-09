@@ -97,6 +97,125 @@ pub const State = enum {
 };
 
 // ============================================================
+// Memory Region Validation (Security)
+// ============================================================
+
+/// Valid memory regions for DMA access
+/// These are the safe ranges where DMA can read/write
+pub const MemoryRegion = struct {
+    start: usize,
+    end: usize,
+    readable: bool,
+    writable: bool,
+    name: []const u8,
+};
+
+/// PP5021C Memory Map - Valid DMA regions
+pub const valid_regions = [_]MemoryRegion{
+    // SDRAM (main memory) - 32MB on iPod Video
+    .{ .start = 0x10000000, .end = 0x12000000, .readable = true, .writable = true, .name = "SDRAM" },
+    // Internal SRAM - 64KB
+    .{ .start = 0x40000000, .end = 0x40010000, .readable = true, .writable = true, .name = "IRAM" },
+    // Uncached SDRAM alias (for DMA buffers)
+    .{ .start = 0x30000000, .end = 0x32000000, .readable = true, .writable = true, .name = "SDRAM_UNCACHED" },
+    // I2S FIFO (write-only for audio output)
+    .{ .start = 0x70002840, .end = 0x70002844, .readable = false, .writable = true, .name = "I2S_FIFO" },
+    // IDE/ATA data register
+    .{ .start = 0xC00001F0, .end = 0xC00001F8, .readable = true, .writable = true, .name = "IDE_DATA" },
+};
+
+/// Invalid/protected regions that DMA must never access
+pub const protected_regions = [_]MemoryRegion{
+    // BootROM - read-only, no DMA
+    .{ .start = 0x00000000, .end = 0x00010000, .readable = false, .writable = false, .name = "BootROM" },
+    // Security registers
+    .{ .start = 0x60000000, .end = 0x60001000, .readable = false, .writable = false, .name = "SECURITY" },
+    // Flash controller (sensitive)
+    .{ .start = 0x20000000, .end = 0x28000000, .readable = false, .writable = false, .name = "FLASH" },
+};
+
+/// DMA validation errors
+pub const ValidationError = error{
+    /// RAM address is in a protected region
+    InvalidRamAddress,
+    /// RAM address is outside valid memory
+    RamAddressOutOfBounds,
+    /// Peripheral address is invalid
+    InvalidPeripheralAddress,
+    /// Transfer length is zero
+    ZeroLength,
+    /// Transfer would exceed region bounds
+    TransferExceedsBounds,
+    /// Write to read-only region
+    WriteToReadOnly,
+    /// Read from write-only region
+    ReadFromWriteOnly,
+};
+
+/// Validate a memory address and length for DMA access
+pub fn validateAddress(addr: usize, length: usize, is_write: bool) ValidationError!void {
+    if (length == 0) return ValidationError.ZeroLength;
+
+    // Check if in protected region
+    for (protected_regions) |region| {
+        if (addr >= region.start and addr < region.end) {
+            return ValidationError.InvalidRamAddress;
+        }
+        // Also check end of transfer
+        const end_addr = addr + length - 1;
+        if (end_addr >= region.start and end_addr < region.end) {
+            return ValidationError.InvalidRamAddress;
+        }
+    }
+
+    // Check if in valid region with proper permissions
+    for (valid_regions) |region| {
+        if (addr >= region.start and addr < region.end) {
+            // Check if transfer stays within region
+            if (addr + length > region.end) {
+                return ValidationError.TransferExceedsBounds;
+            }
+
+            // Check permissions
+            if (is_write and !region.writable) {
+                return ValidationError.WriteToReadOnly;
+            }
+            if (!is_write and !region.readable) {
+                return ValidationError.ReadFromWriteOnly;
+            }
+
+            // Valid!
+            return;
+        }
+    }
+
+    // Not in any valid region
+    return ValidationError.RamAddressOutOfBounds;
+}
+
+/// Validate DMA configuration before starting transfer
+pub fn validateConfig(config: *const Config) ValidationError!void {
+    // Determine if RAM is being written (peripheral-to-memory) or read (memory-to-peripheral)
+    const ram_is_dest = config.direction == .peripheral_to_memory;
+
+    // Validate RAM address
+    try validateAddress(config.ram_addr, config.length, ram_is_dest);
+
+    // Validate peripheral address (simplified - check common peripherals)
+    var periph_valid = false;
+    for (valid_regions) |region| {
+        if (config.peripheral_addr >= region.start and config.peripheral_addr < region.end) {
+            periph_valid = true;
+            break;
+        }
+    }
+
+    if (!periph_valid) {
+        return ValidationError.InvalidPeripheralAddress;
+    }
+}
+
+// ============================================================
 // DMA Configuration
 // ============================================================
 
@@ -190,6 +309,9 @@ pub fn deinit() void {
 /// Configure and start a DMA transfer
 pub fn start(channel: Channel, config: Config) !void {
     if (!initialized) return error.NotInitialized;
+
+    // Security: Validate addresses before starting transfer
+    try validateConfig(&config);
 
     const chan_base = reg.dmaChannelBase(@intFromEnum(channel));
 
@@ -364,4 +486,88 @@ test "config defaults" {
     };
     try std.testing.expect(config.interrupt == true);
     try std.testing.expect(config.ram_increment == true);
+}
+
+test "validate address - valid SDRAM" {
+    // Valid SDRAM address for read
+    try validateAddress(0x10000000, 1024, false);
+    // Valid SDRAM address for write
+    try validateAddress(0x10001000, 512, true);
+}
+
+test "validate address - valid uncached SDRAM" {
+    // Uncached SDRAM region
+    try validateAddress(0x30000000, 4096, true);
+    try validateAddress(0x30010000, 8192, false);
+}
+
+test "validate address - valid IRAM" {
+    // Internal SRAM
+    try validateAddress(0x40000000, 256, true);
+    try validateAddress(0x40008000, 1024, false);
+}
+
+test "validate address - zero length" {
+    try std.testing.expectError(ValidationError.ZeroLength, validateAddress(0x10000000, 0, false));
+}
+
+test "validate address - protected bootrom" {
+    // BootROM is protected
+    try std.testing.expectError(ValidationError.InvalidRamAddress, validateAddress(0x00000000, 256, false));
+    try std.testing.expectError(ValidationError.InvalidRamAddress, validateAddress(0x00008000, 512, true));
+}
+
+test "validate address - protected security region" {
+    try std.testing.expectError(ValidationError.InvalidRamAddress, validateAddress(0x60000100, 16, true));
+}
+
+test "validate address - protected flash" {
+    try std.testing.expectError(ValidationError.InvalidRamAddress, validateAddress(0x20000000, 4096, true));
+    try std.testing.expectError(ValidationError.InvalidRamAddress, validateAddress(0x24000000, 1024, false));
+}
+
+test "validate address - transfer exceeds bounds" {
+    // Try to transfer past end of IRAM (64KB ends at 0x40010000)
+    try std.testing.expectError(ValidationError.TransferExceedsBounds, validateAddress(0x4000F800, 4096, true));
+}
+
+test "validate address - out of bounds" {
+    // Address in unmapped region
+    try std.testing.expectError(ValidationError.RamAddressOutOfBounds, validateAddress(0x80000000, 256, false));
+}
+
+test "validate config - valid audio config" {
+    const config = Config{
+        .ram_addr = 0x30000000, // Uncached SDRAM
+        .peripheral_addr = 0x70002840, // I2S FIFO
+        .length = 1024,
+        .request = .i2s,
+        .burst = .burst_4,
+        .direction = .memory_to_peripheral,
+    };
+    try validateConfig(&config);
+}
+
+test "validate config - invalid ram address" {
+    const config = Config{
+        .ram_addr = 0x00000000, // BootROM - protected!
+        .peripheral_addr = 0x70002840,
+        .length = 1024,
+        .request = .i2s,
+        .burst = .burst_4,
+        .direction = .memory_to_peripheral,
+    };
+    try std.testing.expectError(ValidationError.InvalidRamAddress, validateConfig(&config));
+}
+
+test "validate config - invalid peripheral" {
+    const config = Config{
+        .ram_addr = 0x10000000,
+        .peripheral_addr = 0xDEADBEEF, // Invalid peripheral address
+        .length = 1024,
+        .request = .i2s,
+        .burst = .burst_4,
+        .direction = .memory_to_peripheral,
+    };
+    try std.testing.expectError(ValidationError.InvalidPeripheralAddress, validateConfig(&config));
 }

@@ -694,8 +694,8 @@ test "complete audio pipeline structure" {
     // Verify audio types are properly sized
     try std.testing.expect(@sizeOf(audio.TrackInfo) <= 64);
 
-    // Verify decoder types are all registered
-    try std.testing.expectEqual(@as(usize, 5), @typeInfo(audio.decoders.DecoderType).@"enum".fields.len);
+    // Verify decoder types are all registered (wav, flac, mp3, aiff, aac, m4a, unknown)
+    try std.testing.expectEqual(@as(usize, 7), @typeInfo(audio.decoders.DecoderType).@"enum".fields.len);
 }
 
 test "complete ui screen dimensions" {

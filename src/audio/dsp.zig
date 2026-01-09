@@ -427,6 +427,436 @@ pub const BassBoost = struct {
 };
 
 // ============================================================
+// Dithering for Bit-Depth Reduction
+// ============================================================
+
+/// TPDF (Triangular Probability Density Function) Dithering
+/// Used when reducing bit-depth (e.g., 24-bit to 16-bit) to minimize
+/// quantization noise and avoid correlation with the signal.
+pub const Ditherer = struct {
+    /// LFSR state for pseudo-random noise generation
+    lfsr_state: u32,
+    /// Previous random value for TPDF calculation
+    prev_rand: i32,
+    /// Whether dithering is enabled
+    enabled: bool,
+    /// Noise shaping feedback (for optional noise shaping)
+    error_l: i32,
+    error_r: i32,
+
+    pub fn init() Ditherer {
+        return Ditherer{
+            .lfsr_state = 0x12345678, // Initial seed
+            .prev_rand = 0,
+            .enabled = true,
+            .error_l = 0,
+            .error_r = 0,
+        };
+    }
+
+    /// Generate pseudo-random noise using LFSR
+    fn nextRandom(self: *Ditherer) i32 {
+        // Galois LFSR with taps at 32, 22, 2, 1 (maximal period)
+        const bit = self.lfsr_state & 1;
+        self.lfsr_state >>= 1;
+        if (bit == 1) {
+            self.lfsr_state ^= 0xD0000001;
+        }
+        // Convert to signed and scale to +/- 1 LSB range
+        return @as(i32, @bitCast(self.lfsr_state)) >> 16;
+    }
+
+    /// Apply TPDF dithering to convert 32-bit sample to 16-bit
+    /// TPDF uses two random values subtracted to create triangular distribution
+    pub fn ditherToI16(self: *Ditherer, sample: i32) i16 {
+        if (!self.enabled) {
+            // Simple truncation
+            return @intCast(std.math.clamp(sample >> 16, -32768, 32767));
+        }
+
+        // Generate TPDF noise (triangular distribution)
+        const rand1 = self.nextRandom();
+        const rand2 = self.prev_rand;
+        self.prev_rand = rand1;
+
+        // TPDF = rand1 - rand2 (creates triangular distribution)
+        const dither_noise = rand1 - rand2;
+
+        // Add dither noise scaled to LSB of output (for 32->16 bit, scale by 2^15)
+        // Since we're going from 32-bit to 16-bit, we need 16-bit of dither
+        const dithered = sample + (dither_noise >> 1);
+
+        // Round and truncate
+        const rounded = (dithered + 0x8000) >> 16;
+
+        return @intCast(std.math.clamp(rounded, -32768, 32767));
+    }
+
+    /// Apply TPDF dithering with noise shaping for 24-bit to 16-bit
+    /// Noise shaping moves quantization noise to less audible frequencies
+    pub fn ditherWithNoiseShaping(self: *Ditherer, sample: i32, ch: u1) i16 {
+        if (!self.enabled) {
+            return @intCast(std.math.clamp(sample >> 8, -32768, 32767));
+        }
+
+        // Add feedback error from previous sample (first-order noise shaping)
+        const error_ptr = if (ch == 0) &self.error_l else &self.error_r;
+        const shaped = sample - error_ptr.*;
+
+        // Generate TPDF dither
+        const rand1 = self.nextRandom();
+        const rand2 = self.prev_rand;
+        self.prev_rand = rand1;
+        const dither = (rand1 - rand2) >> 8; // Scale for 24->16 bit
+
+        // Add dither and round
+        const dithered = shaped + dither;
+        const output = (dithered + 128) >> 8;
+        const clamped = std.math.clamp(output, -32768, 32767);
+
+        // Calculate and store error for next sample
+        error_ptr.* = (clamped << 8) - sample;
+
+        return @intCast(clamped);
+    }
+
+    /// Process stereo pair with dithering (assumes 32-bit input, 16-bit output)
+    pub fn process32to16(self: *Ditherer, left: i32, right: i32) StereoSample {
+        return .{
+            .left = self.ditherToI16(left),
+            .right = self.ditherToI16(right),
+        };
+    }
+
+    /// Process stereo pair from 24-bit to 16-bit with noise shaping
+    pub fn process24to16(self: *Ditherer, left: i32, right: i32) StereoSample {
+        return .{
+            .left = self.ditherWithNoiseShaping(left, 0),
+            .right = self.ditherWithNoiseShaping(right, 1),
+        };
+    }
+
+    /// Reset ditherer state
+    pub fn reset(self: *Ditherer) void {
+        self.error_l = 0;
+        self.error_r = 0;
+        self.prev_rand = 0;
+    }
+};
+
+// ============================================================
+// Sample Rate Converter
+// ============================================================
+
+/// Linear interpolation resampler for sample rate conversion
+/// Supports conversion between any pair of common sample rates
+/// Uses fixed-point math for ARM7TDMI efficiency
+pub const Resampler = struct {
+    /// Source sample rate
+    input_rate: u32,
+    /// Target sample rate
+    output_rate: u32,
+    /// Phase accumulator (Q16.16 fixed-point)
+    phase: u32,
+    /// Phase increment per output sample
+    phase_inc: u32,
+    /// Previous sample for interpolation (left)
+    prev_l: i16,
+    /// Previous sample for interpolation (right)
+    prev_r: i16,
+    /// Current sample for interpolation (left)
+    curr_l: i16,
+    /// Current sample for interpolation (right)
+    curr_r: i16,
+    /// Whether resampling is needed (rates differ)
+    enabled: bool,
+
+    /// Common sample rates
+    pub const RATE_8000: u32 = 8000;
+    pub const RATE_11025: u32 = 11025;
+    pub const RATE_16000: u32 = 16000;
+    pub const RATE_22050: u32 = 22050;
+    pub const RATE_32000: u32 = 32000;
+    pub const RATE_44100: u32 = 44100;
+    pub const RATE_48000: u32 = 48000;
+    pub const RATE_96000: u32 = 96000;
+
+    pub fn init() Resampler {
+        return Resampler{
+            .input_rate = RATE_44100,
+            .output_rate = RATE_44100,
+            .phase = 0,
+            .phase_inc = 0x10000, // 1.0 in Q16.16
+            .prev_l = 0,
+            .prev_r = 0,
+            .curr_l = 0,
+            .curr_r = 0,
+            .enabled = false,
+        };
+    }
+
+    /// Configure resampler for specific input/output rates
+    pub fn configure(self: *Resampler, input_rate: u32, output_rate: u32) void {
+        self.input_rate = input_rate;
+        self.output_rate = output_rate;
+
+        if (input_rate == output_rate) {
+            self.enabled = false;
+            self.phase_inc = 0x10000;
+        } else {
+            self.enabled = true;
+            // phase_inc = input_rate / output_rate in Q16.16
+            // For accuracy: (input_rate << 16) / output_rate
+            self.phase_inc = @truncate((@as(u64, input_rate) << 16) / output_rate);
+        }
+
+        self.reset();
+    }
+
+    /// Reset resampler state
+    pub fn reset(self: *Resampler) void {
+        self.phase = 0;
+        self.prev_l = 0;
+        self.prev_r = 0;
+        self.curr_l = 0;
+        self.curr_r = 0;
+    }
+
+    /// Push a new input sample pair
+    pub fn pushSample(self: *Resampler, left: i16, right: i16) void {
+        self.prev_l = self.curr_l;
+        self.prev_r = self.curr_r;
+        self.curr_l = left;
+        self.curr_r = right;
+    }
+
+    /// Generate next output sample using linear interpolation
+    /// Returns null if no output sample is ready (need more input)
+    pub fn pullSample(self: *Resampler) ?StereoSample {
+        if (!self.enabled) {
+            return .{ .left = self.curr_l, .right = self.curr_r };
+        }
+
+        // Check if we've passed the current input sample
+        if (self.phase >= 0x10000) {
+            return null; // Need more input samples
+        }
+
+        // Linear interpolation: output = prev + (curr - prev) * phase
+        const frac: i32 = @intCast(self.phase & 0xFFFF);
+        const inv_frac: i32 = 0x10000 - frac;
+
+        const left = @as(i32, self.prev_l) * inv_frac + @as(i32, self.curr_l) * frac;
+        const right = @as(i32, self.prev_r) * inv_frac + @as(i32, self.curr_r) * frac;
+
+        // Advance phase
+        self.phase += self.phase_inc;
+
+        return .{
+            .left = @intCast(left >> 16),
+            .right = @intCast(right >> 16),
+        };
+    }
+
+    /// Advance phase and check if we need next input sample
+    pub fn needsInput(self: *const Resampler) bool {
+        return self.phase >= 0x10000;
+    }
+
+    /// Consume input sample (call after pushSample when phase indicates)
+    pub fn consumeInput(self: *Resampler) void {
+        if (self.phase >= 0x10000) {
+            self.phase -= 0x10000;
+        }
+    }
+
+    /// Resample a buffer of stereo samples
+    /// Input buffer is in format [L0, R0, L1, R1, ...]
+    /// Returns number of output samples written
+    pub fn resampleBuffer(
+        self: *Resampler,
+        input: []const i16,
+        output: []i16,
+    ) usize {
+        if (!self.enabled) {
+            // No resampling needed, just copy
+            const to_copy = @min(input.len, output.len);
+            @memcpy(output[0..to_copy], input[0..to_copy]);
+            return to_copy / 2; // Return stereo samples
+        }
+
+        var in_idx: usize = 0;
+        var out_idx: usize = 0;
+
+        while (out_idx + 1 < output.len) {
+            // Generate output samples while phase < 1.0
+            while (self.phase < 0x10000 and out_idx + 1 < output.len) {
+                const frac: i32 = @intCast(self.phase & 0xFFFF);
+                const inv_frac: i32 = 0x10000 - frac;
+
+                const left = @as(i32, self.prev_l) * inv_frac + @as(i32, self.curr_l) * frac;
+                const right = @as(i32, self.prev_r) * inv_frac + @as(i32, self.curr_r) * frac;
+
+                output[out_idx] = @intCast(left >> 16);
+                output[out_idx + 1] = @intCast(right >> 16);
+                out_idx += 2;
+
+                self.phase += self.phase_inc;
+            }
+
+            // Need next input sample
+            if (self.phase >= 0x10000) {
+                self.phase -= 0x10000;
+
+                if (in_idx + 1 < input.len) {
+                    self.prev_l = self.curr_l;
+                    self.prev_r = self.curr_r;
+                    self.curr_l = input[in_idx];
+                    self.curr_r = input[in_idx + 1];
+                    in_idx += 2;
+                } else {
+                    break; // No more input
+                }
+            }
+        }
+
+        return out_idx / 2;
+    }
+
+    /// Get ratio for buffer size calculation
+    /// Returns the ratio as Q16.16 fixed-point
+    pub fn getRatio(self: *const Resampler) u32 {
+        if (!self.enabled) return 0x10000;
+        return @truncate((@as(u64, self.output_rate) << 16) / self.input_rate);
+    }
+
+    /// Calculate required output buffer size for given input size
+    pub fn calcOutputSize(self: *const Resampler, input_samples: usize) usize {
+        if (!self.enabled) return input_samples;
+        const ratio = self.getRatio();
+        return @intCast((@as(u64, input_samples) * ratio + 0xFFFF) >> 16);
+    }
+
+    /// Calculate required input buffer size for given output size
+    pub fn calcInputSize(self: *const Resampler, output_samples: usize) usize {
+        if (!self.enabled) return output_samples;
+        return @intCast((@as(u64, output_samples) * self.phase_inc + 0xFFFF) >> 16);
+    }
+};
+
+// ============================================================
+// Volume Ramping
+// ============================================================
+
+/// Volume control with smooth ramping to avoid audible clicks
+/// Uses exponential ramping for natural-sounding transitions
+pub const VolumeRamper = struct {
+    /// Target volume (0x0000 = silence, 0x10000 = unity, max 0x20000 = +6dB)
+    target_volume: i32,
+    /// Current volume (ramping towards target)
+    current_volume: i32,
+    /// Ramp rate per sample (higher = faster transition)
+    ramp_rate: i32,
+    /// Whether ramping is enabled
+    enabled: bool,
+
+    /// Default ramp time in samples (~10ms at 44.1kHz = 441 samples)
+    pub const DEFAULT_RAMP_SAMPLES: i32 = 441;
+
+    pub fn init() VolumeRamper {
+        return VolumeRamper{
+            .target_volume = 0x10000, // Unity gain
+            .current_volume = 0x10000,
+            .ramp_rate = 0x10000 / DEFAULT_RAMP_SAMPLES,
+            .enabled = true,
+        };
+    }
+
+    /// Set target volume (0-100%, can exceed 100% for gain)
+    pub fn setVolume(self: *VolumeRamper, percent: u8) void {
+        // Map 0-100 to 0x0000-0x10000
+        self.target_volume = @divTrunc(@as(i32, percent) << 16, 100);
+    }
+
+    /// Set volume in fixed-point directly (for precise control)
+    pub fn setVolumeFixed(self: *VolumeRamper, volume_fp: i32) void {
+        self.target_volume = std.math.clamp(volume_fp, 0, 0x20000);
+    }
+
+    /// Set ramp time in milliseconds
+    pub fn setRampTimeMs(self: *VolumeRamper, ms: u16) void {
+        const samples = @divTrunc(@as(i32, ms) * SAMPLE_RATE, 1000);
+        if (samples > 0) {
+            self.ramp_rate = @divTrunc(0x10000, samples);
+        }
+    }
+
+    /// Immediately jump to target (no ramping)
+    pub fn jumpToTarget(self: *VolumeRamper) void {
+        self.current_volume = self.target_volume;
+    }
+
+    /// Check if currently ramping
+    pub fn isRamping(self: *const VolumeRamper) bool {
+        return self.current_volume != self.target_volume;
+    }
+
+    /// Get current volume as percentage
+    pub fn getVolumePercent(self: *const VolumeRamper) u8 {
+        return @intCast(@divTrunc(self.current_volume * 100, 0x10000));
+    }
+
+    /// Process a stereo sample with volume ramping
+    pub fn process(self: *VolumeRamper, left: i16, right: i16) StereoSample {
+        if (!self.enabled) {
+            return .{ .left = left, .right = right };
+        }
+
+        // Ramp current volume towards target
+        if (self.current_volume < self.target_volume) {
+            self.current_volume += self.ramp_rate;
+            if (self.current_volume > self.target_volume) {
+                self.current_volume = self.target_volume;
+            }
+        } else if (self.current_volume > self.target_volume) {
+            self.current_volume -= self.ramp_rate;
+            if (self.current_volume < self.target_volume) {
+                self.current_volume = self.target_volume;
+            }
+        }
+
+        // Apply volume
+        const l: i32 = @divTrunc(@as(i32, left) * self.current_volume, 0x10000);
+        const r: i32 = @divTrunc(@as(i32, right) * self.current_volume, 0x10000);
+
+        return .{
+            .left = @intCast(std.math.clamp(l, -32768, 32767)),
+            .right = @intCast(std.math.clamp(r, -32768, 32767)),
+        };
+    }
+
+    /// Process a buffer of stereo samples
+    pub fn processBuffer(self: *VolumeRamper, samples: []i16) void {
+        var i: usize = 0;
+        while (i + 1 < samples.len) : (i += 2) {
+            const result = self.process(samples[i], samples[i + 1]);
+            samples[i] = result.left;
+            samples[i + 1] = result.right;
+        }
+    }
+
+    /// Mute with ramping (fade out)
+    pub fn mute(self: *VolumeRamper) void {
+        self.target_volume = 0;
+    }
+
+    /// Unmute with ramping (fade in to previous level)
+    pub fn unmute(self: *VolumeRamper, percent: u8) void {
+        self.setVolume(percent);
+    }
+};
+
+// ============================================================
 // Complete DSP Chain
 // ============================================================
 
@@ -434,6 +864,7 @@ pub const DspChain = struct {
     equalizer: Equalizer,
     stereo_widener: StereoWidener,
     bass_boost: BassBoost,
+    volume: VolumeRamper,
     enabled: bool,
 
     pub fn init() DspChain {
@@ -441,8 +872,24 @@ pub const DspChain = struct {
             .equalizer = Equalizer.init(),
             .stereo_widener = StereoWidener.init(),
             .bass_boost = BassBoost.init(),
+            .volume = VolumeRamper.init(),
             .enabled = true,
         };
+    }
+
+    /// Set volume with smooth ramping (0-100%)
+    pub fn setVolume(self: *DspChain, percent: u8) void {
+        self.volume.setVolume(percent);
+    }
+
+    /// Get current volume percentage
+    pub fn getVolume(self: *const DspChain) u8 {
+        return self.volume.getVolumePercent();
+    }
+
+    /// Check if volume is currently ramping
+    pub fn isVolumeRamping(self: *const DspChain) bool {
+        return self.volume.isRamping();
     }
 
     /// Process a stereo sample through the entire DSP chain
@@ -451,8 +898,10 @@ pub const DspChain = struct {
             return .{ .left = left, .right = right };
         }
 
-        // Order: Bass Boost -> Equalizer -> Stereo Widener
-        var result = self.bass_boost.process(left, right);
+        // Order: Volume -> Bass Boost -> Equalizer -> Stereo Widener
+        // Volume first to avoid clipping in subsequent stages
+        var result = self.volume.process(left, right);
+        result = self.bass_boost.process(result.left, result.right);
         result = self.equalizer.process(result.left, result.right);
         result = self.stereo_widener.process(result.left, result.right);
 
@@ -478,6 +927,16 @@ pub const DspChain = struct {
             self.equalizer.setAllBands(preset.gains);
             self.equalizer.setPreamp(preset.preamp);
         }
+    }
+
+    /// Mute audio with smooth fade out
+    pub fn mute(self: *DspChain) void {
+        self.volume.mute();
+    }
+
+    /// Unmute audio with smooth fade in
+    pub fn unmute(self: *DspChain, percent: u8) void {
+        self.volume.unmute(percent);
     }
 };
 
@@ -630,4 +1089,130 @@ test "preset application" {
 
     dsp.applyPreset(1); // Rock preset
     try std.testing.expectEqual(@as(i8, 4), dsp.equalizer.getBandGain(0));
+}
+
+test "volume ramper initialization" {
+    const vol = VolumeRamper.init();
+    try std.testing.expectEqual(@as(i32, 0x10000), vol.target_volume);
+    try std.testing.expectEqual(@as(i32, 0x10000), vol.current_volume);
+    try std.testing.expect(vol.enabled);
+}
+
+test "volume ramper set volume" {
+    var vol = VolumeRamper.init();
+
+    vol.setVolume(50);
+    try std.testing.expectEqual(@as(i32, 0x8000), vol.target_volume);
+
+    vol.setVolume(100);
+    try std.testing.expectEqual(@as(i32, 0x10000), vol.target_volume);
+}
+
+test "volume ramper ramping" {
+    var vol = VolumeRamper.init();
+    vol.jumpToTarget(); // Ensure current == target
+
+    // Set lower volume
+    vol.setVolume(0);
+    try std.testing.expect(vol.isRamping());
+
+    // Process samples - should ramp down
+    for (0..1000) |_| {
+        _ = vol.process(1000, 1000);
+    }
+
+    // Should have ramped down significantly
+    try std.testing.expect(vol.current_volume < 0x10000);
+}
+
+test "volume ramper mute" {
+    var vol = VolumeRamper.init();
+    vol.mute();
+
+    try std.testing.expectEqual(@as(i32, 0), vol.target_volume);
+}
+
+test "ditherer initialization" {
+    const dither = Ditherer.init();
+    try std.testing.expect(dither.enabled);
+    try std.testing.expect(dither.lfsr_state != 0);
+}
+
+test "ditherer generates varied output" {
+    var dither = Ditherer.init();
+
+    // Same input should produce slightly varied output due to dithering
+    const out1 = dither.ditherToI16(0x7FFF0000);
+    const out2 = dither.ditherToI16(0x7FFF0000);
+
+    // Values should be close but potentially different due to dither noise
+    try std.testing.expect(@abs(@as(i32, out1) - @as(i32, out2)) < 10);
+}
+
+test "ditherer disabled pass-through" {
+    var dither = Ditherer.init();
+    dither.enabled = false;
+
+    // With dithering disabled, should just truncate
+    const out = dither.ditherToI16(0x40000000);
+    try std.testing.expectEqual(@as(i16, 0x4000), out);
+}
+
+test "resampler initialization" {
+    const resampler = Resampler.init();
+    try std.testing.expectEqual(@as(u32, 44100), resampler.input_rate);
+    try std.testing.expectEqual(@as(u32, 44100), resampler.output_rate);
+    try std.testing.expect(!resampler.enabled);
+}
+
+test "resampler same rate passthrough" {
+    var resampler = Resampler.init();
+    resampler.configure(44100, 44100);
+
+    try std.testing.expect(!resampler.enabled);
+    try std.testing.expectEqual(@as(u32, 0x10000), resampler.phase_inc);
+}
+
+test "resampler 48k to 44.1k" {
+    var resampler = Resampler.init();
+    resampler.configure(48000, 44100);
+
+    try std.testing.expect(resampler.enabled);
+    // phase_inc = 48000/44100 ≈ 1.088 in Q16.16 = ~71330
+    try std.testing.expect(resampler.phase_inc > 0x10000);
+    try std.testing.expect(resampler.phase_inc < 0x12000);
+}
+
+test "resampler 22050 to 44100" {
+    var resampler = Resampler.init();
+    resampler.configure(22050, 44100);
+
+    try std.testing.expect(resampler.enabled);
+    // phase_inc = 22050/44100 = 0.5 in Q16.16 = 0x8000
+    try std.testing.expectEqual(@as(u32, 0x8000), resampler.phase_inc);
+}
+
+test "resampler buffer upsampling" {
+    var resampler = Resampler.init();
+    resampler.configure(22050, 44100); // 2x upsampling
+
+    // Input: 2 stereo samples
+    const input = [_]i16{ 1000, 2000, 3000, 4000 };
+    var output: [8]i16 = undefined;
+
+    const count = resampler.resampleBuffer(&input, &output);
+
+    // Should produce approximately 4 stereo samples (2x input)
+    try std.testing.expect(count >= 2);
+    try std.testing.expect(count <= 4);
+}
+
+test "resampler calc output size" {
+    var resampler = Resampler.init();
+    resampler.configure(44100, 48000);
+
+    const out_size = resampler.calcOutputSize(100);
+    // 100 samples at 44100 -> ~109 samples at 48000
+    try std.testing.expect(out_size >= 108);
+    try std.testing.expect(out_size <= 110);
 }

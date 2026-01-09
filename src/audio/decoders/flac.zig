@@ -14,10 +14,13 @@ const audio = @import("../audio.zig");
 const FLAC_MARKER = "fLaC";
 
 /// Maximum block size (samples)
-const MAX_BLOCK_SIZE: usize = 65535;
+/// Typical FLAC files use 4096-8192 sample blocks
+/// 8192 covers 99%+ of real-world FLAC files
+const MAX_BLOCK_SIZE: usize = 8192;
 
-/// Maximum channels
-const MAX_CHANNELS: u8 = 8;
+/// Maximum channels (stereo only for iPod - saves memory)
+/// Original FLAC spec allows up to 8 channels, but iPod only outputs stereo
+const MAX_CHANNELS: u8 = 2;
 
 /// Subframe types
 const SubframeType = enum(u8) {
@@ -230,6 +233,15 @@ pub const FlacDecoder = struct {
                 @as(u64, si_data[17]),
             .md5_signature = si_data[18..34].*,
         };
+
+        // Validate file doesn't exceed our embedded constraints
+        // iPod only supports stereo output, and we limit block size to save memory
+        if (stream_info.channels > MAX_CHANNELS) {
+            return Error.UnsupportedFormat; // Only stereo supported on iPod
+        }
+        if (stream_info.max_block_size > MAX_BLOCK_SIZE) {
+            return Error.UnsupportedFormat; // Block size too large for our buffer
+        }
 
         // Skip remaining metadata blocks
         var offset: usize = 42;

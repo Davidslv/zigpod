@@ -239,6 +239,316 @@ pub fn createDebouncedButton(button: u8) DebouncedButton {
 // Wheel Gesture Detection
 // ============================================================
 
+// ============================================================
+// Wheel Acceleration
+// ============================================================
+
+/// Wheel acceleration for faster scrolling through large lists
+/// Uses velocity tracking and exponential curve for natural feel
+pub const WheelAccelerator = struct {
+    /// Configuration
+    pub const Config = struct {
+        /// Base scroll speed (1.0 = raw delta)
+        base_multiplier: u16 = 256, // Q8 fixed-point (1.0)
+        /// Maximum acceleration multiplier
+        max_multiplier: u16 = 2048, // Q8 fixed-point (8.0)
+        /// Velocity threshold to start accelerating (wheel positions per second)
+        accel_threshold: u32 = 50,
+        /// Time window to measure velocity (ms)
+        velocity_window: u32 = 100,
+        /// Decay rate when wheel stops (ms to return to base speed)
+        decay_ms: u32 = 300,
+    };
+
+    config: Config = .{},
+
+    // State
+    last_delta_time: u32 = 0,
+    last_delta: i8 = 0,
+    accumulated_delta: i32 = 0,
+    velocity: u32 = 0, // positions per second, Q0
+    current_multiplier: u16 = 256, // Q8
+
+    // History for velocity calculation
+    history: [4]DeltaEntry = [_]DeltaEntry{.{}} ** 4,
+    history_index: u8 = 0,
+
+    const DeltaEntry = struct {
+        delta: i8 = 0,
+        timestamp: u32 = 0,
+    };
+
+    /// Update with new wheel delta
+    pub fn update(self: *WheelAccelerator, delta: i8, timestamp: u32) i16 {
+        if (delta == 0) {
+            // Decay acceleration when wheel is idle
+            self.decay(timestamp);
+            return 0;
+        }
+
+        // Add to history
+        self.history[self.history_index] = .{ .delta = delta, .timestamp = timestamp };
+        self.history_index = (self.history_index + 1) % 4;
+
+        // Calculate velocity from history
+        self.velocity = self.calculateVelocity(timestamp);
+
+        // Update multiplier based on velocity
+        self.updateMultiplier();
+
+        // Apply acceleration
+        const abs_delta: i32 = if (delta < 0) -@as(i32, delta) else @as(i32, delta);
+        const sign: i32 = if (delta < 0) -1 else 1;
+        const accelerated = (abs_delta * self.current_multiplier) >> 8;
+        const result = sign * @max(1, accelerated);
+
+        self.last_delta = delta;
+        self.last_delta_time = timestamp;
+
+        return @intCast(std.math.clamp(result, -127, 127));
+    }
+
+    fn calculateVelocity(self: *WheelAccelerator, current_time: u32) u32 {
+        var total_delta: u32 = 0;
+        var oldest_time: u32 = current_time;
+        var valid_entries: u32 = 0;
+
+        for (self.history) |entry| {
+            if (entry.timestamp > 0 and current_time - entry.timestamp < self.config.velocity_window) {
+                const abs_delta: u32 = if (entry.delta < 0)
+                    @intCast(-@as(i32, entry.delta))
+                else
+                    @intCast(entry.delta);
+                total_delta += abs_delta;
+                if (entry.timestamp < oldest_time) {
+                    oldest_time = entry.timestamp;
+                }
+                valid_entries += 1;
+            }
+        }
+
+        if (valid_entries < 2 or current_time == oldest_time) {
+            return 0;
+        }
+
+        // positions per second
+        const time_span = current_time - oldest_time;
+        if (time_span == 0) return 0;
+        return (total_delta * 1000) / time_span;
+    }
+
+    fn updateMultiplier(self: *WheelAccelerator) void {
+        if (self.velocity < self.config.accel_threshold) {
+            self.current_multiplier = self.config.base_multiplier;
+            return;
+        }
+
+        // Exponential curve: multiplier = base * (velocity / threshold)^0.7
+        // Approximated with linear interpolation for embedded
+        const excess = self.velocity - self.config.accel_threshold;
+        const scale = @min(excess, 200); // Cap at 200 excess velocity
+
+        // Linear interpolation from base to max based on velocity
+        // Use u32 to avoid overflow: range (1792) * scale (200) = 358400
+        const range: u32 = self.config.max_multiplier - self.config.base_multiplier;
+        const increase: u32 = (range * scale) / 200;
+        self.current_multiplier = self.config.base_multiplier + @as(u16, @intCast(increase));
+    }
+
+    fn decay(self: *WheelAccelerator, current_time: u32) void {
+        if (self.current_multiplier <= self.config.base_multiplier) return;
+
+        const elapsed = current_time - self.last_delta_time;
+        if (elapsed >= self.config.decay_ms) {
+            self.current_multiplier = self.config.base_multiplier;
+            self.velocity = 0;
+        } else {
+            // Gradual decay
+            const progress = (elapsed * 256) / self.config.decay_ms;
+            const range = self.current_multiplier - self.config.base_multiplier;
+            const decay_amount = (range * @as(u16, @intCast(progress))) / 256;
+            if (decay_amount >= range) {
+                self.current_multiplier = self.config.base_multiplier;
+            } else {
+                self.current_multiplier -= @as(u16, @intCast(decay_amount));
+            }
+        }
+    }
+
+    /// Reset acceleration state
+    pub fn reset(self: *WheelAccelerator) void {
+        self.current_multiplier = self.config.base_multiplier;
+        self.velocity = 0;
+        self.history = [_]DeltaEntry{.{}} ** 4;
+        self.history_index = 0;
+    }
+
+    /// Get current acceleration multiplier (Q8 fixed-point, 256 = 1.0x)
+    pub fn getMultiplier(self: *const WheelAccelerator) u16 {
+        return self.current_multiplier;
+    }
+
+    /// Get current velocity (positions per second)
+    pub fn getVelocity(self: *const WheelAccelerator) u32 {
+        return self.velocity;
+    }
+};
+
+/// Create a wheel accelerator
+pub fn createWheelAccelerator() WheelAccelerator {
+    return WheelAccelerator{};
+}
+
+// ============================================================
+// Gesture Detection
+// ============================================================
+
+/// Comprehensive gesture detector for buttons and wheel
+pub const GestureDetector = struct {
+    /// Gesture types
+    pub const GestureType = enum {
+        none,
+        tap, // Quick press and release
+        long_press, // Held for threshold time
+        double_tap, // Two quick taps
+        hold, // Currently being held (continuous)
+        scrub_cw, // Fast clockwise wheel movement
+        scrub_ccw, // Fast counter-clockwise wheel movement
+    };
+
+    /// Configuration
+    pub const Config = struct {
+        tap_max_ms: u32 = 200, // Max time for a tap
+        long_press_ms: u32 = 800, // Time to trigger long press
+        double_tap_window_ms: u32 = 400, // Window for double tap
+        scrub_threshold: u32 = 48, // Wheel positions to trigger scrub
+    };
+
+    config: Config = .{},
+
+    // Button state
+    button_down_time: u32 = 0,
+    button_up_time: u32 = 0,
+    button_down: bool = false,
+    last_button: u8 = 0,
+    tap_count: u8 = 0,
+    long_press_fired: bool = false,
+
+    // Wheel state
+    wheel_accumulator: i32 = 0,
+    wheel_direction: i8 = 0,
+    wheel_last_time: u32 = 0,
+
+    /// Update with new input event, returns detected gesture
+    pub fn update(self: *GestureDetector, event: InputEvent) GestureType {
+        var gesture: GestureType = .none;
+
+        // Check for wheel gestures
+        if (event.wheel_delta != 0) {
+            gesture = self.updateWheel(event.wheel_delta, event.timestamp);
+            if (gesture != .none) return gesture;
+        } else {
+            // Wheel idle - decay accumulator
+            if (event.timestamp - self.wheel_last_time > 200) {
+                self.wheel_accumulator = 0;
+            }
+        }
+
+        // Check for button gestures
+        const any_pressed = event.anyButtonPressed();
+
+        if (any_pressed and !self.button_down) {
+            // Button just pressed
+            self.button_down = true;
+            self.button_down_time = event.timestamp;
+            self.last_button = event.buttons;
+            self.long_press_fired = false;
+        } else if (!any_pressed and self.button_down) {
+            // Button just released
+            self.button_down = false;
+            self.button_up_time = event.timestamp;
+
+            const press_duration = event.timestamp - self.button_down_time;
+
+            if (!self.long_press_fired and press_duration < self.config.tap_max_ms) {
+                // This was a tap
+                if (self.tap_count == 1 and event.timestamp - self.button_up_time < self.config.double_tap_window_ms) {
+                    self.tap_count = 0;
+                    return .double_tap;
+                } else {
+                    self.tap_count = 1;
+                    return .tap;
+                }
+            }
+        } else if (self.button_down) {
+            // Button being held
+            const press_duration = event.timestamp - self.button_down_time;
+
+            if (!self.long_press_fired and press_duration >= self.config.long_press_ms) {
+                self.long_press_fired = true;
+                return .long_press;
+            }
+
+            if (self.long_press_fired) {
+                return .hold;
+            }
+        }
+
+        // Reset tap count if window expired
+        if (self.tap_count > 0 and event.timestamp - self.button_up_time > self.config.double_tap_window_ms) {
+            self.tap_count = 0;
+        }
+
+        return gesture;
+    }
+
+    fn updateWheel(self: *GestureDetector, delta: i8, timestamp: u32) GestureType {
+        const direction: i8 = if (delta > 0) 1 else -1;
+
+        if (direction != self.wheel_direction) {
+            // Direction changed - reset
+            self.wheel_accumulator = 0;
+            self.wheel_direction = direction;
+        }
+
+        self.wheel_accumulator += delta;
+        self.wheel_last_time = timestamp;
+
+        const abs_accum: u32 = @intCast(@abs(self.wheel_accumulator));
+
+        if (abs_accum >= self.config.scrub_threshold) {
+            // Scrub detected - reset and return
+            self.wheel_accumulator = 0;
+            return if (direction > 0) .scrub_cw else .scrub_ccw;
+        }
+
+        return .none;
+    }
+
+    /// Reset all gesture state
+    pub fn reset(self: *GestureDetector) void {
+        self.button_down = false;
+        self.tap_count = 0;
+        self.long_press_fired = false;
+        self.wheel_accumulator = 0;
+        self.wheel_direction = 0;
+    }
+
+    /// Get the button that triggered the last gesture
+    pub fn getLastButton(self: *const GestureDetector) u8 {
+        return self.last_button;
+    }
+};
+
+/// Create a gesture detector
+pub fn createGestureDetector() GestureDetector {
+    return GestureDetector{};
+}
+
+// ============================================================
+// Wheel Pattern Detection
+// ============================================================
+
 /// Gesture state for detecting wheel patterns
 pub const WheelGesture = struct {
     accumulated_delta: i32 = 0,
@@ -429,4 +739,140 @@ test "button names" {
     try std.testing.expectEqualStrings("Select", buttonName(Button.SELECT));
     try std.testing.expectEqualStrings("Menu", buttonName(Button.MENU));
     try std.testing.expectEqualStrings("Play/Pause", buttonName(Button.PLAY));
+}
+
+test "wheel accelerator base speed" {
+    var accel = createWheelAccelerator();
+
+    // At slow speeds, should return approximately the input delta
+    const result = accel.update(5, 0);
+    // Base multiplier is 256 (1.0x), so result should be ~5
+    try std.testing.expectEqual(@as(i16, 5), result);
+}
+
+test "wheel accelerator velocity buildup" {
+    var accel = createWheelAccelerator();
+
+    // Simulate fast spinning (many deltas in quick succession)
+    _ = accel.update(10, 0);
+    _ = accel.update(10, 20);
+    _ = accel.update(10, 40);
+    const result = accel.update(10, 60);
+
+    // After velocity builds up, multiplier should increase
+    // Velocity should be around 500 positions/second (10 delta per 20ms)
+    try std.testing.expect(accel.getVelocity() > 0);
+
+    // Result should be >= 10 due to acceleration
+    try std.testing.expect(result >= 10);
+}
+
+test "wheel accelerator decay" {
+    var accel = createWheelAccelerator();
+
+    // Build up velocity
+    _ = accel.update(10, 0);
+    _ = accel.update(10, 20);
+    _ = accel.update(10, 40);
+    _ = accel.update(10, 60);
+
+    const before = accel.getMultiplier();
+
+    // Wait for decay (simulate idle time > decay_ms)
+    _ = accel.update(0, 500);
+
+    // Multiplier should decay back toward base
+    try std.testing.expect(accel.getMultiplier() <= before);
+}
+
+test "wheel accelerator reset" {
+    var accel = createWheelAccelerator();
+
+    // Build up velocity
+    _ = accel.update(10, 0);
+    _ = accel.update(10, 20);
+
+    accel.reset();
+
+    try std.testing.expectEqual(@as(u16, 256), accel.getMultiplier());
+    try std.testing.expectEqual(@as(u32, 0), accel.getVelocity());
+}
+
+test "gesture detector tap" {
+    var detector = createGestureDetector();
+
+    // Press button
+    var event = InputEvent{
+        .buttons = Button.SELECT,
+        .wheel_position = 0,
+        .wheel_delta = 0,
+        .timestamp = 0,
+    };
+    var gesture = detector.update(event);
+    try std.testing.expectEqual(GestureDetector.GestureType.none, gesture);
+
+    // Release within tap window
+    event.buttons = 0;
+    event.timestamp = 100;
+    gesture = detector.update(event);
+    try std.testing.expectEqual(GestureDetector.GestureType.tap, gesture);
+}
+
+test "gesture detector long press" {
+    var detector = createGestureDetector();
+
+    // Press button
+    var event = InputEvent{
+        .buttons = Button.MENU,
+        .wheel_position = 0,
+        .wheel_delta = 0,
+        .timestamp = 0,
+    };
+    _ = detector.update(event);
+
+    // Hold past long press threshold
+    event.timestamp = 900;
+    const gesture = detector.update(event);
+    try std.testing.expectEqual(GestureDetector.GestureType.long_press, gesture);
+}
+
+test "gesture detector scrub" {
+    var detector = createGestureDetector();
+
+    // Accumulate wheel movement
+    var event = InputEvent{
+        .buttons = 0,
+        .wheel_position = 0,
+        .wheel_delta = 20,
+        .timestamp = 0,
+    };
+    _ = detector.update(event);
+
+    event.wheel_delta = 20;
+    event.timestamp = 50;
+    _ = detector.update(event);
+
+    event.wheel_delta = 20;
+    event.timestamp = 100;
+    const gesture = detector.update(event);
+
+    // 60 total delta should trigger scrub (threshold is 48)
+    try std.testing.expectEqual(GestureDetector.GestureType.scrub_cw, gesture);
+}
+
+test "gesture detector reset" {
+    var detector = createGestureDetector();
+
+    // Press a button
+    const event = InputEvent{
+        .buttons = Button.SELECT,
+        .wheel_position = 0,
+        .wheel_delta = 0,
+        .timestamp = 0,
+    };
+    _ = detector.update(event);
+
+    detector.reset();
+    try std.testing.expect(!detector.button_down);
+    try std.testing.expectEqual(@as(i32, 0), detector.wheel_accumulator);
 }

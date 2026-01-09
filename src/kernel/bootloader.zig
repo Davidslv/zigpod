@@ -101,19 +101,43 @@ pub const FirmwareHeader = extern struct {
     version_major: u8 = 0,
     version_minor: u8 = 1,
     version_patch: u8 = 0,
-    _reserved: u8 = 0,
+    flags: FirmwareFlags = .{},
     size: u32 = 0,
     entry_point: u32 = 0,
     load_address: u32 = 0,
     checksum: u32 = 0,
     build_timestamp: u32 = 0,
     name: [32]u8 = [_]u8{0} ** 32,
+    /// Signature offset from start of firmware (0 = no signature)
+    signature_offset: u32 = 0,
+    /// Signature length in bytes
+    signature_length: u16 = 0,
+    /// Signature algorithm ID
+    signature_algorithm: SignatureAlgorithm = .none,
+    _reserved2: u8 = 0,
+
+    pub const FirmwareFlags = packed struct {
+        /// Firmware requires signature verification
+        requires_signature: bool = false,
+        /// Firmware is a development/debug build
+        debug_build: bool = false,
+        /// Firmware supports secure boot
+        secure_boot_capable: bool = false,
+        _reserved: u5 = 0,
+    };
 
     /// Check if header is valid
     pub fn isValid(self: *const FirmwareHeader) bool {
         return self.magic == ZIGPOD_MAGIC and
             self.size > 0 and
             self.entry_point >= self.load_address;
+    }
+
+    /// Check if firmware has a signature
+    pub fn hasSignature(self: *const FirmwareHeader) bool {
+        return self.signature_offset > 0 and
+            self.signature_length > 0 and
+            self.signature_algorithm != .none;
     }
 
     /// Get version string
@@ -125,6 +149,129 @@ pub const FirmwareHeader = extern struct {
         }) catch buffer[0..0];
     }
 };
+
+// ============================================================
+// Firmware Signature Infrastructure (Placeholder)
+// ============================================================
+//
+// This module provides the framework for firmware signature
+// verification. Currently a placeholder implementation.
+//
+// Future implementation should:
+// 1. Use Ed25519 or ECDSA signatures
+// 2. Embed public key in bootloader ROM
+// 3. Verify signature before booting firmware
+// 4. Support key rotation via signed updates
+//
+// Security Notes:
+// - Never ship debug builds with signature bypass
+// - Bootloader must be ROM-locked after production
+// - Consider hardware-backed key storage (if available)
+
+/// Supported signature algorithms
+pub const SignatureAlgorithm = enum(u8) {
+    none = 0,
+    /// Ed25519 signature (planned)
+    ed25519 = 1,
+    /// ECDSA with P-256 curve (planned)
+    ecdsa_p256 = 2,
+    /// RSA-2048 with SHA-256 (legacy, not recommended)
+    rsa2048_sha256 = 3,
+};
+
+/// Signature verification result
+pub const SignatureResult = enum {
+    /// No signature present or not required
+    not_applicable,
+    /// Signature verification passed
+    valid,
+    /// Signature verification failed
+    invalid,
+    /// Unknown or unsupported algorithm
+    unsupported_algorithm,
+    /// Signature data corrupted or malformed
+    malformed,
+    /// Internal verification error
+    error_internal,
+};
+
+/// Public key for signature verification
+/// This would be embedded in the bootloader at build time
+pub const PublicKey = struct {
+    algorithm: SignatureAlgorithm,
+    key_data: [64]u8, // Max size for Ed25519/P-256 public keys
+
+    /// Placeholder: would contain actual key in production
+    pub fn getBootloaderKey() PublicKey {
+        return PublicKey{
+            .algorithm = .none,
+            .key_data = [_]u8{0} ** 64,
+        };
+    }
+};
+
+/// Verify firmware signature
+/// PLACEHOLDER: Returns not_applicable for now
+/// Real implementation would perform cryptographic verification
+pub fn verifyFirmwareSignature(header: *const FirmwareHeader) SignatureResult {
+    // Check if firmware has signature
+    if (!header.hasSignature()) {
+        // No signature - check if required
+        if (header.flags.requires_signature) {
+            return .invalid;
+        }
+        return .not_applicable;
+    }
+
+    // Check algorithm support
+    switch (header.signature_algorithm) {
+        .none => return .not_applicable,
+        .ed25519 => {
+            // PLACEHOLDER: Ed25519 verification would go here
+            // 1. Get public key from PublicKey.getBootloaderKey()
+            // 2. Read signature from firmware at signature_offset
+            // 3. Compute hash of firmware data
+            // 4. Verify signature against hash with public key
+            return .unsupported_algorithm;
+        },
+        .ecdsa_p256 => {
+            // PLACEHOLDER: ECDSA verification would go here
+            return .unsupported_algorithm;
+        },
+        .rsa2048_sha256 => {
+            // PLACEHOLDER: RSA verification would go here
+            return .unsupported_algorithm;
+        },
+    }
+}
+
+/// Check if signature verification should be enforced
+/// In production builds, this should return true
+pub fn isSignatureEnforcementEnabled() bool {
+    // PLACEHOLDER: In production, return true
+    // For development, allow unsigned firmware
+    return false;
+}
+
+/// Validate firmware for booting
+/// Combines header validation and signature verification
+pub fn validateFirmwareForBoot(header: *const FirmwareHeader) bool {
+    // Basic header validation
+    if (!header.isValid()) {
+        return false;
+    }
+
+    // Signature verification (if enforcement enabled)
+    if (isSignatureEnforcementEnabled()) {
+        const sig_result = verifyFirmwareSignature(header);
+        switch (sig_result) {
+            .valid, .not_applicable => return true,
+            else => return false,
+        }
+    }
+
+    return true;
+}
 
 // ============================================================
 // Bootloader State
@@ -414,4 +561,96 @@ test "firmware header validation" {
     // Invalid: size is 0
     header.size = 0;
     try std.testing.expect(!header.isValid());
+}
+
+test "firmware header signature detection" {
+    // No signature
+    const header_no_sig = FirmwareHeader{
+        .size = 1024,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+    };
+    try std.testing.expect(!header_no_sig.hasSignature());
+
+    // Has signature
+    var header_with_sig = FirmwareHeader{
+        .size = 1024,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+        .signature_offset = 1024,
+        .signature_length = 64,
+        .signature_algorithm = .ed25519,
+    };
+    try std.testing.expect(header_with_sig.hasSignature());
+
+    // Has offset but no algorithm
+    header_with_sig.signature_algorithm = .none;
+    try std.testing.expect(!header_with_sig.hasSignature());
+}
+
+test "signature verification - no signature" {
+    const header = FirmwareHeader{
+        .size = 1024,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+    };
+
+    const result = verifyFirmwareSignature(&header);
+    try std.testing.expectEqual(SignatureResult.not_applicable, result);
+}
+
+test "signature verification - requires but missing" {
+    var header = FirmwareHeader{
+        .size = 1024,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+    };
+    header.flags.requires_signature = true;
+
+    const result = verifyFirmwareSignature(&header);
+    try std.testing.expectEqual(SignatureResult.invalid, result);
+}
+
+test "signature verification - unsupported algorithm" {
+    const header = FirmwareHeader{
+        .size = 1024,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+        .signature_offset = 1024,
+        .signature_length = 64,
+        .signature_algorithm = .ed25519,
+    };
+
+    const result = verifyFirmwareSignature(&header);
+    // Currently returns unsupported as it's a placeholder
+    try std.testing.expectEqual(SignatureResult.unsupported_algorithm, result);
+}
+
+test "validate firmware for boot" {
+    // Valid firmware, no signature required
+    const valid = FirmwareHeader{
+        .size = 1024,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+    };
+    try std.testing.expect(validateFirmwareForBoot(&valid));
+
+    // Invalid firmware (size = 0)
+    const invalid = FirmwareHeader{
+        .size = 0,
+        .entry_point = 0x40100100,
+        .load_address = 0x40100000,
+    };
+    try std.testing.expect(!validateFirmwareForBoot(&invalid));
+}
+
+test "signature algorithm enum" {
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(SignatureAlgorithm.none));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(SignatureAlgorithm.ed25519));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(SignatureAlgorithm.ecdsa_p256));
+}
+
+test "public key placeholder" {
+    const key = PublicKey.getBootloaderKey();
+    try std.testing.expectEqual(SignatureAlgorithm.none, key.algorithm);
 }

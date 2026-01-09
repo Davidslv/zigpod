@@ -512,6 +512,334 @@ pub fn init() hal.HalError!void {
 }
 
 // ============================================================
+// Overlay System
+// ============================================================
+
+/// Overlay types
+pub const OverlayType = enum {
+    none,
+    volume,
+    brightness,
+    hold,
+    low_battery,
+    charging,
+};
+
+/// Overlay display state
+pub const OverlayState = struct {
+    overlay_type: OverlayType = .none,
+    value: u8 = 0, // 0-100 for volume/brightness
+    show_time: u32 = 0, // Timestamp when overlay was shown
+    duration_ms: u32 = 1500, // How long to show overlay
+
+    /// Check if overlay should still be visible
+    pub fn isVisible(self: *const OverlayState, current_time: u32) bool {
+        if (self.overlay_type == .none) return false;
+        return (current_time - self.show_time) < self.duration_ms;
+    }
+
+    /// Show volume overlay
+    pub fn showVolume(self: *OverlayState, volume: u8, timestamp: u32) void {
+        self.overlay_type = .volume;
+        self.value = volume;
+        self.show_time = timestamp;
+    }
+
+    /// Show brightness overlay
+    pub fn showBrightness(self: *OverlayState, brightness: u8, timestamp: u32) void {
+        self.overlay_type = .brightness;
+        self.value = brightness;
+        self.show_time = timestamp;
+    }
+
+    /// Show hold switch indicator
+    pub fn showHold(self: *OverlayState, timestamp: u32) void {
+        self.overlay_type = .hold;
+        self.show_time = timestamp;
+        self.duration_ms = 2000;
+    }
+
+    /// Show low battery warning
+    pub fn showLowBattery(self: *OverlayState, percent: u8, timestamp: u32) void {
+        self.overlay_type = .low_battery;
+        self.value = percent;
+        self.show_time = timestamp;
+        self.duration_ms = 3000;
+    }
+
+    /// Show charging indicator
+    pub fn showCharging(self: *OverlayState, percent: u8, timestamp: u32) void {
+        self.overlay_type = .charging;
+        self.value = percent;
+        self.show_time = timestamp;
+    }
+
+    /// Hide overlay
+    pub fn hide(self: *OverlayState) void {
+        self.overlay_type = .none;
+    }
+};
+
+var overlay_state = OverlayState{};
+
+/// Get overlay state
+pub fn getOverlay() *OverlayState {
+    return &overlay_state;
+}
+
+/// Draw the current overlay (if visible)
+pub fn drawOverlay(current_time: u32) void {
+    if (!overlay_state.isVisible(current_time)) return;
+
+    switch (overlay_state.overlay_type) {
+        .volume => drawVolumeOverlay(overlay_state.value),
+        .brightness => drawBrightnessOverlay(overlay_state.value),
+        .hold => drawHoldOverlay(),
+        .low_battery => drawLowBatteryOverlay(overlay_state.value),
+        .charging => drawChargingOverlay(overlay_state.value),
+        .none => {},
+    }
+}
+
+/// Draw volume overlay
+fn drawVolumeOverlay(volume: u8) void {
+    const box_width: u16 = 180;
+    const box_height: u16 = 70;
+    const box_x: u16 = (SCREEN_WIDTH - box_width) / 2;
+    const box_y: u16 = (SCREEN_HEIGHT - box_height) / 2;
+
+    // Semi-transparent overlay effect (dark background)
+    lcd.fillRect(box_x, box_y, box_width, box_height, lcd.rgb(30, 30, 30));
+    lcd.drawRect(box_x, box_y, box_width, box_height, current_theme.accent);
+
+    // Speaker icon (simple representation)
+    const icon_x = box_x + 15;
+    const icon_y = box_y + 25;
+    lcd.fillRect(icon_x, icon_y, 8, 20, lcd.rgb(200, 200, 200));
+    lcd.fillRect(icon_x + 8, icon_y - 5, 10, 30, lcd.rgb(200, 200, 200));
+
+    // Volume label
+    lcd.drawString(icon_x + 30, box_y + 12, "Volume", lcd.rgb(200, 200, 200), lcd.rgb(30, 30, 30));
+
+    // Volume bar
+    const bar_x: u16 = box_x + 40;
+    const bar_y: u16 = box_y + 35;
+    const bar_width: u16 = 120;
+    const bar_height: u16 = 20;
+
+    // Background bar
+    lcd.fillRect(bar_x, bar_y, bar_width, bar_height, lcd.rgb(60, 60, 60));
+
+    // Filled portion
+    const filled_width: u16 = (bar_width * volume) / 100;
+    if (filled_width > 0) {
+        lcd.fillRect(bar_x, bar_y, filled_width, bar_height, current_theme.accent);
+    }
+
+    // Volume percentage
+    var buf: [4]u8 = undefined;
+    const percent_str = formatNumber(volume, &buf);
+    lcd.drawString(bar_x + bar_width + 5, bar_y + 6, percent_str, lcd.rgb(200, 200, 200), lcd.rgb(30, 30, 30));
+}
+
+/// Draw brightness overlay
+fn drawBrightnessOverlay(brightness: u8) void {
+    const box_width: u16 = 180;
+    const box_height: u16 = 70;
+    const box_x: u16 = (SCREEN_WIDTH - box_width) / 2;
+    const box_y: u16 = (SCREEN_HEIGHT - box_height) / 2;
+
+    lcd.fillRect(box_x, box_y, box_width, box_height, lcd.rgb(30, 30, 30));
+    lcd.drawRect(box_x, box_y, box_width, box_height, current_theme.accent);
+
+    // Sun icon (simple circle)
+    const icon_x = box_x + 15;
+    const icon_y = box_y + 25;
+    lcd.fillRect(icon_x + 5, icon_y + 5, 10, 10, lcd.rgb(255, 200, 0));
+
+    // Brightness label
+    lcd.drawString(icon_x + 30, box_y + 12, "Brightness", lcd.rgb(200, 200, 200), lcd.rgb(30, 30, 30));
+
+    // Brightness bar
+    const bar_x: u16 = box_x + 40;
+    const bar_y: u16 = box_y + 35;
+    const bar_width: u16 = 120;
+    const bar_height: u16 = 20;
+
+    lcd.fillRect(bar_x, bar_y, bar_width, bar_height, lcd.rgb(60, 60, 60));
+
+    const filled_width: u16 = (bar_width * brightness) / 100;
+    if (filled_width > 0) {
+        lcd.fillRect(bar_x, bar_y, filled_width, bar_height, lcd.rgb(255, 200, 0));
+    }
+
+    var buf: [4]u8 = undefined;
+    const percent_str = formatNumber(brightness, &buf);
+    lcd.drawString(bar_x + bar_width + 5, bar_y + 6, percent_str, lcd.rgb(200, 200, 200), lcd.rgb(30, 30, 30));
+}
+
+/// Draw hold switch overlay
+fn drawHoldOverlay() void {
+    const box_width: u16 = 160;
+    const box_height: u16 = 60;
+    const box_x: u16 = (SCREEN_WIDTH - box_width) / 2;
+    const box_y: u16 = (SCREEN_HEIGHT - box_height) / 2;
+
+    lcd.fillRect(box_x, box_y, box_width, box_height, lcd.rgb(40, 40, 40));
+    lcd.drawRect(box_x, box_y, box_width, box_height, lcd.rgb(255, 165, 0));
+
+    // Lock icon (simple padlock shape)
+    const lock_x = box_x + 20;
+    const lock_y = box_y + 20;
+    lcd.drawRect(lock_x, lock_y - 8, 16, 10, lcd.rgb(255, 165, 0));
+    lcd.fillRect(lock_x - 2, lock_y, 20, 20, lcd.rgb(255, 165, 0));
+
+    lcd.drawString(lock_x + 35, box_y + 22, "Hold On", lcd.rgb(255, 165, 0), lcd.rgb(40, 40, 40));
+}
+
+/// Draw low battery warning overlay
+fn drawLowBatteryOverlay(percent: u8) void {
+    const box_width: u16 = 200;
+    const box_height: u16 = 70;
+    const box_x: u16 = (SCREEN_WIDTH - box_width) / 2;
+    const box_y: u16 = (SCREEN_HEIGHT - box_height) / 2;
+
+    lcd.fillRect(box_x, box_y, box_width, box_height, lcd.rgb(50, 20, 20));
+    lcd.drawRect(box_x, box_y, box_width, box_height, lcd.rgb(255, 50, 50));
+
+    // Battery icon
+    drawBatteryIcon(box_x + 15, box_y + 20, percent, true);
+
+    lcd.drawString(box_x + 55, box_y + 15, "Low Battery", lcd.rgb(255, 100, 100), lcd.rgb(50, 20, 20));
+
+    var buf: [8]u8 = undefined;
+    const percent_str = formatNumber(percent, buf[0..4]);
+    lcd.drawString(box_x + 55, box_y + 35, percent_str, lcd.rgb(200, 200, 200), lcd.rgb(50, 20, 20));
+    lcd.drawString(box_x + 80, box_y + 35, "% remaining", lcd.rgb(200, 200, 200), lcd.rgb(50, 20, 20));
+}
+
+/// Draw charging indicator overlay
+fn drawChargingOverlay(percent: u8) void {
+    const box_width: u16 = 180;
+    const box_height: u16 = 70;
+    const box_x: u16 = (SCREEN_WIDTH - box_width) / 2;
+    const box_y: u16 = (SCREEN_HEIGHT - box_height) / 2;
+
+    lcd.fillRect(box_x, box_y, box_width, box_height, lcd.rgb(20, 40, 20));
+    lcd.drawRect(box_x, box_y, box_width, box_height, lcd.rgb(50, 200, 50));
+
+    // Battery icon with lightning bolt
+    drawBatteryIcon(box_x + 15, box_y + 20, percent, false);
+
+    lcd.drawString(box_x + 55, box_y + 15, "Charging", lcd.rgb(100, 255, 100), lcd.rgb(20, 40, 20));
+
+    var buf: [4]u8 = undefined;
+    const percent_str = formatNumber(percent, &buf);
+    lcd.drawString(box_x + 55, box_y + 35, percent_str, lcd.rgb(200, 200, 200), lcd.rgb(20, 40, 20));
+    lcd.drawString(box_x + 80, box_y + 35, "%", lcd.rgb(200, 200, 200), lcd.rgb(20, 40, 20));
+}
+
+// ============================================================
+// Status Bar Indicators
+// ============================================================
+
+/// Battery status
+pub const BatteryStatus = struct {
+    percent: u8 = 100,
+    is_charging: bool = false,
+    is_low: bool = false,
+};
+
+var battery_status = BatteryStatus{};
+
+/// Update battery status
+pub fn updateBatteryStatus(percent: u8, charging: bool) void {
+    battery_status.percent = percent;
+    battery_status.is_charging = charging;
+    battery_status.is_low = percent <= 20;
+}
+
+/// Get current battery status
+pub fn getBatteryStatus() BatteryStatus {
+    return battery_status;
+}
+
+/// Draw battery icon at specified position
+pub fn drawBatteryIcon(x: u16, y: u16, percent: u8, low: bool) void {
+    // Battery outline (28x14 pixels)
+    const width: u16 = 28;
+    const height: u16 = 14;
+
+    // Choose color based on state
+    const color = if (low)
+        lcd.rgb(255, 50, 50)
+    else if (percent < 30)
+        lcd.rgb(255, 165, 0)
+    else
+        lcd.rgb(100, 200, 100);
+
+    // Outline
+    lcd.drawRect(x, y, width, height, color);
+
+    // Terminal nub
+    lcd.fillRect(x + width, y + 4, 3, 6, color);
+
+    // Fill level (inside the outline)
+    const inner_width = width - 4;
+    const fill_width: u16 = (inner_width * percent) / 100;
+    if (fill_width > 0) {
+        lcd.fillRect(x + 2, y + 2, fill_width, height - 4, color);
+    }
+}
+
+/// Draw status bar with battery and other indicators
+pub fn drawStatusBar() void {
+    // Battery icon in top-right corner
+    const battery_x = SCREEN_WIDTH - 40;
+    const battery_y: u16 = 5;
+    drawBatteryIcon(battery_x, battery_y, battery_status.percent, battery_status.is_low);
+
+    // Charging indicator (lightning bolt)
+    if (battery_status.is_charging) {
+        lcd.drawString(battery_x - 12, battery_y, "+", lcd.rgb(50, 200, 50), current_theme.header_bg);
+    }
+}
+
+/// Draw header with status bar
+pub fn drawHeaderWithStatus(title: []const u8) void {
+    lcd.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, current_theme.header_bg);
+
+    // Title (left-aligned to leave room for status)
+    lcd.drawString(8, 8, title, current_theme.header_fg, current_theme.header_bg);
+
+    // Status indicators on the right
+    drawStatusBar();
+
+    lcd.drawHLine(0, HEADER_HEIGHT - 1, SCREEN_WIDTH, current_theme.disabled);
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+/// Format a number as a string (up to 3 digits)
+fn formatNumber(value: u8, buf: []u8) []const u8 {
+    if (value >= 100) {
+        buf[0] = '1';
+        buf[1] = '0';
+        buf[2] = '0';
+        return buf[0..3];
+    } else if (value >= 10) {
+        buf[0] = '0' + (value / 10);
+        buf[1] = '0' + (value % 10);
+        return buf[0..2];
+    } else {
+        buf[0] = '0' + value;
+        return buf[0..1];
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -584,4 +912,71 @@ test "theme colors" {
     const theme = default_theme;
     try std.testing.expectEqual(lcd.rgb(255, 255, 255), theme.background);
     try std.testing.expectEqual(lcd.rgb(0, 0, 0), theme.foreground);
+}
+
+test "overlay visibility" {
+    var overlay = OverlayState{};
+
+    // Initially not visible
+    try std.testing.expect(!overlay.isVisible(0));
+
+    // Show volume overlay
+    overlay.showVolume(50, 1000);
+    try std.testing.expect(overlay.isVisible(1000));
+    try std.testing.expect(overlay.isVisible(1500)); // Still within duration
+    try std.testing.expect(overlay.isVisible(2400)); // Still within 1500ms duration
+    try std.testing.expect(!overlay.isVisible(2600)); // After duration
+
+    // Hide overlay
+    overlay.hide();
+    try std.testing.expect(!overlay.isVisible(2600));
+}
+
+test "overlay types" {
+    var overlay = OverlayState{};
+
+    overlay.showVolume(75, 0);
+    try std.testing.expectEqual(OverlayType.volume, overlay.overlay_type);
+    try std.testing.expectEqual(@as(u8, 75), overlay.value);
+
+    overlay.showBrightness(50, 0);
+    try std.testing.expectEqual(OverlayType.brightness, overlay.overlay_type);
+
+    overlay.showHold(0);
+    try std.testing.expectEqual(OverlayType.hold, overlay.overlay_type);
+    try std.testing.expectEqual(@as(u32, 2000), overlay.duration_ms);
+
+    overlay.showLowBattery(15, 0);
+    try std.testing.expectEqual(OverlayType.low_battery, overlay.overlay_type);
+    try std.testing.expectEqual(@as(u32, 3000), overlay.duration_ms);
+
+    overlay.showCharging(80, 0);
+    try std.testing.expectEqual(OverlayType.charging, overlay.overlay_type);
+}
+
+test "battery status" {
+    updateBatteryStatus(100, false);
+    var status = getBatteryStatus();
+    try std.testing.expectEqual(@as(u8, 100), status.percent);
+    try std.testing.expect(!status.is_charging);
+    try std.testing.expect(!status.is_low);
+
+    updateBatteryStatus(15, true);
+    status = getBatteryStatus();
+    try std.testing.expectEqual(@as(u8, 15), status.percent);
+    try std.testing.expect(status.is_charging);
+    try std.testing.expect(status.is_low); // <= 20%
+}
+
+test "format number" {
+    var buf: [4]u8 = undefined;
+
+    const one = formatNumber(5, &buf);
+    try std.testing.expectEqualStrings("5", one);
+
+    const two = formatNumber(42, &buf);
+    try std.testing.expectEqualStrings("42", two);
+
+    const three = formatNumber(100, &buf);
+    try std.testing.expectEqualStrings("100", three);
 }
