@@ -151,6 +151,68 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     // ============================================================
+    // Integration Tests
+    // ============================================================
+
+    // Create test root module that provides access to all zigpod modules
+    const test_root_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = default_target,
+        .optimize = optimize,
+    });
+
+    // Audio Pipeline Integration Tests
+    const audio_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/audio_pipeline_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigpod", .module = test_root_module },
+            },
+        }),
+    });
+    const run_audio_integration = b.addRunArtifact(audio_integration_tests);
+
+    // UI Navigation Integration Tests
+    const ui_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/ui_navigation_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigpod", .module = test_root_module },
+            },
+        }),
+    });
+    const run_ui_integration = b.addRunArtifact(ui_integration_tests);
+
+    // File Playback Integration Tests
+    const file_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/file_playback_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigpod", .module = test_root_module },
+            },
+        }),
+    });
+    const run_file_integration = b.addRunArtifact(file_integration_tests);
+
+    const integration_step = b.step("test-integration", "Run integration tests");
+    integration_step.dependOn(&run_audio_integration.step);
+    integration_step.dependOn(&run_ui_integration.step);
+    integration_step.dependOn(&run_file_integration.step);
+
+    // All tests step
+    const all_tests_step = b.step("test-all", "Run all tests (unit + integration)");
+    all_tests_step.dependOn(&run_unit_tests.step);
+    all_tests_step.dependOn(&run_audio_integration.step);
+    all_tests_step.dependOn(&run_ui_integration.step);
+    all_tests_step.dependOn(&run_file_integration.step);
+
+    // ============================================================
     // Format Check
     // ============================================================
 

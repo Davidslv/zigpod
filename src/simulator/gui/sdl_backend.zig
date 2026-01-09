@@ -355,12 +355,13 @@ pub const Sdl2Backend = struct {
 
     fn mapKeyToButton(keycode: c_int) ?Button {
         return switch (keycode) {
-            c.SDLK_m, c.SDLK_ESCAPE, c.SDLK_UP => .menu,
-            c.SDLK_SPACE, c.SDLK_p, c.SDLK_DOWN => .play_pause,
+            c.SDLK_m, c.SDLK_ESCAPE => .menu,
+            c.SDLK_SPACE, c.SDLK_p => .play_pause,
             c.SDLK_RIGHT, c.SDLK_n => .next,
             c.SDLK_LEFT, c.SDLK_b => .prev,
             c.SDLK_RETURN, c.SDLK_s => .select,
             c.SDLK_h => .hold,
+            // Note: UP/DOWN arrows are handled separately for menu navigation
             else => null,
         };
     }
