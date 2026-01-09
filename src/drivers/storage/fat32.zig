@@ -351,6 +351,7 @@ pub const File = struct {
 pub const FatError = error{
     file_not_found,
     not_a_file,
+    not_a_directory,
     path_too_long,
     io_error,
     not_initialized,
@@ -369,6 +370,69 @@ pub fn isInitialized() bool {
     return global_fs != null;
 }
 
+/// Directory entry info for listing
+pub const DirEntryInfo = struct {
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
+    is_directory: bool = false,
+    size: u32 = 0,
+
+    pub fn getName(self: *const DirEntryInfo) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+/// List directory contents
+/// Returns the number of entries written to the buffer
+pub fn listDirectory(path: []const u8, entries: []DirEntryInfo) FatError!usize {
+    var fs = global_fs orelse return FatError.not_initialized;
+
+    var dir = try openDirectory(&fs, path);
+    var count: usize = 0;
+
+    while (count < entries.len) {
+        const entry = dir.readEntry() catch return FatError.io_error;
+        if (entry == null) break;
+
+        const e = entry.?;
+
+        // Skip volume labels and hidden files
+        if ((e.attributes & DirEntry.ATTR_VOLUME_ID) != 0) continue;
+        if ((e.attributes & DirEntry.ATTR_HIDDEN) != 0) continue;
+
+        var info = DirEntryInfo{};
+        info.is_directory = e.isDirectory();
+        info.size = e.file_size;
+
+        // Convert 8.3 name to normal format
+        var name_len: u8 = 0;
+
+        // Copy filename part (first 8 chars, trimmed)
+        var i: usize = 0;
+        while (i < 8 and e.name[i] != ' ') : (i += 1) {
+            info.name[name_len] = e.name[i];
+            name_len += 1;
+        }
+
+        // Add extension if present (for files)
+        if (e.name[8] != ' ') {
+            info.name[name_len] = '.';
+            name_len += 1;
+            i = 8;
+            while (i < 11 and e.name[i] != ' ') : (i += 1) {
+                info.name[name_len] = e.name[i];
+                name_len += 1;
+            }
+        }
+
+        info.name_len = name_len;
+        entries[count] = info;
+        count += 1;
+    }
+
+    return count;
+}
+
 /// Read an entire file into a buffer
 /// Returns the number of bytes read
 pub fn readFile(path: []const u8, buffer: []u8) FatError!usize {
@@ -381,6 +445,69 @@ pub fn readFile(path: []const u8, buffer: []u8) FatError!usize {
     // Read entire file
     const bytes_read = f.read(buffer) catch return FatError.io_error;
     return bytes_read;
+}
+
+/// Open a directory by path (e.g., "/MUSIC")
+pub fn openDirectory(fs: *Fat32, path: []const u8) FatError!Directory {
+    // Root directory
+    if (path.len == 0 or (path.len == 1 and path[0] == '/')) {
+        return fs.openRootDir();
+    }
+
+    var current_dir = fs.openRootDir();
+    var remaining_path = path;
+
+    // Skip leading slash
+    if (remaining_path[0] == '/') {
+        remaining_path = remaining_path[1..];
+    }
+
+    // Skip trailing slash
+    while (remaining_path.len > 0 and remaining_path[remaining_path.len - 1] == '/') {
+        remaining_path = remaining_path[0 .. remaining_path.len - 1];
+    }
+
+    if (remaining_path.len == 0) {
+        return fs.openRootDir();
+    }
+
+    // Navigate through path components
+    while (remaining_path.len > 0) {
+        // Find next path separator
+        var component_end: usize = 0;
+        while (component_end < remaining_path.len and remaining_path[component_end] != '/') {
+            component_end += 1;
+        }
+
+        const component = remaining_path[0..component_end];
+        if (component.len == 0) break;
+
+        // Find entry in current directory
+        current_dir.rewind();
+        const entry = findEntry(&current_dir, component) catch return FatError.io_error;
+        if (entry == null) return FatError.file_not_found;
+
+        if (!entry.?.isDirectory()) {
+            return FatError.not_a_directory;
+        }
+
+        // Enter directory
+        current_dir = Directory{
+            .fs = fs,
+            .first_cluster = entry.?.getCluster(),
+            .current_cluster = entry.?.getCluster(),
+            .position = 0,
+        };
+
+        // Move past this component
+        if (component_end < remaining_path.len) {
+            remaining_path = remaining_path[component_end + 1 ..];
+        } else {
+            break;
+        }
+    }
+
+    return current_dir;
 }
 
 /// Open a file by path (e.g., "/MUSIC/song.wav")

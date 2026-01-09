@@ -61,6 +61,8 @@ pub const FileEntry = struct {
         const ext = name[name.len - 4 ..];
         self.is_audio = std.mem.eql(u8, ext, ".wav") or
             std.mem.eql(u8, ext, ".WAV") or
+            std.mem.eql(u8, ext, ".mp3") or
+            std.mem.eql(u8, ext, ".MP3") or
             std.mem.eql(u8, ext, ".fla") or // FLAC might be truncated
             std.mem.eql(u8, ext, ".FLA");
 
@@ -123,20 +125,53 @@ pub const FileBrowser = struct {
             self.entry_count = 1;
         }
 
-        // TODO: Implement actual FAT32 directory reading
-        // For now, add placeholder entries for testing
-        if (self.path_len == 1) { // Root directory
-            var music_entry = FileEntry{};
-            music_entry.setName("MUSIC");
-            music_entry.is_directory = true;
-            self.entries[self.entry_count] = music_entry;
-            self.entry_count += 1;
+        // Read directory from FAT32
+        if (fat32.isInitialized()) {
+            var fat_entries: [127]fat32.DirEntryInfo = undefined;
+            const count = fat32.listDirectory(self.getPath(), &fat_entries) catch |err| {
+                self.error_message = switch (err) {
+                    fat32.FatError.file_not_found => "Directory not found",
+                    fat32.FatError.not_a_directory => "Not a directory",
+                    fat32.FatError.io_error => "Read error",
+                    fat32.FatError.not_initialized => "Storage not ready",
+                    else => "Error reading directory",
+                };
+                self.is_loading = false;
+                return;
+            };
 
-            var podcasts_entry = FileEntry{};
-            podcasts_entry.setName("PODCASTS");
-            podcasts_entry.is_directory = true;
-            self.entries[self.entry_count] = podcasts_entry;
-            self.entry_count += 1;
+            // Convert FAT32 entries to FileEntry format
+            for (fat_entries[0..count]) |*fat_entry| {
+                if (self.entry_count >= self.entries.len) break;
+
+                var entry = FileEntry{};
+                entry.setName(fat_entry.getName());
+                entry.is_directory = fat_entry.is_directory;
+                entry.size = fat_entry.size;
+
+                // Check for audio extension
+                if (!entry.is_directory) {
+                    entry.checkAudioExtension();
+                }
+
+                self.entries[self.entry_count] = entry;
+                self.entry_count += 1;
+            }
+        } else {
+            // FAT32 not initialized - show placeholder for testing
+            if (self.path_len == 1) {
+                var music_entry = FileEntry{};
+                music_entry.setName("MUSIC");
+                music_entry.is_directory = true;
+                self.entries[self.entry_count] = music_entry;
+                self.entry_count += 1;
+
+                var podcasts_entry = FileEntry{};
+                podcasts_entry.setName("PODCASTS");
+                podcasts_entry.is_directory = true;
+                self.entries[self.entry_count] = podcasts_entry;
+                self.entry_count += 1;
+            }
         }
 
         // Sort entries: directories first, then files alphabetically
@@ -476,7 +511,7 @@ test "file entry audio detection" {
 
     entry.setName("track.mp3");
     entry.checkAudioExtension();
-    try std.testing.expect(!entry.is_audio);
+    try std.testing.expect(entry.is_audio);
 
     entry.setName("track.flac");
     entry.checkAudioExtension();
