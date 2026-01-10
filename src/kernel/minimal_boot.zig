@@ -377,7 +377,7 @@ export fn _zigpod_main() void {
     fillScreen(COLOR32_BLUE);
     delay();
 
-    // Initialize wheel (we know this works)
+    // Initialize click wheel
     DEV_EN.* |= DEV_OPTO;
     DEV_RS.* |= DEV_OPTO;
     var i: u32 = 0;
@@ -391,31 +391,32 @@ export fn _zigpod_main() void {
     fillScreen(COLOR32_CYAN);
     delay();
 
-    // Now just poll and show what we see
-    // BLACK = no data, colors = button press
+    // Main loop - poll wheel and show button colors
     fillScreen(COLOR32_BLACK);
 
     while (true) {
         const status = WHEEL_STATUS.*;
 
-        // Check data ready bit
+        // Check data ready bit (bit 26)
         if ((status & 0x04000000) != 0) {
             const data = WHEEL_DATA.*;
 
-            // Clear/acknowledge the data (from Rockbox)
+            // Acknowledge the read
             WHEEL_STATUS.* = WHEEL_STATUS.* | 0x0C000000;
             WHEEL_CTRL.* = WHEEL_CTRL.* | 0x60000000;
 
-            // Validate packet format: (data & 0x800000FF) == 0x8000001A
-            if ((data & 0x800000FF) == 0x8000001A) {
-                // 5.5G Button mapping (CONFIRMED):
+            // Validate packet: lower byte must be 0x1A
+            // NOTE: MENU packets don't have bit 31 set, so only check lower byte!
+            if ((data & 0xFF) == 0x1A) {
+                // 5.5G Button mapping (CONFIRMED WORKING January 2026):
                 // Bit 8  (0x0100) = SELECT
                 // Bit 9  (0x0200) = RIGHT
                 // Bit 10 (0x0400) = LEFT
                 // Bit 11 (0x0800) = PLAY
-                // Bit 13 (0x2000) = MENU (NOT bit 12!)
+                // Bit 12 (0x1000) = MENU (alternative)
+                // Bit 13 (0x2000) = MENU (primary)
 
-                if ((data & 0x00002000) != 0) {
+                if ((data & 0x00002000) != 0 or (data & 0x00001000) != 0) {
                     fillScreen(COLOR32_RED);     // MENU = Red
                 } else if ((data & 0x00000100) != 0) {
                     fillScreen(COLOR32_WHITE);   // SELECT = White
@@ -426,11 +427,9 @@ export fn _zigpod_main() void {
                 } else if ((data & 0x00000200) != 0) {
                     fillScreen(COLOR32_YELLOW);  // RIGHT = Yellow
                 } else {
-                    // No button pressed
-                    fillScreen(COLOR32_BLACK);
+                    fillScreen(COLOR32_BLACK);   // No button
                 }
             }
-            // Ignore invalid packets silently
         }
 
         // Small delay
