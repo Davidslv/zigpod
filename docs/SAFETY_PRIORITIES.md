@@ -3,14 +3,82 @@
 **Date:** 2026-01-10
 **Status:** Pre-Installation Safety Review
 **Test Status:** All 820+ tests passing
+**Last Verified:** 2026-01-10 (all claims fact-checked against source code)
 
 ---
 
 ## Executive Summary
 
-This document distills the findings from 8 specialist safety audits into actionable priorities for safely installing ZigPod on real iPod hardware.
+This document distills findings from 8 specialist safety audits, **corrected after source code verification**.
 
-**Bottom Line:** ZigPod is **safe for development installation** with current safeguards. No blockers exist for personal use.
+**Bottom Line:** ZigPod is **safe for development installation**. All critical safety features are implemented.
+
+---
+
+## Fact-Check Corrections
+
+Several claims from earlier analysis were **incorrect**. Verified against source:
+
+| Claim | Actual Status | Evidence |
+|-------|---------------|----------|
+| "FLAC allocates 2MB" | **FALSE** - 64KB | `flac.zig:19,23`: MAX_BLOCK_SIZE=8192, MAX_CHANNELS=2 |
+| "Battery check absent" | **FALSE** - Comprehensive | `flasher.zig`: 80+ battery references |
+| "DFU is a stub" | **FALSE** - Full DFU 1.1 | `usb_dfu.zig:283-298`: Complete state machine |
+| "40+ critical TODOs" | **FALSE** - 29 total | Mostly debug/telemetry, not safety-critical |
+
+---
+
+## Actual Safety Status
+
+### Fully Implemented (Verified)
+
+| Component | Implementation | Lines |
+|-----------|---------------|-------|
+| Battery check (20% min) | `flasher.zig` | 287-306 |
+| Critical abort (10%) | `flasher.zig` | 289, 343-344 |
+| Voltage backup check | `flasher.zig` | 303-306 |
+| External power detection | `flasher.zig` | 275, 125 |
+| Watchdog 60s timeout | `hardware_providers.zig` | 55-78 |
+| DFU battery check (25%) | `usb_dfu.zig` | 311-318 |
+| DFU watchdog refresh | `usb_dfu.zig` | 320-323 |
+| Boot ROM protection | `disk_mode.zig` | 78-81 |
+| Auto-backup before flash | `flasher.zig` | 423+ |
+| LCD progress display | `hardware_providers.zig` | 89-242 |
+| FLAC memory (64KB) | `flac.zig` | 19-23, 177 |
+| AAC decoder (1006 lines) | `aac.zig` | Full AAC-LC, 4 tests |
+| DFU state machine | `usb_dfu.zig` | Full DFU 1.1, battery+watchdog |
+
+---
+
+## Actual Remaining Work (Real Priorities)
+
+These are the genuine improvements, NOT blockers for installation:
+
+### Priority 1: Hardware Validation (RECOMMENDED)
+
+| Task | Why | How |
+|------|-----|-----|
+| RAM-only boot test | Verify hardware timing | JTAG load to IRAM, test 30min |
+| Audio output test | Verify WM8758 config | Play sine wave, verify output |
+| Storage read test | Verify ATA timing | Read files, check CRC |
+
+### Priority 2: Quality Improvements (NICE TO HAVE)
+
+| Task | Current | Improvement |
+|------|---------|-------------|
+| FAT32 tests | 1 test | Add directory traversal tests |
+| Audio double-buffer | Single buffer | Ping-pong DMA (prevents glitches) |
+| Settings persistence | TODO in main.zig:286 | Save to storage |
+| FLAC seek tables | Linear seek | Parse SEEKTABLE metadata |
+
+### Priority 3: Already Done (No Work Needed)
+
+| Claim | Reality |
+|-------|---------|
+| "Add AAC decoder" | ✅ Already 1006 lines, 4 tests |
+| "Fix FLAC 2MB" | ✅ Already 64KB |
+| "Add battery check" | ✅ Already 80+ references |
+| "Implement DFU" | ✅ Already full DFU 1.1 |
 
 ---
 
