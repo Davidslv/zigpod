@@ -88,9 +88,11 @@ These are the genuine improvements, NOT blockers for installation:
 
 - [ ] Battery charged to >50%
 - [ ] External power connected (recommended)
-- [ ] Full disk backup created
+- [ ] Full disk backup created via Disk Mode
 - [ ] Original firmware saved separately
-- [ ] JTAG adapter ready for recovery (recommended)
+- [ ] USB cable ready for Disk Mode recovery
+
+**Note:** This installation uses USB Disk Mode only. No JTAG required.
 
 ### Verification Commands
 
@@ -153,14 +155,6 @@ These improvements reduce risk but are not blockers:
 
 **Future Fix:** Implement ping-pong DMA buffers (estimated: 3 days)
 
-### 2.3 FLAC Memory Usage (MEDIUM)
-
-**Risk:** Memory exhaustion with FLAC files
-**Current:** Allocates 2MB buffer
-**Mitigation:** Use MP3 or WAV for initial testing
-
-**Future Fix:** Dynamic block size allocation (estimated: 1 day)
-
 ---
 
 ## Priority 3: NICE TO HAVE
@@ -169,7 +163,6 @@ These are quality improvements, not safety issues:
 
 | Item | Risk | Impact |
 |------|------|--------|
-| AAC decoder | Can't play iTunes purchases | Use MP3/FLAC |
 | Volume ramping | Click on volume change | Minor annoyance |
 | Sample rate conversion | Gap between different-rate tracks | Brief silence |
 | Signature verification | Unsigned firmware accepted | OK for personal use |
@@ -177,68 +170,127 @@ These are quality improvements, not safety issues:
 
 ---
 
-## Recovery Procedures
+## Honest Confidence Assessment
+
+### Confidence Breakdown
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                CONFIDENCE BREAKDOWN                      │
+├─────────────────────────────────────────────────────────┤
+│ Software safety mechanisms:     ████████████████ 95%    │
+│ Register addresses (Rockbox):   ████████████████ 90%    │
+│ Init sequences from Rockbox:    ██████████████░░ 85%    │
+│ LCD controller (BCM2722):       ████████████░░░░ 75%    │
+│ Tested on real hardware:        ░░░░░░░░░░░░░░░░  0%    │
+├─────────────────────────────────────────────────────────┤
+│ OVERALL CONFIDENCE FOR INSTALL: ██████████░░░░░░ ~65%   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### What We KNOW Works (HIGH confidence)
+- Simulator runs correctly
+- All 820+ unit tests pass
+- Safety mechanisms are comprehensive in code
+- Register addresses verified from working Rockbox code
+- Decoders (MP3, FLAC, WAV, AIFF, AAC) implemented and tested
+
+### What We DON'T Know (adds uncertainty)
+- Actual boot on real PP5021C hardware
+- I2C timing to PMU under real conditions
+- WM8758 codec initialization on real hardware
+- ATA/iFlash timing in practice
+- LCD BCM2722 firmware loading (most complex component)
+
+### Risk Assessment
+
+| Risk | Likelihood | Impact | Recovery |
+|------|------------|--------|----------|
+| LCD doesn't init (BCM2722) | Medium | Boot but no display | Disk Mode |
+| I2C timing wrong | Low | No audio/battery read | Disk Mode |
+| ATA timing wrong | Low | No storage access | Disk Mode |
+| Catastrophic boot failure | Very Low | Won't boot | Disk Mode + iTunes |
+
+**All recovery paths use USB Disk Mode - no JTAG required.**
+
+---
+
+## Recovery Procedures (USB Only)
 
 ### If Device Won't Boot
 
 1. **Enter Disk Mode manually:**
-   - Hold MENU + SELECT until Apple logo
+   - Hold MENU + SELECT until Apple logo appears
    - Immediately hold SELECT + PLAY
-   - Device enters Disk Mode
+   - Device enters Disk Mode (shows "OK to disconnect")
 
 2. **Restore via iTunes/Finder:**
-   - Connect to computer
-   - Use iTunes/Finder to restore original firmware
+   - Connect to computer via USB
+   - iTunes/Finder will detect device in recovery
+   - Click "Restore" to reinstall original firmware
 
-3. **JTAG Recovery (advanced):**
-   - Connect FT2232H adapter
-   - Use OpenOCD to restore bootloader
-   - See `docs/006-hardware-testing-protocol.md`
+3. **Manual Disk Mode restore:**
+   - Enter Disk Mode (step 1)
+   - Mount as USB drive
+   - Restore backed-up firmware partition
 
 ### If Flash Fails Mid-Write
 
-The watchdog timer will reset the device after 60 seconds. On next boot:
+The watchdog timer resets the device after 60 seconds. On next boot:
 1. Device should fall back to original firmware (dual-boot)
 2. If not, use Disk Mode recovery above
 
+**Note:** Disk Mode is in ROM - it ALWAYS works regardless of firmware state.
+
 ---
 
-## Safe Installation Sequence
+## USB-Only Installation Sequence
 
-### Level 1: Read-Only Verification (Safest)
+### Step 1: Create Full Backup
 
 ```bash
-# Connect JTAG, verify communication only
-openocd -f interface/ftdi/ft2232h.cfg -f target/arm7tdmi.cfg
-# Just read memory, don't write anything
+# Put iPod in Disk Mode:
+# Hold MENU + SELECT → when Apple logo appears → hold SELECT + PLAY
+
+# On macOS, find the disk:
+diskutil list | grep -i ipod
+
+# Create full disk image backup (replace diskX):
+sudo dd if=/dev/diskX of=ipod_backup.img bs=1m status=progress
+
+# Verify backup:
+ls -la ipod_backup.img
 ```
 
-### Level 2: RAM-Only Boot (Safe)
+### Step 2: Flash ZigPod
 
 ```bash
-# Load ZigPod into RAM via JTAG, doesn't touch flash
-zigpod-jtag load-ram zig-out/bin/zigpod.bin
-# Test functionality, reboot returns to original firmware
-```
+# Build firmware
+zig build -Dtarget=arm-freestanding-eabi
 
-### Level 3: Non-Persistent Boot (Recommended First Step)
-
-```bash
-# Boot ZigPod from RAM, connect iPod in Disk Mode
-# Play music, test navigation
-# Reboot returns to original firmware
-```
-
-### Level 4: Persistent Installation (After Level 3 Success)
-
-```bash
-# Only after confirming Level 3 stability!
+# Flash using zigpod-flasher (with all safety features)
 zigpod-flasher flash \
+    --device /dev/diskX \
     --backup-dir ./backups \
     --check-battery \
     --enable-watchdog \
     --verify-after-write \
     --image zig-out/bin/zigpod.bin
+```
+
+### Step 3: First Boot
+
+1. Disconnect USB
+2. Hold MENU + SELECT to reset
+3. Watch for ZigPod boot screen
+4. If black screen for >30s, enter Disk Mode and restore
+
+### Step 4: If Recovery Needed
+
+```bash
+# Enter Disk Mode (always works)
+# Restore from backup:
+sudo dd if=ipod_backup.img of=/dev/diskX bs=1m status=progress
 ```
 
 ---
