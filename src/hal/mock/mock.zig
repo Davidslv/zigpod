@@ -98,6 +98,10 @@ pub const MockState = struct {
     pmu_charging: bool = false,
     pmu_external_power: bool = false,
 
+    // Click wheel state (set by simulator GUI)
+    clickwheel_buttons: u8 = 0,
+    clickwheel_position: u8 = 0,
+
     // Allocator for dynamic allocations
     allocator: std.mem.Allocator = undefined,
 
@@ -187,6 +191,26 @@ pub fn setAtaStorage(data: []u8) void {
     const state = getState();
     state.ata_storage = data;
     state.ata_initialized = true;
+}
+
+/// Set the click wheel button state (called by simulator GUI)
+/// Button bits: 0=SELECT, 1=MENU, 2=PLAY, 3=LEFT, 4=RIGHT
+pub fn setClickwheelButtons(buttons: u8) void {
+    const state = getState();
+    state.clickwheel_buttons = buttons;
+}
+
+/// Set the click wheel position (called by simulator GUI)
+/// Position is 0-95 for the 96 wheel positions
+pub fn setClickwheelPosition(position: u8) void {
+    const state = getState();
+    state.clickwheel_position = position;
+}
+
+/// Get the current button state (for debugging/testing)
+pub fn getClickwheelButtons() u8 {
+    const state = getState();
+    return state.clickwheel_buttons;
 }
 
 // ============================================================
@@ -499,13 +523,13 @@ fn mockClickwheelInit() HalError!void {
 }
 
 fn mockClickwheelReadButtons() u8 {
-    // Mock: no buttons pressed by default
-    return 0;
+    const state = getState();
+    return state.clickwheel_buttons;
 }
 
 fn mockClickwheelReadPosition() u8 {
-    // Mock: position at 0
-    return 0;
+    const state = getState();
+    return state.clickwheel_position;
 }
 
 fn mockGetTicks() u32 {

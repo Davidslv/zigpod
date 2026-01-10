@@ -9,6 +9,11 @@ const build_options = @import("build_options");
 const zigpod = @import("zigpod");
 const simulator = zigpod.simulator;
 
+// Import real app and mock HAL for proper simulation
+const app = zigpod.app;
+const mock_hal = zigpod.hal.mock;
+const clickwheel = zigpod.clickwheel;
+
 const SimulatorState = simulator.SimulatorState;
 
 // Conditional SDL2 GUI and audio imports
@@ -51,6 +56,7 @@ const Options = struct {
     headless: bool = false,
     debug: bool = false,
     breakpoint: ?u32 = null,
+    app_mode: bool = false, // Run real app.zig instead of sim_ui
 };
 
 pub fn main() !void {
@@ -92,6 +98,8 @@ pub fn main() !void {
             if (i < args.len) {
                 options.breakpoint = std.fmt.parseInt(u32, args[i], 0) catch null;
             }
+        } else if (std.mem.eql(u8, arg, "--app") or std.mem.eql(u8, arg, "-A")) {
+            options.app_mode = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -152,6 +160,9 @@ pub fn main() !void {
 
     if (options.headless) {
         runHeadless(state, options, &out);
+    } else if (options.app_mode and build_options.enable_sdl2) {
+        // Run real app.zig with mock HAL (like Rockbox simulator)
+        runAppMode(allocator, state, options, &out);
     } else if (build_options.enable_sdl2) {
         runGuiMode(allocator, state, options, &out);
     } else {
@@ -331,7 +342,7 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
     out.print("\nSimulator exited. Frames: {d}\n", .{frame_count});
 }
 
-/// Map GUI button to UI button
+/// Map GUI button to UI button (for sim_ui - legacy)
 fn mapGuiButton(button: gui.Button) sim_ui.Button {
     return switch (button) {
         .menu => .menu,
@@ -342,6 +353,124 @@ fn mapGuiButton(button: gui.Button) sim_ui.Button {
         .repeat => .repeat,
         else => .none,
     };
+}
+
+/// Map GUI button to clickwheel button bits (for real app mode)
+fn mapGuiToClickwheel(button: gui.Button) u8 {
+    return switch (button) {
+        .menu => clickwheel.Button.MENU,
+        .play_pause => clickwheel.Button.PLAY,
+        .prev => clickwheel.Button.LEFT,
+        .next => clickwheel.Button.RIGHT,
+        .select => clickwheel.Button.SELECT,
+        .hold => clickwheel.Button.HOLD,
+        else => 0,
+    };
+}
+
+/// Run simulator with real app code (proper testing mode)
+fn runAppMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Options, out: *Output) void {
+    _ = options;
+    if (!build_options.enable_sdl2) return;
+
+    out.write("Starting Real App Mode (testing actual app.zig)...\n");
+    out.write("Controls:\n");
+    out.write("  Arrow keys / Click wheel: Navigate\n");
+    out.write("  Enter / Center button: Select\n");
+    out.write("  M / Escape: Menu/Back\n");
+    out.write("  Space: Play/Pause\n");
+    out.write("  Q / Close window: Quit\n\n");
+
+    // Initialize SDL2 backend
+    var backend = sdl_backend.Sdl2Backend.create(allocator);
+    var gui_interface = backend.getBackend();
+
+    gui_interface.init(.{
+        .width = 320,
+        .height = 240,
+        .scale = 1,
+        .title = "ZigPod - Real App Mode",
+    }) catch |err| {
+        out.print("Failed to initialize GUI: {}\n", .{err});
+        return;
+    };
+    defer gui_interface.deinit();
+
+    // Initialize the real app
+    app.init();
+    out.write("App initialized\n");
+
+    // Main GUI loop
+    var frame_count: u64 = 0;
+    var running = true;
+    var current_buttons: u8 = 0;
+    var wheel_position: u8 = 0;
+
+    while (running and gui_interface.isOpen()) {
+        // Process GUI events and update mock HAL state
+        while (gui_interface.pollEvent()) |event| {
+            switch (event.event_type) {
+                .quit => {
+                    running = false;
+                },
+                .button_press => {
+                    if (event.button) |button| {
+                        current_buttons |= mapGuiToClickwheel(button);
+                        mock_hal.setClickwheelButtons(current_buttons);
+                    }
+                },
+                .button_release => {
+                    if (event.button) |button| {
+                        current_buttons &= ~mapGuiToClickwheel(button);
+                        mock_hal.setClickwheelButtons(current_buttons);
+                    }
+                },
+                .wheel_turn => {
+                    // Update wheel position (wrap around 0-95)
+                    const delta = event.wheel_delta;
+                    if (delta > 0) {
+                        wheel_position = @intCast(@mod(@as(i16, wheel_position) + delta, 96));
+                    } else {
+                        const neg_delta: i16 = -delta;
+                        if (neg_delta > wheel_position) {
+                            wheel_position = @intCast(96 - (@as(u16, @intCast(neg_delta)) - wheel_position));
+                        } else {
+                            wheel_position -= @intCast(@as(u16, @intCast(neg_delta)));
+                        }
+                    }
+                    mock_hal.setClickwheelPosition(wheel_position);
+                },
+                .key_down => {
+                    if (event.keycode == 'q') {
+                        running = false;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Run one frame of the real app
+        app.update();
+
+        // Get the framebuffer from mock HAL and display it
+        const framebuffer = mock_hal.getFramebuffer();
+
+        // Copy to simulator state (for compatibility with existing display code)
+        @memcpy(&state.lcd_framebuffer, framebuffer);
+
+        // Update GUI with LCD framebuffer
+        gui_interface.updateLcd(&state.lcd_framebuffer);
+        gui_interface.setWheelPosition(wheel_position);
+
+        // Present frame
+        gui_interface.present();
+        frame_count += 1;
+
+        // Small delay to prevent 100% CPU
+        std.Thread.sleep(16 * std.time.ns_per_ms); // ~60 FPS
+    }
+
+    out.print("\nApp mode exited. Frames: {d}\n", .{frame_count});
 }
 
 /// Handle UI action (play file, toggle play, etc.)
@@ -713,6 +842,7 @@ fn printHelp() void {
         \\  -s, --audio-samples <dir>  Create mock FAT32 with files from directory
         \\  -c, --cycles <n>     Cycles per frame (default: 10000)
         \\  -b, --break <addr>   Set breakpoint at address
+        \\  -A, --app            Run real app.zig (like Rockbox simulator)
         \\  --headless           Run without interactive mode
         \\  --debug              Enable debug logging
         \\  -h, --help           Show this help
