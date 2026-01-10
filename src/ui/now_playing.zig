@@ -8,6 +8,7 @@ const ui = @import("ui.zig");
 const lcd = @import("../drivers/display/lcd.zig");
 const audio = @import("../audio/audio.zig");
 const playback_queue = audio.playback_queue;
+const album_art = @import("../audio/album_art.zig");
 
 // ============================================================
 // Constants
@@ -178,6 +179,38 @@ pub fn draw(state: *const NowPlayingState) void {
 fn drawAlbumArt(state: *const NowPlayingState, theme: ui.Theme) void {
     _ = state;
 
+    // Try to load album art for current track
+    const queue = playback_queue.getQueue();
+    if (queue.getCurrentTrackPath()) |track_path| {
+        const art = album_art.loadForTrack(track_path);
+
+        if (art.valid) {
+            // Render album art pixels
+            renderAlbumArt(art);
+            // Draw border around art
+            lcd.drawRect(ALBUM_ART_X, ALBUM_ART_Y, ALBUM_ART_SIZE, ALBUM_ART_SIZE, theme.disabled);
+            return;
+        }
+    }
+
+    // No art available - draw placeholder
+    drawPlaceholderArt(theme);
+}
+
+/// Render album art pixels to LCD
+fn renderAlbumArt(art: *const album_art.ArtBuffer) void {
+    // Render each pixel directly to LCD
+    // This uses the art's RGB565 pixel buffer
+    for (0..album_art.ART_SIZE) |y| {
+        for (0..album_art.ART_SIZE) |x| {
+            const color = art.getPixel(@intCast(x), @intCast(y));
+            lcd.setPixel(ALBUM_ART_X + @as(u16, @intCast(x)), ALBUM_ART_Y + @as(u16, @intCast(y)), color);
+        }
+    }
+}
+
+/// Draw placeholder when no album art is available
+fn drawPlaceholderArt(theme: ui.Theme) void {
     // Draw placeholder border
     lcd.drawRect(ALBUM_ART_X, ALBUM_ART_Y, ALBUM_ART_SIZE, ALBUM_ART_SIZE, theme.disabled);
 
