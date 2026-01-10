@@ -15,6 +15,8 @@ const file_browser = @import("../ui/file_browser.zig");
 const music_browser = @import("../ui/music_browser.zig");
 const settings_ui = @import("../ui/settings.zig");
 const music_db = @import("../library/music_db.zig");
+const playlist_parser = @import("../library/playlist.zig");
+const fat32 = @import("../drivers/storage/fat32.zig");
 
 // ============================================================
 // Application Screens
@@ -351,6 +353,77 @@ fn handleFileBrowserInput(event: clickwheel.InputEvent) void {
 
                 // Switch to now playing screen
                 app_state.pushScreen(.now_playing);
+            }
+        },
+        .play_playlist => {
+            // Get the full path of the playlist file
+            var path_buffer: [256]u8 = undefined;
+            if (app_state.file_browser.getSelectedPath(&path_buffer)) |playlist_path| {
+                // Read playlist file content
+                var file_buffer: [8192]u8 = undefined; // 8KB should be enough for most playlists
+                const bytes_read = fat32.readFile(playlist_path, &file_buffer) catch |err| {
+                    const msg = switch (err) {
+                        fat32.FatError.file_not_found => "Playlist not found",
+                        fat32.FatError.io_error => "Read error",
+                        else => "Cannot read playlist",
+                    };
+                    showMessage("Error", msg);
+                    return;
+                };
+
+                const content = file_buffer[0..bytes_read];
+
+                // Detect format and parse
+                const format = playlist_parser.detectFormat(content);
+                var parsed: playlist_parser.M3uParser.ParseResult = undefined;
+
+                switch (format) {
+                    .m3u => {
+                        var parser = playlist_parser.M3uParser.init(content);
+                        parsed = parser.parse();
+                    },
+                    .pls => {
+                        var parser = playlist_parser.PlsParser.init(content);
+                        parsed = parser.parse();
+                    },
+                    .unknown => {
+                        showMessage("Error", "Unknown playlist format");
+                        return;
+                    },
+                }
+
+                if (parsed.count == 0) {
+                    showMessage("Error", "Playlist is empty");
+                    return;
+                }
+
+                // Load playlist into queue
+                const queue = audio.playback_queue.getQueue();
+                queue.setFromPlaylist(playlist_path, &parsed);
+
+                // Load and play the first track
+                if (queue.getCurrentTrackPath()) |first_track| {
+                    audio.loadFile(first_track) catch |err| {
+                        const msg = switch (err) {
+                            audio.LoadError.FileNotFound => "Track not found",
+                            audio.LoadError.UnsupportedFormat => "Unsupported format",
+                            else => "Cannot play track",
+                        };
+                        showMessage("Error", msg);
+                        return;
+                    };
+
+                    // Update now playing metadata
+                    const track_info = audio.getLoadedTrackInfo();
+                    app_state.now_playing_state.metadata.title = track_info.getTitle();
+                    app_state.now_playing_state.metadata.artist = track_info.getArtist();
+                    app_state.now_playing_state.metadata.album = track_info.getAlbum();
+
+                    // Switch to now playing screen
+                    app_state.pushScreen(.now_playing);
+                } else {
+                    showMessage("Error", "No tracks in playlist");
+                }
             }
         },
         .back => app_state.popScreen(),

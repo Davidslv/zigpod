@@ -8,6 +8,7 @@ const ui = @import("ui.zig");
 const lcd = @import("../drivers/display/lcd.zig");
 const fat32 = @import("../drivers/storage/fat32.zig");
 const audio = @import("../audio/audio.zig");
+const playlist = @import("../library/playlist.zig");
 
 // ============================================================
 // Constants
@@ -20,6 +21,7 @@ pub const MAX_FILENAME_DISPLAY: usize = 30;
 // File type icons
 pub const ICON_FOLDER = "[D]";
 pub const ICON_AUDIO = "[♪]";
+pub const ICON_PLAYLIST = "[L]";
 pub const ICON_FILE = "[F]";
 pub const ICON_PARENT = "[..]";
 
@@ -32,6 +34,7 @@ pub const FileEntry = struct {
     name_len: u8 = 0,
     is_directory: bool = false,
     is_audio: bool = false,
+    is_playlist: bool = false,
     size: u32 = 0,
 
     pub fn getName(self: *const FileEntry) []const u8 {
@@ -46,6 +49,7 @@ pub const FileEntry = struct {
 
     pub fn getIcon(self: *const FileEntry) []const u8 {
         if (self.is_directory) return ICON_FOLDER;
+        if (self.is_playlist) return ICON_PLAYLIST;
         if (self.is_audio) return ICON_AUDIO;
         return ICON_FILE;
     }
@@ -73,6 +77,12 @@ pub const FileEntry = struct {
                 self.is_audio = true;
             }
         }
+    }
+
+    /// Check if filename has a playlist extension (.m3u, .m3u8, .pls)
+    pub fn checkPlaylistExtension(self: *FileEntry) void {
+        const name = self.getName();
+        self.is_playlist = playlist.isPlaylistExtension(name);
     }
 };
 
@@ -149,9 +159,10 @@ pub const FileBrowser = struct {
                 entry.is_directory = fat_entry.is_directory;
                 entry.size = fat_entry.size;
 
-                // Check for audio extension
+                // Check for audio/playlist extension
                 if (!entry.is_directory) {
                     entry.checkAudioExtension();
+                    entry.checkPlaylistExtension();
                 }
 
                 self.entries[self.entry_count] = entry;
@@ -252,6 +263,10 @@ pub const FileBrowser = struct {
             return try self.enterDirectory(selected.getName());
         }
 
+        if (selected.is_playlist) {
+            return .play_playlist;
+        }
+
         if (selected.is_audio) {
             return .play_file;
         }
@@ -331,6 +346,7 @@ pub const BrowserAction = enum {
     none,
     directory_changed,
     play_file,
+    play_playlist,
     back,
 };
 
@@ -522,6 +538,26 @@ test "file entry audio detection" {
     try std.testing.expect(!entry.is_audio);
 }
 
+test "file entry playlist detection" {
+    var entry = FileEntry{};
+
+    entry.setName("playlist.m3u");
+    entry.checkPlaylistExtension();
+    try std.testing.expect(entry.is_playlist);
+
+    entry.setName("playlist.M3U8");
+    entry.checkPlaylistExtension();
+    try std.testing.expect(entry.is_playlist);
+
+    entry.setName("playlist.pls");
+    entry.checkPlaylistExtension();
+    try std.testing.expect(entry.is_playlist);
+
+    entry.setName("track.mp3");
+    entry.checkPlaylistExtension();
+    try std.testing.expect(!entry.is_playlist);
+}
+
 test "file entry icons" {
     var dir_entry = FileEntry{};
     dir_entry.is_directory = true;
@@ -530,6 +566,10 @@ test "file entry icons" {
     var audio_entry = FileEntry{};
     audio_entry.is_audio = true;
     try std.testing.expectEqualStrings(ICON_AUDIO, audio_entry.getIcon());
+
+    var playlist_entry = FileEntry{};
+    playlist_entry.is_playlist = true;
+    try std.testing.expectEqualStrings(ICON_PLAYLIST, playlist_entry.getIcon());
 
     var file_entry = FileEntry{};
     try std.testing.expectEqualStrings(ICON_FILE, file_entry.getIcon());

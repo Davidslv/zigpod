@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const music_db = @import("../library/music_db.zig");
+const playlist_parser = @import("../library/playlist.zig");
 
 // ============================================================
 // Repeat Mode
@@ -87,12 +88,16 @@ pub const QueueSource = enum {
     album, // All tracks from an album
     artist, // All tracks from an artist
     all_songs, // All songs in library
-    custom, // Manual/playlist queue
+    playlist, // From M3U/PLS playlist file
+    custom, // Manual queue
 };
 
 // ============================================================
 // Playback Queue
 // ============================================================
+
+/// Maximum path length for playlist entries
+pub const MAX_PATH_LENGTH: usize = 256;
 
 pub const PlaybackQueue = struct {
     /// Track indices into music_db (or paths for single files)
@@ -111,6 +116,14 @@ pub const PlaybackQueue = struct {
     /// For single file playback (not in music_db)
     single_file_path: [256]u8 = [_]u8{0} ** 256,
     single_file_path_len: usize = 0,
+
+    /// For playlist playback - stores resolved file paths
+    playlist_paths: [MAX_QUEUE_SIZE][MAX_PATH_LENGTH]u8 = undefined,
+    playlist_path_lens: [MAX_QUEUE_SIZE]u8 = [_]u8{0} ** MAX_QUEUE_SIZE,
+
+    /// Base directory for resolving relative playlist paths
+    playlist_base_dir: [MAX_PATH_LENGTH]u8 = [_]u8{0} ** MAX_PATH_LENGTH,
+    playlist_base_dir_len: usize = 0,
 
     /// Shuffle mode
     shuffle_enabled: bool = false,
@@ -261,6 +274,14 @@ pub const PlaybackQueue = struct {
         if (self.source == .single_file) {
             if (self.single_file_path_len > 0) {
                 return self.single_file_path[0..self.single_file_path_len];
+            }
+            return null;
+        }
+
+        if (self.source == .playlist) {
+            const path_len = self.playlist_path_lens[self.current_index];
+            if (path_len > 0) {
+                return self.playlist_paths[self.current_index][0..path_len];
             }
             return null;
         }
@@ -432,6 +453,96 @@ pub const PlaybackQueue = struct {
         }
 
         self.current_index = @min(start_track_idx, if (self.count > 0) self.count - 1 else 0);
+    }
+
+    /// Populate queue from a parsed playlist
+    /// `playlist_path` is used to resolve relative paths in the playlist
+    /// `parsed` contains the parsed playlist entries
+    pub fn setFromPlaylist(
+        self: *PlaybackQueue,
+        playlist_path: []const u8,
+        parsed: *const playlist_parser.M3uParser.ParseResult,
+    ) void {
+        self.clear();
+        self.source = .playlist;
+
+        // Extract base directory from playlist path
+        self.setPlaylistBaseDir(playlist_path);
+
+        // Add entries from parsed playlist
+        for (parsed.entries[0..parsed.count]) |entry| {
+            if (self.count >= MAX_QUEUE_SIZE) break;
+
+            // Resolve the path (relative to playlist directory if not absolute)
+            const resolved = self.resolvePlaylistPath(entry.path);
+            if (resolved) |path| {
+                const idx = self.count;
+                const len = @min(path.len, MAX_PATH_LENGTH);
+                @memcpy(self.playlist_paths[idx][0..len], path[0..len]);
+                self.playlist_path_lens[idx] = @intCast(len);
+                self.count += 1;
+            }
+        }
+
+        self.current_index = 0;
+    }
+
+    /// Set the base directory for playlist path resolution
+    fn setPlaylistBaseDir(self: *PlaybackQueue, playlist_path: []const u8) void {
+        // Find last path separator
+        var last_sep: usize = 0;
+        for (playlist_path, 0..) |c, i| {
+            if (c == '/' or c == '\\') last_sep = i;
+        }
+
+        if (last_sep > 0) {
+            const len = @min(last_sep, self.playlist_base_dir.len);
+            @memcpy(self.playlist_base_dir[0..len], playlist_path[0..len]);
+            self.playlist_base_dir_len = len;
+        } else {
+            self.playlist_base_dir_len = 0;
+        }
+    }
+
+    /// Resolve a playlist entry path (handle relative vs absolute)
+    /// Returns a slice into a static buffer
+    fn resolvePlaylistPath(self: *PlaybackQueue, path: []const u8) ?[]const u8 {
+        if (path.len == 0) return null;
+
+        // Check if absolute path
+        if (path[0] == '/' or (path.len > 1 and path[1] == ':')) {
+            return path;
+        }
+
+        // Relative path - prepend base directory
+        if (self.playlist_base_dir_len == 0) {
+            return path;
+        }
+
+        // Build absolute path in static buffer
+        const ResolveBuffer = struct {
+            var buf: [MAX_PATH_LENGTH]u8 = undefined;
+        };
+
+        var pos: usize = 0;
+
+        // Copy base dir
+        const base_len = @min(self.playlist_base_dir_len, ResolveBuffer.buf.len);
+        @memcpy(ResolveBuffer.buf[0..base_len], self.playlist_base_dir[0..base_len]);
+        pos = base_len;
+
+        // Add separator
+        if (pos < ResolveBuffer.buf.len) {
+            ResolveBuffer.buf[pos] = '/';
+            pos += 1;
+        }
+
+        // Add relative path
+        const path_len = @min(path.len, ResolveBuffer.buf.len - pos);
+        @memcpy(ResolveBuffer.buf[pos .. pos + path_len], path[0..path_len]);
+        pos += path_len;
+
+        return ResolveBuffer.buf[0..pos];
     }
 
     /// Sort queue by track number (for album playback)
@@ -780,4 +891,63 @@ test "can auto advance" {
     // Repeat all - can always advance (wrap)
     queue.setRepeatMode(.all);
     try std.testing.expect(queue.canAutoAdvance());
+}
+
+test "playlist path resolution absolute" {
+    var queue = PlaybackQueue.init();
+    queue.setPlaylistBaseDir("/music/playlists/myplaylist.m3u");
+
+    // Absolute path should remain unchanged
+    const resolved = queue.resolvePlaylistPath("/other/song.mp3");
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings("/other/song.mp3", resolved.?);
+}
+
+test "playlist path resolution relative" {
+    var queue = PlaybackQueue.init();
+    queue.setPlaylistBaseDir("/music/playlists/myplaylist.m3u");
+
+    // Relative path should be prepended with base dir
+    const resolved = queue.resolvePlaylistPath("track1.mp3");
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings("/music/playlists/track1.mp3", resolved.?);
+}
+
+test "playlist set from parsed" {
+    var queue = PlaybackQueue.init();
+
+    // Create a mock parsed result
+    var parsed = playlist_parser.M3uParser.ParseResult{
+        .entries = undefined,
+        .count = 0,
+        .name = "",
+        .is_extended = false,
+    };
+
+    // Initialize entries
+    for (&parsed.entries) |*entry| {
+        entry.* = playlist_parser.PlaylistEntry.init();
+    }
+
+    // Add some entries
+    parsed.entries[0].path = "/music/song1.mp3";
+    parsed.entries[1].path = "song2.mp3"; // Relative
+    parsed.entries[2].path = "/music/song3.mp3";
+    parsed.count = 3;
+
+    queue.setFromPlaylist("/playlists/test.m3u", &parsed);
+
+    try std.testing.expectEqual(@as(usize, 3), queue.count);
+    try std.testing.expectEqual(QueueSource.playlist, queue.source);
+
+    // Check first path (absolute)
+    try std.testing.expectEqualStrings("/music/song1.mp3", queue.getCurrentTrackPath().?);
+
+    // Navigate and check second path (was relative, now resolved)
+    _ = queue.next();
+    try std.testing.expectEqualStrings("/playlists/song2.mp3", queue.getCurrentTrackPath().?);
+
+    // Third path
+    _ = queue.next();
+    try std.testing.expectEqualStrings("/music/song3.mp3", queue.getCurrentTrackPath().?);
 }
