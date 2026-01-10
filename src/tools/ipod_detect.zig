@@ -64,6 +64,37 @@ const IpodProductId = enum(u16) {
     }
 };
 
+/// Partition information
+pub const PartitionInfo = struct {
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: usize = 0,
+    partition_type: [32]u8 = [_]u8{0} ** 32,
+    type_len: usize = 0,
+    size: u64 = 0,
+    device: [32]u8 = [_]u8{0} ** 32,
+    device_len: usize = 0,
+
+    pub fn getName(self: *const PartitionInfo) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn getType(self: *const PartitionInfo) []const u8 {
+        return self.partition_type[0..self.type_len];
+    }
+
+    pub fn getDevice(self: *const PartitionInfo) []const u8 {
+        return self.device[0..self.device_len];
+    }
+
+    pub fn getSizeGB(self: *const PartitionInfo) f64 {
+        return @as(f64, @floatFromInt(self.size)) / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    pub fn getSizeMB(self: *const PartitionInfo) f64 {
+        return @as(f64, @floatFromInt(self.size)) / (1024.0 * 1024.0);
+    }
+};
+
 /// Detected iPod information
 pub const IpodInfo = struct {
     /// Product name from USB
@@ -77,6 +108,9 @@ pub const IpodInfo = struct {
     /// USB Product ID
     product_id: u16 = 0,
 
+    /// USB Vendor ID
+    vendor_id: u16 = 0,
+
     /// Disk device path (if in Disk Mode)
     disk_path: [64]u8 = [_]u8{0} ** 64,
     disk_path_len: usize = 0,
@@ -84,12 +118,43 @@ pub const IpodInfo = struct {
     /// Disk size in bytes
     disk_size: u64 = 0,
 
+    /// Block size
+    block_size: u32 = 512,
+
     /// Is device in Disk Mode
     in_disk_mode: bool = false,
 
     /// USB location ID
     location_id: [32]u8 = [_]u8{0} ** 32,
     location_id_len: usize = 0,
+
+    /// USB speed (1=Low, 2=Full, 3=High, 4=Super)
+    usb_speed: u8 = 0,
+
+    /// Partitions (up to 8)
+    partitions: [8]PartitionInfo = [_]PartitionInfo{.{}} ** 8,
+    partition_count: usize = 0,
+
+    /// Firmware partition index (-1 if not found)
+    firmware_partition_idx: i8 = -1,
+
+    /// Data partition index (-1 if not found)
+    data_partition_idx: i8 = -1,
+
+    /// Mount point (if mounted)
+    mount_point: [128]u8 = [_]u8{0} ** 128,
+    mount_point_len: usize = 0,
+
+    /// Disk model string
+    disk_model: [64]u8 = [_]u8{0} ** 64,
+    disk_model_len: usize = 0,
+
+    /// Media type (Internal, External, etc)
+    media_type: [32]u8 = [_]u8{0} ** 32,
+    media_type_len: usize = 0,
+
+    /// Is likely iFlash/SSD (based on size > 160GB or model string)
+    is_flash_storage: bool = false,
 
     pub fn getProductName(self: *const IpodInfo) []const u8 {
         return self.product_name[0..self.product_name_len];
@@ -109,6 +174,42 @@ pub const IpodInfo = struct {
 
     pub fn getDiskSizeGB(self: *const IpodInfo) f64 {
         return @as(f64, @floatFromInt(self.disk_size)) / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    pub fn getMountPoint(self: *const IpodInfo) []const u8 {
+        return self.mount_point[0..self.mount_point_len];
+    }
+
+    pub fn getDiskModel(self: *const IpodInfo) []const u8 {
+        return self.disk_model[0..self.disk_model_len];
+    }
+
+    pub fn getMediaType(self: *const IpodInfo) []const u8 {
+        return self.media_type[0..self.media_type_len];
+    }
+
+    pub fn getUsbSpeedString(self: *const IpodInfo) []const u8 {
+        return switch (self.usb_speed) {
+            1 => "Low Speed (1.5 Mbps)",
+            2 => "Full Speed (12 Mbps)",
+            3 => "High Speed (480 Mbps)",
+            4 => "Super Speed (5 Gbps)",
+            else => "Unknown",
+        };
+    }
+
+    pub fn getFirmwarePartition(self: *const IpodInfo) ?*const PartitionInfo {
+        if (self.firmware_partition_idx >= 0 and self.firmware_partition_idx < @as(i8, @intCast(self.partition_count))) {
+            return &self.partitions[@intCast(self.firmware_partition_idx)];
+        }
+        return null;
+    }
+
+    pub fn getDataPartition(self: *const IpodInfo) ?*const PartitionInfo {
+        if (self.data_partition_idx >= 0 and self.data_partition_idx < @as(i8, @intCast(self.partition_count))) {
+            return &self.partitions[@intCast(self.data_partition_idx)];
+        }
+        return null;
     }
 };
 
@@ -276,15 +377,62 @@ fn isIpodProductId(product_id: u16) bool {
     };
 }
 
+/// Parse a size from diskutil output (handles "256.1 GB (255923695616 Bytes)" format)
+fn parseDiskutilSize(line: []const u8) u64 {
+    // Look for "(NNN Bytes)" format
+    if (std.mem.indexOf(u8, line, "(")) |paren_start| {
+        if (std.mem.indexOf(u8, line, " Bytes")) |bytes_end| {
+            if (bytes_end > paren_start) {
+                const size_str = line[paren_start + 1 .. bytes_end];
+                var clean_size: [32]u8 = undefined;
+                var clean_len: usize = 0;
+                for (size_str) |c| {
+                    if (c >= '0' and c <= '9') {
+                        if (clean_len < clean_size.len) {
+                            clean_size[clean_len] = c;
+                            clean_len += 1;
+                        }
+                    }
+                }
+                return std.fmt.parseInt(u64, clean_size[0..clean_len], 10) catch 0;
+            }
+        }
+    }
+    return 0;
+}
+
+/// Extract string value from diskutil info line (e.g., "   Device Model:      APPLE HDD")
+fn extractDiskutilValue(line: []const u8) []const u8 {
+    // Find the colon
+    if (std.mem.indexOf(u8, line, ":")) |colon_pos| {
+        var start = colon_pos + 1;
+        // Skip leading whitespace
+        while (start < line.len and (line[start] == ' ' or line[start] == '\t')) {
+            start += 1;
+        }
+        // Trim trailing whitespace
+        var end = line.len;
+        while (end > start and (line[end - 1] == ' ' or line[end - 1] == '\t' or line[end - 1] == '\n' or line[end - 1] == '\r')) {
+            end -= 1;
+        }
+        if (end > start) {
+            return line[start..end];
+        }
+    }
+    return "";
+}
+
 /// Find disk device for iPod in Disk Mode
 fn findDiskDevice(allocator: std.mem.Allocator, info: *IpodInfo) !void {
     // Run diskutil list to find all disks
     const output = runCommand(allocator, &.{ "diskutil", "list" }) catch return;
     defer allocator.free(output);
 
-    // Look specifically for Apple_HFS iPod partition
+    // Look specifically for Apple_HFS iPod partition or Apple_partition_scheme
     var lines = std.mem.splitScalar(u8, output, '\n');
     var current_disk: ?[]const u8 = null;
+    var found_apple_partition_scheme = false;
+    var partition_idx: usize = 0;
 
     while (lines.next()) |line| {
         // Track which disk we're looking at
@@ -294,53 +442,181 @@ fn findDiskDevice(allocator: std.mem.Allocator, info: *IpodInfo) !void {
                 end += 1;
             }
             current_disk = line[start..end];
+            found_apple_partition_scheme = false;
+            partition_idx = 0;
+        }
+
+        // Check for Apple partition map (iPod uses this)
+        if (std.mem.indexOf(u8, line, "Apple_partition_scheme") != null) {
+            found_apple_partition_scheme = true;
+        }
+
+        // Parse partition entries (format: "   1:   Apple_partition_map    32.3 KB   disk10s1")
+        if (found_apple_partition_scheme and current_disk != null and info.partition_count < info.partitions.len) {
+            // Look for partition type identifiers
+            const is_partition_line = std.mem.indexOf(u8, line, "Apple_") != null or
+                std.mem.indexOf(u8, line, "EFI") != null;
+
+            if (is_partition_line) {
+                var part = &info.partitions[info.partition_count];
+
+                // Extract partition type
+                if (std.mem.indexOf(u8, line, "Apple_partition_map")) |_| {
+                    const t = "Apple_partition_map";
+                    @memcpy(part.partition_type[0..t.len], t);
+                    part.type_len = t.len;
+                } else if (std.mem.indexOf(u8, line, "Apple_MDFW")) |_| {
+                    const t = "Apple_MDFW";
+                    @memcpy(part.partition_type[0..t.len], t);
+                    part.type_len = t.len;
+                    const n = "Firmware";
+                    @memcpy(part.name[0..n.len], n);
+                    part.name_len = n.len;
+                    info.firmware_partition_idx = @intCast(info.partition_count);
+                } else if (std.mem.indexOf(u8, line, "Apple_HFS")) |_| {
+                    const t = "Apple_HFS";
+                    @memcpy(part.partition_type[0..t.len], t);
+                    part.type_len = t.len;
+                    // Check if it's the iPod data partition
+                    if (std.mem.indexOf(u8, line, "iPod") != null or std.mem.indexOf(u8, line, "IPOD") != null) {
+                        const n = "iPod";
+                        @memcpy(part.name[0..n.len], n);
+                        part.name_len = n.len;
+                        info.data_partition_idx = @intCast(info.partition_count);
+                    }
+                } else if (std.mem.indexOf(u8, line, "Apple_Free")) |_| {
+                    const t = "Apple_Free";
+                    @memcpy(part.partition_type[0..t.len], t);
+                    part.type_len = t.len;
+                }
+
+                // Extract device path (e.g., "disk10s1" at end of line)
+                var iter = std.mem.splitBackwardsScalar(u8, line, ' ');
+                if (iter.next()) |last| {
+                    if (std.mem.startsWith(u8, last, "disk")) {
+                        const dev_path = "/dev/";
+                        @memcpy(part.device[0..dev_path.len], dev_path);
+                        const last_len = @min(last.len, part.device.len - dev_path.len);
+                        @memcpy(part.device[dev_path.len .. dev_path.len + last_len], last[0..last_len]);
+                        part.device_len = dev_path.len + last_len;
+                    }
+                }
+
+                if (part.type_len > 0) {
+                    info.partition_count += 1;
+                }
+            }
         }
 
         // Look for Apple_HFS iPod partition (the actual iPod data partition)
         if (std.mem.indexOf(u8, line, "Apple_HFS") != null and
-            std.mem.indexOf(u8, line, "iPod") != null)
+            (std.mem.indexOf(u8, line, "iPod") != null or std.mem.indexOf(u8, line, "IPOD") != null))
         {
             if (current_disk) |disk| {
                 const len = @min(disk.len, info.disk_path.len);
                 @memcpy(info.disk_path[0..len], disk[0..len]);
                 info.disk_path_len = len;
                 info.in_disk_mode = true;
+            }
+        }
+    }
 
-                // Get disk size using diskutil info
-                const disk_info = runCommand(allocator, &.{ "diskutil", "info", disk }) catch return;
-                defer allocator.free(disk_info);
+    // Get detailed disk info if we found the disk
+    if (info.disk_path_len > 0) {
+        const disk_path = info.getDiskPath();
+        const disk_info = runCommand(allocator, &.{ "diskutil", "info", disk_path }) catch return;
+        defer allocator.free(disk_info);
 
-                // Parse disk info
-                var info_lines = std.mem.splitScalar(u8, disk_info, '\n');
-                while (info_lines.next()) |info_line| {
-                    // Get disk size
-                    if (std.mem.indexOf(u8, info_line, "Disk Size:")) |_| {
-                        if (std.mem.indexOf(u8, info_line, "(")) |paren_start| {
-                            if (std.mem.indexOf(u8, info_line, " Bytes")) |bytes_end| {
-                                if (bytes_end > paren_start) {
-                                    const size_str = info_line[paren_start + 1 .. bytes_end];
-                                    var clean_size: [32]u8 = undefined;
-                                    var clean_len: usize = 0;
-                                    for (size_str) |c| {
-                                        if (c >= '0' and c <= '9') {
-                                            clean_size[clean_len] = c;
-                                            clean_len += 1;
-                                        }
-                                    }
-                                    info.disk_size = std.fmt.parseInt(u64, clean_size[0..clean_len], 10) catch 0;
-                                }
-                            }
-                        }
-                    }
+        // Parse disk info
+        var info_lines = std.mem.splitScalar(u8, disk_info, '\n');
+        while (info_lines.next()) |info_line| {
+            // Get disk size
+            if (std.mem.indexOf(u8, info_line, "Disk Size:") != null) {
+                info.disk_size = parseDiskutilSize(info_line);
+            }
 
-                    // Check Media Type to confirm it's an iPod
-                    if (std.mem.indexOf(u8, info_line, "Media Type:") != null and
-                        std.mem.indexOf(u8, info_line, "iPod") != null)
+            // Get block size
+            if (std.mem.indexOf(u8, info_line, "Device Block Size:") != null) {
+                const val = extractDiskutilValue(info_line);
+                // Parse "512 Bytes" format
+                var iter = std.mem.splitScalar(u8, val, ' ');
+                if (iter.next()) |num_str| {
+                    info.block_size = std.fmt.parseInt(u32, num_str, 10) catch 512;
+                }
+            }
+
+            // Get device model
+            if (std.mem.indexOf(u8, info_line, "Device / Media Name:") != null) {
+                const val = extractDiskutilValue(info_line);
+                const vlen = @min(val.len, info.disk_model.len);
+                @memcpy(info.disk_model[0..vlen], val[0..vlen]);
+                info.disk_model_len = vlen;
+
+                // Check for flash storage indicators
+                if (std.mem.indexOf(u8, val, "SD") != null or
+                    std.mem.indexOf(u8, val, "Flash") != null or
+                    std.mem.indexOf(u8, val, "iFlash") != null or
+                    std.mem.indexOf(u8, val, "SSD") != null or
+                    std.mem.indexOf(u8, val, "CF") != null)
+                {
+                    info.is_flash_storage = true;
+                }
+            }
+
+            // Get media type
+            if (std.mem.indexOf(u8, info_line, "Removable Media:") != null) {
+                const val = extractDiskutilValue(info_line);
+                const vlen = @min(val.len, info.media_type.len);
+                @memcpy(info.media_type[0..vlen], val[0..vlen]);
+                info.media_type_len = vlen;
+            }
+        }
+
+        // If disk is larger than 160GB, likely flash storage
+        if (info.disk_size > 160 * 1024 * 1024 * 1024) {
+            info.is_flash_storage = true;
+        }
+
+        // Get partition sizes
+        for (info.partitions[0..info.partition_count]) |*part| {
+            if (part.device_len > 0) {
+                const part_info = runCommand(allocator, &.{ "diskutil", "info", part.getDevice() }) catch continue;
+                defer allocator.free(part_info);
+
+                var part_lines = std.mem.splitScalar(u8, part_info, '\n');
+                while (part_lines.next()) |pline| {
+                    if (std.mem.indexOf(u8, pline, "Disk Size:") != null or
+                        std.mem.indexOf(u8, pline, "Total Size:") != null)
                     {
-                        info.in_disk_mode = true;
+                        part.size = parseDiskutilSize(pline);
+                        break;
                     }
                 }
-                return;
+            }
+        }
+
+        // Get mount point
+        const mount_output = runCommand(allocator, &.{ "mount" }) catch return;
+        defer allocator.free(mount_output);
+
+        var mount_lines = std.mem.splitScalar(u8, mount_output, '\n');
+        while (mount_lines.next()) |mline| {
+            // Look for our disk in mount output
+            if (std.mem.indexOf(u8, mline, disk_path) != null or
+                (info.partition_count > 0 and std.mem.indexOf(u8, mline, "disk") != null))
+            {
+                // Check for iPod mount
+                if (std.mem.indexOf(u8, mline, "/Volumes/")) |vol_start| {
+                    var vol_end = vol_start + 9;
+                    while (vol_end < mline.len and mline[vol_end] != ' ' and mline[vol_end] != '(') {
+                        vol_end += 1;
+                    }
+                    const mount = mline[vol_start..vol_end];
+                    const mlen = @min(mount.len, info.mount_point.len);
+                    @memcpy(info.mount_point[0..mlen], mount[0..mlen]);
+                    info.mount_point_len = mlen;
+                    break;
+                }
             }
         }
     }
@@ -419,6 +695,54 @@ pub fn detectIpod(allocator: std.mem.Allocator) DetectionResult {
                 }
             }
 
+            // Extract vendor ID
+            if (std.mem.indexOf(u8, search_region, "\"idVendor\" = ")) |id_pos| {
+                const num_start = id_pos + 13;
+                var num_end = num_start;
+                while (num_end < search_region.len and search_region[num_end] >= '0' and search_region[num_end] <= '9') {
+                    num_end += 1;
+                }
+                if (num_end > num_start) {
+                    result.ipod.vendor_id = std.fmt.parseInt(u16, search_region[num_start..num_end], 10) catch 0;
+                }
+            }
+
+            // Extract USB speed (1=Low, 2=Full, 3=High)
+            if (std.mem.indexOf(u8, search_region, "\"Device Speed\" = ")) |speed_pos| {
+                const num_start = speed_pos + 17;
+                if (num_start < search_region.len and search_region[num_start] >= '0' and search_region[num_start] <= '9') {
+                    result.ipod.usb_speed = search_region[num_start] - '0';
+                }
+            }
+
+            // Also check "USBSpeed" format
+            if (result.ipod.usb_speed == 0) {
+                // Search backwards in the region before iPod string
+                const pre_search_start = if (ipod_pos > 500) ipod_pos - 500 else 0;
+                const pre_search_region = ioreg_ipod[pre_search_start..ipod_pos];
+                if (std.mem.indexOf(u8, pre_search_region, "\"USBSpeed\" = ")) |speed_pos| {
+                    const num_start = speed_pos + 13;
+                    if (num_start < pre_search_region.len and pre_search_region[num_start] >= '0' and pre_search_region[num_start] <= '9') {
+                        result.ipod.usb_speed = pre_search_region[num_start] - '0';
+                    }
+                }
+            }
+
+            // Extract location ID
+            if (std.mem.indexOf(u8, search_region, "\"locationID\" = ")) |loc_pos| {
+                const num_start = loc_pos + 15;
+                var num_end = num_start;
+                while (num_end < search_region.len and search_region[num_end] >= '0' and search_region[num_end] <= '9') {
+                    num_end += 1;
+                }
+                if (num_end > num_start) {
+                    // Convert decimal to hex string for display
+                    const loc_dec = std.fmt.parseInt(u32, search_region[num_start..num_end], 10) catch 0;
+                    const loc_str = std.fmt.bufPrint(&result.ipod.location_id, "0x{X:0>8}", .{loc_dec}) catch "";
+                    result.ipod.location_id_len = loc_str.len;
+                }
+            }
+
             // Extract serial - it appears BEFORE the iPod string in the output
             // Look in the 500 bytes before the iPod string
             const serial_search_start = if (ipod_pos > 500) ipod_pos - 500 else 0;
@@ -484,7 +808,7 @@ pub fn detectIpod(allocator: std.mem.Allocator) DetectionResult {
     return result;
 }
 
-/// Print detection results
+/// Print detection results (basic output)
 fn printResults(result: *const DetectionResult) void {
     print("\n", .{});
     print("╔══════════════════════════════════════════════════════════╗\n", .{});
@@ -565,8 +889,215 @@ fn printResults(result: *const DetectionResult) void {
     print("\n", .{});
 }
 
+/// Print verbose detection results (detailed for development)
+fn printVerboseResults(result: *const DetectionResult) void {
+    print("\n", .{});
+    print("╔══════════════════════════════════════════════════════════════════════════╗\n", .{});
+    print("║              ZigPod iPod Detection Tool (VERBOSE)                        ║\n", .{});
+    print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+
+    if (result.found) {
+        print("║  Status: iPod DETECTED                                                   ║\n", .{});
+
+        // USB Information Section
+        print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+        print("║  USB DEVICE INFORMATION                                                  ║\n", .{});
+        print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+
+        const name = result.ipod.getProductName();
+        if (name.len > 0) {
+            print("║  Device:        {s:<56} ║\n", .{name});
+        }
+
+        if (result.ipod.vendor_id != 0) {
+            print("║  Vendor ID:     0x{X:0>4} (Apple Inc.)                                     ║\n", .{result.ipod.vendor_id});
+        } else {
+            print("║  Vendor ID:     0x05AC (Apple Inc.)                                      ║\n", .{});
+        }
+
+        if (result.ipod.product_id != 0) {
+            const prod_desc: []const u8 = switch (result.ipod.product_id) {
+                0x1201 => "iPod 1G/2G",
+                0x1203 => "iPod 3G",
+                0x1205 => "iPod Mini 1G",
+                0x1207 => "iPod 4G/Photo",
+                0x1209 => "iPod Video 5G/5.5G / Disk Mode",
+                0x120A => "iPod Nano 1G",
+                0x1260 => "iPod Nano 2G",
+                0x1261 => "iPod Classic 6G",
+                0x1262 => "iPod Classic 6G 120GB",
+                0x1263 => "iPod Classic 7G",
+                else => "Unknown iPod",
+            };
+            print("║  Product ID:    0x{X:0>4} ({s:<38}) ║\n", .{ result.ipod.product_id, prod_desc });
+        }
+
+        const serial = result.ipod.getSerial();
+        if (serial.len > 0) {
+            print("║  Serial:        {s:<56} ║\n", .{serial});
+        }
+
+        const loc = result.ipod.getLocationId();
+        if (loc.len > 0) {
+            print("║  Location ID:   {s:<56} ║\n", .{loc});
+        }
+
+        if (result.ipod.usb_speed != 0) {
+            print("║  USB Speed:     {s:<56} ║\n", .{result.ipod.getUsbSpeedString()});
+        }
+
+        // Storage Information Section
+        if (result.ipod.in_disk_mode) {
+            print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+            print("║  STORAGE INFORMATION                                                     ║\n", .{});
+            print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+            print("║  Mode:          DISK MODE (ready for ZigPod flashing)                    ║\n", .{});
+
+            const disk_path = result.ipod.getDiskPath();
+            if (disk_path.len > 0) {
+                print("║  Disk Device:   {s:<56} ║\n", .{disk_path});
+            }
+
+            if (result.ipod.disk_size > 0) {
+                const size_gb = result.ipod.getDiskSizeGB();
+                const total_sectors = result.ipod.disk_size / result.ipod.block_size;
+                print("║  Total Size:    {d:.2} GB ({d} bytes)                       ║\n", .{ size_gb, result.ipod.disk_size });
+                print("║  Block Size:    {d} bytes                                            ║\n", .{result.ipod.block_size});
+                print("║  Total Sectors: {d:<56} ║\n", .{total_sectors});
+            }
+
+            const model = result.ipod.getDiskModel();
+            if (model.len > 0) {
+                print("║  Disk Model:    {s:<56} ║\n", .{model});
+            }
+
+            const media = result.ipod.getMediaType();
+            if (media.len > 0) {
+                print("║  Removable:     {s:<56} ║\n", .{media});
+            }
+
+            if (result.ipod.is_flash_storage) {
+                print("║  Storage Type:  Flash/SSD (iFlash or similar mod detected)              ║\n", .{});
+            } else {
+                print("║  Storage Type:  HDD (original mechanical drive)                         ║\n", .{});
+            }
+
+            const mount = result.ipod.getMountPoint();
+            if (mount.len > 0) {
+                print("║  Mount Point:   {s:<56} ║\n", .{mount});
+            }
+
+            // Partition Layout Section
+            if (result.ipod.partition_count > 0) {
+                print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+                print("║  PARTITION LAYOUT                                                        ║\n", .{});
+                print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+
+                for (result.ipod.partitions[0..result.ipod.partition_count], 0..) |part, i| {
+                    const ptype = part.getType();
+                    const pname = part.getName();
+                    const pdev = part.getDevice();
+
+                    // Determine if this is firmware or data partition
+                    var indicator: []const u8 = "   ";
+                    if (@as(i8, @intCast(i)) == result.ipod.firmware_partition_idx) {
+                        indicator = "FW ";
+                    } else if (@as(i8, @intCast(i)) == result.ipod.data_partition_idx) {
+                        indicator = "DAT";
+                    }
+
+                    if (part.size > 0) {
+                        if (part.size < 1024 * 1024) {
+                            // Show in KB for small partitions
+                            const size_kb = @as(f64, @floatFromInt(part.size)) / 1024.0;
+                            print("║  [{s}] {d}: {s:<20} {d:>8.1} KB  {s:<18} ║\n", .{ indicator, i + 1, ptype, size_kb, pdev });
+                        } else if (part.size < 1024 * 1024 * 1024) {
+                            // Show in MB
+                            const size_mb = part.getSizeMB();
+                            print("║  [{s}] {d}: {s:<20} {d:>8.1} MB  {s:<18} ║\n", .{ indicator, i + 1, ptype, size_mb, pdev });
+                        } else {
+                            // Show in GB
+                            const size_gb = part.getSizeGB();
+                            print("║  [{s}] {d}: {s:<20} {d:>8.2} GB  {s:<18} ║\n", .{ indicator, i + 1, ptype, size_gb, pdev });
+                        }
+                    } else {
+                        print("║  [{s}] {d}: {s:<20} {s:<10} {s:<18} ║\n", .{ indicator, i + 1, ptype, pname, pdev });
+                    }
+                }
+
+                print("║                                                                          ║\n", .{});
+                print("║  Legend: [FW ] = Firmware partition (for ZigPod)                         ║\n", .{});
+                print("║          [DAT] = Data partition (music/files)                            ║\n", .{});
+            }
+
+            // ZigPod Development Info
+            print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+            print("║  ZIGPOD DEVELOPMENT INFO                                                 ║\n", .{});
+            print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+
+            if (result.ipod.getFirmwarePartition()) |fw_part| {
+                const fw_dev = fw_part.getDevice();
+                print("║  Firmware Dev:  {s:<56} ║\n", .{fw_dev});
+                if (fw_part.size > 0) {
+                    const fw_sectors = fw_part.size / result.ipod.block_size;
+                    print("║  FW Size:       {d:.2} MB ({d} sectors)                           ║\n", .{ fw_part.getSizeMB(), fw_sectors });
+                }
+            } else {
+                print("║  Firmware Dev:  Not found (Apple_MDFW partition)                         ║\n", .{});
+            }
+
+            // PP5021 specific info
+            print("║                                                                          ║\n", .{});
+            print("║  Target SoC:    PP5021C (PortalPlayer)                                   ║\n", .{});
+            print("║  RAM:           32 MB SDRAM                                              ║\n", .{});
+            print("║  LCD:           320x240 QVGA (BCM2722)                                   ║\n", .{});
+            print("║  Codec:         Wolfson WM8758                                           ║\n", .{});
+
+            // Flash command hint
+            print("║                                                                          ║\n", .{});
+            print("║  To flash ZigPod:                                                        ║\n", .{});
+            print("║    zigpod-flasher flash --device {s:<15} --image zigpod.bin  ║\n", .{disk_path});
+
+        } else {
+            print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+            print("║  Mode: Normal (not in Disk Mode)                                         ║\n", .{});
+            print("║                                                                          ║\n", .{});
+            print("║  To enter Disk Mode for flashing:                                        ║\n", .{});
+            print("║  1. Hold MENU + SELECT until Apple logo appears                          ║\n", .{});
+            print("║  2. Immediately hold SELECT + PLAY                                       ║\n", .{});
+            print("║  3. Wait for \"OK to disconnect\" screen                                   ║\n", .{});
+        }
+    } else {
+        print("║  Status: No iPod detected                                                ║\n", .{});
+        print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});
+        print("║                                                                          ║\n", .{});
+        print("║  Make sure your iPod is:                                                 ║\n", .{});
+        print("║  - Connected via USB cable                                               ║\n", .{});
+        print("║  - Powered on                                                            ║\n", .{});
+        print("║  - In Disk Mode for flashing                                             ║\n", .{});
+        print("║                                                                          ║\n", .{});
+        print("║  To enter Disk Mode:                                                     ║\n", .{});
+        print("║  1. Hold MENU + SELECT until Apple logo                                  ║\n", .{});
+        print("║  2. Immediately hold SELECT + PLAY                                       ║\n", .{});
+        print("║                                                                          ║\n", .{});
+        print("║  Supported iPod models for ZigPod:                                       ║\n", .{});
+        print("║  - iPod Video 5G/5.5G (0x1209) [PRIMARY TARGET]                          ║\n", .{});
+        print("║  - iPod Classic 6G (0x1261)                                              ║\n", .{});
+        print("║  - iPod Classic 7G (0x1263)                                              ║\n", .{});
+
+        const err = result.getError();
+        if (err.len > 0) {
+            print("║                                                                          ║\n", .{});
+            print("║  Error: {s:<63} ║\n", .{err});
+        }
+    }
+
+    print("╚══════════════════════════════════════════════════════════════════════════╝\n", .{});
+    print("\n", .{});
+}
+
 /// Watch mode - continuously check for iPod
-fn watchMode(allocator: std.mem.Allocator) void {
+fn watchMode(allocator: std.mem.Allocator, verbose: bool) void {
     print("\nWatching for iPod... (press Ctrl+C to stop)\n\n", .{});
 
     var last_found = false;
@@ -576,7 +1107,11 @@ fn watchMode(allocator: std.mem.Allocator) void {
         if (result.found != last_found) {
             if (result.found) {
                 print("iPod connected!\n", .{});
-                printResults(&result);
+                if (verbose) {
+                    printVerboseResults(&result);
+                } else {
+                    printResults(&result);
+                }
             } else {
                 print("iPod disconnected\n", .{});
             }
@@ -595,11 +1130,16 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    // Check for watch mode
+    // Parse command line options
     var watch = false;
+    var verbose = false;
+
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
             watch = true;
+        }
+        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            verbose = true;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             print(
@@ -608,6 +1148,8 @@ pub fn main() !void {
                 \\Usage: ipod-detect [OPTIONS]
                 \\
                 \\Options:
+                \\  -v, --verbose  Show detailed device info (partition layout, USB details,
+                \\                 storage type, firmware partition location, ZigPod dev info)
                 \\  -w, --watch    Continuously watch for iPod connection
                 \\  -h, --help     Show this help message
                 \\
@@ -615,16 +1157,32 @@ pub fn main() !void {
                 \\their information. When an iPod is in Disk Mode, it will
                 \\show the disk path needed for flashing ZigPod.
                 \\
+                \\Supported iPod Models:
+                \\  - iPod Video 5G/5.5G (0x1209) - PRIMARY TARGET
+                \\  - iPod Classic 6G (0x1261)
+                \\  - iPod Classic 6G 120GB (0x1262)
+                \\  - iPod Classic 7G (0x1263)
+                \\
+                \\Examples:
+                \\  ipod-detect              Basic detection
+                \\  ipod-detect -v           Detailed info for development
+                \\  ipod-detect -w           Watch for iPod connection
+                \\  ipod-detect -v -w        Verbose watch mode
+                \\
             , .{});
             return;
         }
     }
 
     if (watch) {
-        watchMode(allocator);
+        watchMode(allocator, verbose);
     } else {
         const result = detectIpod(allocator);
-        printResults(&result);
+        if (verbose) {
+            printVerboseResults(&result);
+        } else {
+            printResults(&result);
+        }
     }
 }
 
