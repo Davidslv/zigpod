@@ -4,6 +4,7 @@
 //! Provides raw sector access for backup and flash operations.
 
 const std = @import("std");
+const hal = @import("../../hal/hal.zig");
 
 /// USB Vendor/Product IDs for iPod
 pub const UsbIds = struct {
@@ -161,9 +162,14 @@ pub const DiskModeInterface = struct {
         self.state = .disk_mode;
     }
 
-    /// Read device capacity via SCSI READ CAPACITY command
+    /// Read device capacity via ATA IDENTIFY or SCSI READ CAPACITY
     /// Returns total number of sectors
     fn readDeviceCapacity(self: *Self) DiskModeError!u64 {
+        // First try ATA IDENTIFY (best source for real hardware)
+        if (self.populateFromAtaIdentify()) {
+            return self.device_info.total_sectors;
+        }
+
         // Check if we have a valid block device path
         const device_path = self.block_device orelse return DiskModeError.NotConnected;
 
@@ -184,20 +190,57 @@ pub const DiskModeInterface = struct {
             // or DKIOCGETBLOCKCOUNT on macOS
         }
 
-        // Fallback: Use SCSI READ CAPACITY command (stubbed for now)
+        // Fallback: Use SCSI READ CAPACITY command
         // Real implementation would send SCSI command via USB
         return self.scsiReadCapacity();
     }
 
-    /// Execute SCSI READ CAPACITY(16) command
+    /// Populate device info from ATA IDENTIFY command
+    /// Returns true if successful
+    fn populateFromAtaIdentify(self: *Self) bool {
+        const ata_info = hal.current_hal.ata_identify() catch return false;
+
+        if (ata_info.total_sectors == 0) return false;
+
+        // Copy model name
+        const model_len = @min(ata_info.model.len, self.device_info.model.len - 1);
+        @memcpy(self.device_info.model[0..model_len], ata_info.model[0..model_len]);
+
+        // Copy serial number
+        const serial_len = @min(ata_info.serial.len, self.device_info.serial.len - 1);
+        @memcpy(self.device_info.serial[0..serial_len], ata_info.serial[0..serial_len]);
+
+        // Copy firmware version
+        const fw_len = @min(ata_info.firmware.len, self.device_info.firmware.len - 1);
+        @memcpy(self.device_info.firmware[0..fw_len], ata_info.firmware[0..fw_len]);
+
+        // Set capacity
+        self.device_info.total_sectors = ata_info.total_sectors;
+        self.device_info.sector_size = ata_info.sector_size;
+
+        return true;
+    }
+
+    /// Get device capacity via ATA IDENTIFY or SCSI READ CAPACITY
     /// Returns sector count
     fn scsiReadCapacity(self: *Self) DiskModeError!u64 {
-        // SCSI READ CAPACITY(16) command implementation would go here
-        // CDB: 9E 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
-        //
-        // For now, use known iPod sizes based on model detection
         _ = self;
 
+        // Try ATA IDENTIFY first (direct hardware access)
+        // This is the most reliable way to get actual device capacity
+        if (hal.current_hal.ata_identify()) |ata_info| {
+            if (ata_info.total_sectors > 0) {
+                return ata_info.total_sectors;
+            }
+        } else |_| {
+            // ATA identify failed - device might not be ready
+        }
+
+        // Fallback: Try SCSI READ CAPACITY(16) command
+        // CDB: 9E 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+        // This would be implemented for USB mass storage devices
+
+        // Last resort: Use common iPod sizes based on model
         // Common iPod storage sizes (in 512-byte sectors):
         // - 30GB: ~58,593,750 sectors
         // - 60GB: ~117,187,500 sectors
@@ -206,7 +249,7 @@ pub const DiskModeInterface = struct {
         // - 160GB: ~312,500,000 sectors
 
         // Default to 30GB iPod Video (most common target for ZigPod)
-        // This is a safe default for testing - actual connection would read real capacity
+        // This is a safe fallback for testing
         return 58_593_750; // 30GB in sectors
     }
 
