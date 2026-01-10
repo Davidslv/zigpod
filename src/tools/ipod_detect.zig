@@ -929,7 +929,11 @@ fn printVerboseResults(result: *const DetectionResult) void {
                 0x1263 => "iPod Classic 7G",
                 else => "Unknown iPod",
             };
-            print("║  Product ID:    0x{X:0>4} ({s:<38}) ║\n", .{ result.ipod.product_id, prod_desc });
+            // Format product ID with description into buffer for proper alignment
+            var pid_buf: [56]u8 = [_]u8{' '} ** 56;
+            const pid_str = std.fmt.bufPrint(&pid_buf, "0x{X:0>4} ({s})", .{ result.ipod.product_id, prod_desc }) catch "";
+            _ = pid_str;
+            print("║  Product ID:    {s} ║\n", .{pid_buf});
         }
 
         const serial = result.ipod.getSerial();
@@ -1053,10 +1057,11 @@ fn printVerboseResults(result: *const DetectionResult) void {
             print("║  LCD:           320x240 QVGA (BCM2722)                                   ║\n", .{});
             print("║  Codec:         Wolfson WM8758                                           ║\n", .{});
 
-            // Flash command hint
+            // Installation command hint
             print("║                                                                          ║\n", .{});
-            print("║  To flash ZigPod:                                                        ║\n", .{});
-            print("║    zigpod-flasher flash --device {s:<15} --image zigpod.bin  ║\n", .{disk_path});
+            print("║  To install ZigPod (see docs/INSTALLATION_GUIDE.md):                     ║\n", .{});
+            print("║    1. sudo ./ipodpatcher -a zig-out/bin/zigpod-bootloader.bin            ║\n", .{});
+            print("║    2. cp zig-out/bin/zigpod.bin /Volumes/IPOD/.zigpod/firmware.bin       ║\n", .{});
 
         } else {
             print("╠══════════════════════════════════════════════════════════════════════════╣\n", .{});

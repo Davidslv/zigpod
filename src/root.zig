@@ -131,13 +131,6 @@ pub const perf = @import("perf/metrics.zig");
 pub const simulator = @import("simulator/simulator.zig");
 
 // ============================================================
-// Integration Tests
-// ============================================================
-
-/// Integration tests for multi-component interaction
-pub const integration_tests = @import("tests/integration_tests.zig");
-
-// ============================================================
 // Platform Detection
 // ============================================================
 

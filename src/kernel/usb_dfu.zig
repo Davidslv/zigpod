@@ -14,8 +14,9 @@
 //!   - Rollback capability if verification fails
 
 const std = @import("std");
-const hal = @import("../hal/hal.zig");
-const usb = @import("../drivers/usb.zig");
+const zigpod = @import("zigpod");
+const hal = zigpod.hal;
+const usb = zigpod.usb;
 
 // ============================================================
 // DFU Constants (USB DFU 1.1 Specification)

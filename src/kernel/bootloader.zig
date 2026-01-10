@@ -4,8 +4,36 @@
 //! Supports booting ZigPod OS, original firmware, or entering recovery mode.
 
 const std = @import("std");
-const hal = @import("../hal/hal.zig");
+const zigpod = @import("zigpod");
+const hal = zigpod.hal;
 const usb_dfu = @import("usb_dfu.zig");
+
+// ============================================================
+// Entry Point (called by Boot ROM)
+// ============================================================
+
+/// Linker-provided symbols
+extern var __stack_top: u32;
+
+/// Entry point - Boot ROM jumps here after loading bootloader to IRAM
+export fn _start() callconv(.naked) noreturn {
+    // Set up stack pointer (provided by linker script)
+    // Then jump to bootloader main
+    asm volatile (
+        \\ldr sp, =__stack_top
+        \\b _bootloader_main
+    );
+    unreachable;
+}
+
+/// Main bootloader function (called after stack setup)
+export fn _bootloader_main() noreturn {
+    // Initialize bootloader
+    init();
+
+    // Enter boot sequence (never returns)
+    boot();
+}
 
 // ============================================================
 // Bootloader Constants

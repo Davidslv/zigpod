@@ -54,6 +54,46 @@ pub fn build(b: *std.Build) void {
     firmware_step.dependOn(&install_bin.step);
 
     // ============================================================
+    // ZigPod Bootloader (ARM target)
+    // ============================================================
+
+    // Create ARM root module for bootloader imports
+    const arm_root_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = arm_target,
+        .optimize = .ReleaseSmall,
+    });
+
+    const bootloader = b.addExecutable(.{
+        .name = "zigpod-bootloader",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kernel/bootloader.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall, // Bootloader should be small
+            .imports = &.{
+                .{ .name = "zigpod", .module = arm_root_module },
+            },
+        }),
+    });
+
+    // Use the bootloader linker script (runs from IRAM)
+    bootloader.setLinkerScript(b.path("linker/bootloader.ld"));
+
+    // Generate raw binary for ipodpatcher
+    const bootloader_bin = bootloader.addObjCopy(.{
+        .basename = "zigpod-bootloader.bin",
+        .format = .bin,
+    });
+
+    // Install both ELF and binary
+    b.installArtifact(bootloader);
+
+    const install_bootloader_bin = b.addInstallFile(bootloader_bin.getOutput(), "bin/zigpod-bootloader.bin");
+
+    const bootloader_step = b.step("bootloader", "Build ZigPod bootloader for iPod hardware");
+    bootloader_step.dependOn(&install_bootloader_bin.step);
+
+    // ============================================================
     // Simulator Executable
     // ============================================================
 
