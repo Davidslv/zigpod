@@ -91,12 +91,71 @@ const WHEEL_CTRL_START: u32 = 0x80000000;         // Start transfer
 const WHEEL_CTRL_ACK: u32 = 0x60000000;           // Acknowledge bits
 
 // Button bits from wheel packet - 5.5G CONFIRMED mapping
-// These are the bit positions in the data word (bits 8-13)
+// These are the bit positions in the data word (bits 8-12)
 const BTN_SELECT: u32 = 0x00000100;  // Bit 8
 const BTN_RIGHT: u32 = 0x00000200;   // Bit 9
 const BTN_LEFT: u32 = 0x00000400;    // Bit 10
 const BTN_PLAY: u32 = 0x00000800;    // Bit 11
-const BTN_MENU: u32 = 0x00002000;    // Bit 13 (NOT bit 12!)
+const BTN_MENU: u32 = 0x00003000;    // Bit 12 OR 13 - check both!
+
+// ============================================================================
+// UART Serial Debug (dock connector, 115200 baud)
+// ============================================================================
+// Connect: Pin 11 = TX, Pin 13 = RX, Pin 1/2 = GND
+// Use: screen /dev/tty.usbserial-XXXX 115200
+
+const DEV_SER0: u32 = 0x00000040;  // Serial 0 enable bit in DEV_EN
+
+const SER0_BASE: u32 = 0x70006000;
+const SER0_RBR_THR: *volatile u32 = @ptrFromInt(SER0_BASE + 0x00);  // RX/TX buffer
+const SER0_DLL: *volatile u32 = @ptrFromInt(SER0_BASE + 0x00);      // Divisor low (when DLAB=1)
+const SER0_DLM: *volatile u32 = @ptrFromInt(SER0_BASE + 0x04);      // Divisor high (when DLAB=1)
+const SER0_LCR: *volatile u32 = @ptrFromInt(SER0_BASE + 0x0C);      // Line control
+const SER0_LSR: *volatile u32 = @ptrFromInt(SER0_BASE + 0x14);      // Line status
+
+// Initialize UART for debug output
+fn initUart() void {
+    // Enable serial device
+    DEV_EN.* |= DEV_SER0;
+
+    // Set DLAB to access divisor registers
+    SER0_LCR.* = 0x80;
+
+    // Set baud rate: 24MHz / 115200 / 16 = 13
+    SER0_DLL.* = 13;
+    SER0_DLM.* = 0;
+
+    // 8-N-1, clear DLAB
+    SER0_LCR.* = 0x03;
+}
+
+// Send one character
+fn uartPutChar(c: u8) void {
+    // Wait for TX holding register empty (bit 5)
+    while ((SER0_LSR.* & 0x20) == 0) {
+        asm volatile ("nop");
+    }
+    SER0_RBR_THR.* = c;
+}
+
+// Send a string
+fn uartPrint(s: []const u8) void {
+    for (s) |c| {
+        if (c == '\n') uartPutChar('\r');
+        uartPutChar(c);
+    }
+}
+
+// Print hex value
+fn uartPrintHex(val: u32) void {
+    const hex = "0123456789ABCDEF";
+    uartPrint("0x");
+    var i: i8 = 28;
+    while (i >= 0) : (i -= 4) {
+        const shift: u5 = @intCast(@as(u8, @bitCast(i)));
+        uartPutChar(hex[@as(usize, (val >> shift) & 0xF)]);
+    }
+}
 
 // Initialize click wheel - full sequence from Rockbox opto_i2c_init()
 fn initWheel() void {
@@ -365,16 +424,28 @@ fn drawMenuItems() void {
     BCM_CONTROL.* = 0x31;
 }
 
+// Set to true to enable UART debug output (requires dock connector serial cable)
+const UART_DEBUG = false;
+
 export fn _zigpod_main() void {
     // Set backlight to maximum (5.5G enhancement)
     PWM_BACKLIGHT.* = 0x0000FFFF;
 
+    // Initialize UART if debug enabled
+    if (UART_DEBUG) {
+        initUart();
+        uartPrint("\n\n=== ZigPod Boot ===\n");
+    }
+
     // Show startup sequence
     fillScreen(COLOR32_RED);
+    if (UART_DEBUG) uartPrint("Display: RED\n");
     delay();
     fillScreen(COLOR32_GREEN);
+    if (UART_DEBUG) uartPrint("Display: GREEN\n");
     delay();
     fillScreen(COLOR32_BLUE);
+    if (UART_DEBUG) uartPrint("Display: BLUE\n");
     delay();
 
     // Initialize click wheel
@@ -387,12 +458,16 @@ export fn _zigpod_main() void {
     WHEEL_CTRL.* = 0xC00A1F00;
     WHEEL_STATUS.* = 0x01000000;
 
+    if (UART_DEBUG) uartPrint("Click wheel initialized\n");
+
     // Show CYAN = init complete
     fillScreen(COLOR32_CYAN);
+    if (UART_DEBUG) uartPrint("Display: CYAN (init complete)\n");
     delay();
 
     // Main loop - poll wheel and show button colors
     fillScreen(COLOR32_BLACK);
+    if (UART_DEBUG) uartPrint("Entering main loop...\n");
 
     while (true) {
         const status = WHEEL_STATUS.*;
@@ -404,6 +479,13 @@ export fn _zigpod_main() void {
             // Acknowledge the read
             WHEEL_STATUS.* = WHEEL_STATUS.* | 0x0C000000;
             WHEEL_CTRL.* = WHEEL_CTRL.* | 0x60000000;
+
+            // Debug: print raw packet data
+            if (UART_DEBUG) {
+                uartPrint("WHEEL_DATA: ");
+                uartPrintHex(data);
+                uartPrint("\n");
+            }
 
             // Validate packet: lower byte must be 0x1A
             // NOTE: MENU packets don't have bit 31 set, so only check lower byte!
@@ -418,17 +500,24 @@ export fn _zigpod_main() void {
 
                 if ((data & 0x00002000) != 0 or (data & 0x00001000) != 0) {
                     fillScreen(COLOR32_RED);     // MENU = Red
+                    if (UART_DEBUG) uartPrint("Button: MENU\n");
                 } else if ((data & 0x00000100) != 0) {
                     fillScreen(COLOR32_WHITE);   // SELECT = White
+                    if (UART_DEBUG) uartPrint("Button: SELECT\n");
                 } else if ((data & 0x00000800) != 0) {
                     fillScreen(COLOR32_GREEN);   // PLAY = Green
+                    if (UART_DEBUG) uartPrint("Button: PLAY\n");
                 } else if ((data & 0x00000400) != 0) {
                     fillScreen(COLOR32_BLUE);    // LEFT = Blue
+                    if (UART_DEBUG) uartPrint("Button: LEFT\n");
                 } else if ((data & 0x00000200) != 0) {
                     fillScreen(COLOR32_YELLOW);  // RIGHT = Yellow
+                    if (UART_DEBUG) uartPrint("Button: RIGHT\n");
                 } else {
                     fillScreen(COLOR32_BLACK);   // No button
                 }
+            } else if (UART_DEBUG) {
+                uartPrint("Invalid packet (low byte != 0x1A)\n");
             }
         }
 
