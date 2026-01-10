@@ -197,10 +197,7 @@ pub fn disableInterrupts() void {
         \\mrs r0, cpsr
         \\orr r0, r0, #0xC0
         \\msr cpsr_c, r0
-        :
-        :
-        : "r0"
-    );
+        ::: .{ .r0 = true });
 
     init_state = .interrupts_disabled;
 }
@@ -211,10 +208,7 @@ pub fn enableInterrupts() void {
         \\mrs r0, cpsr
         \\bic r0, r0, #0xC0
         \\msr cpsr_c, r0
-        :
-        :
-        : "r0"
-    );
+        ::: .{ .r0 = true });
 }
 
 /// Simple delay loop (approximately microseconds at 80MHz)
@@ -485,10 +479,7 @@ pub fn sleep() void {
     asm volatile (
         \\mov r0, #0
         \\mcr p15, 0, r0, c7, c0, 4
-        :
-        :
-        : "r0"
-    );
+        ::: .{ .r0 = true });
 }
 
 /// System reset via watchdog

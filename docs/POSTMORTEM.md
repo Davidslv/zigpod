@@ -3,7 +3,69 @@
 ## Date: 2026-01-10
 
 ## Summary
-First hardware test resulted in black screen. iPod did not display anything after ZigPod bootloader was installed.
+Two hardware tests resulted in black screen. iPod did not display anything after ZigPod bootloader was installed.
+
+---
+
+## Hardware Test #2: 2026-01-10 (Second Attempt)
+
+### What We Did
+After the first failure, we researched Rockbox source code and discovered:
+1. iPod Video uses BCM2722 Broadcom graphics chip (not a simple LCD controller)
+2. BCM requires 3-stage bootstrap and firmware upload from ROM
+3. PP5021C needs specific device enable sequence
+
+We implemented:
+- `src/drivers/display/bcm.zig` - Full BCM2722 driver with bootstrap sequence
+- `src/kernel/pp5021c_init.zig` - PP5021C hardware initialization
+- Updated HAL to use BCM driver for LCD operations
+
+### Result: Black Screen Again
+
+### Why It Still Failed
+
+The BCM driver fix was **correct but insufficient**. The fundamental architecture problem remained:
+
+```
+Apple ROM → Apple Bootloader → ZigPod Bootloader → tries to load firmware → NOTHING THERE
+                                      ↓
+                              BCM init code exists in firmware.bin
+                              but firmware.bin is on disk, not in RAM!
+```
+
+**The bootloader itself never runs the BCM initialization code** because:
+1. Bootloader is tiny (664 bytes) - just tries to jump to firmware
+2. Firmware (31KB with BCM driver) sits on HFS+ filesystem
+3. Bootloader has no code to read from filesystem
+4. Bootloader tries to read from RAM address 0x40100000
+5. Nothing is there → crash → black screen
+
+### Key Insight
+
+We fixed the wrong layer. The BCM driver in `firmware.bin` is correct, but:
+- `firmware.bin` never gets loaded
+- `bootloader.bin` doesn't contain BCM init
+- `bootloader.bin` can't read `firmware.bin` from disk
+
+### Solution: Single Binary Approach
+
+Instead of:
+```
+bootloader.bin (664B) + firmware.bin (31KB on disk)
+```
+
+We need:
+```
+zigpod.bin (single binary with everything)
+```
+
+The single binary:
+1. Gets appended to Apple firmware by ipodpatcher
+2. Apple bootloader loads it directly to RAM
+3. Contains PP5021C init + BCM init + full ZigPod OS
+4. No filesystem access needed for boot
+
+---
 
 ---
 
@@ -162,12 +224,13 @@ void system_init(void) {
 
 ## Action Items
 
-- [ ] Study Rockbox bootloader source (`bootloader/ipod.c`)
-- [ ] Document PP5021C initialization sequence
-- [ ] Decide on bootloader architecture
-- [ ] Add LCD init to bootloader (or firmware)
-- [ ] Add filesystem loading capability
-- [ ] Test each component in isolation
+- [x] Study Rockbox bootloader source (`bootloader/ipod.c`)
+- [x] Document PP5021C initialization sequence
+- [x] Decide on bootloader architecture → **Single Binary Approach**
+- [x] Add LCD init (BCM driver created)
+- [ ] ~~Add filesystem loading capability~~ (Not needed with single binary)
+- [x] Implement single binary firmware build
+- [ ] Test single binary on hardware (Test #3)
 
 ---
 

@@ -24,8 +24,10 @@ pub fn build(b: *std.Build) void {
     const enable_sdl2 = b.option(bool, "sdl2", "Enable SDL2 GUI (requires SDL2 installed)") orelse false;
 
     // ============================================================
-    // ZigPod Firmware (ARM target)
+    // ZigPod Firmware - Single Binary (ARM target)
     // ============================================================
+    // This builds a complete ZigPod OS that can be installed directly
+    // via ipodpatcher. Apple bootloader loads it to 0x10000000.
 
     const firmware = b.addExecutable(.{
         .name = "zigpod",
@@ -36,8 +38,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Use the PP5021C linker script
-    firmware.setLinkerScript(b.path("linker/pp5021c.ld"));
+    // Use the single binary linker script (loads at 0x10000000)
+    firmware.setLinkerScript(b.path("linker/single_binary.ld"));
 
     // Generate raw binary for flashing
     const firmware_bin = firmware.addObjCopy(.{
@@ -50,7 +52,7 @@ pub fn build(b: *std.Build) void {
 
     const install_bin = b.addInstallFile(firmware_bin.getOutput(), "bin/zigpod.bin");
 
-    const firmware_step = b.step("firmware", "Build ZigPod firmware for iPod hardware");
+    const firmware_step = b.step("firmware", "Build ZigPod single-binary firmware (install with: ipodpatcher -ab zigpod.bin)");
     firmware_step.dependOn(&install_bin.step);
 
     // ============================================================

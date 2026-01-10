@@ -29,6 +29,20 @@ const clock = @import("clock.zig");
 const sdram = @import("sdram.zig");
 const cache = @import("cache.zig");
 
+// Hardware-specific initialization for single binary approach
+const pp5021c_init = if (is_arm) @import("pp5021c_init.zig") else struct {
+    pub fn disableInterrupts() void {}
+    pub fn initMinimal() void {}
+    pub fn delayMs(_: u32) void {}
+};
+const bcm = if (is_arm) @import("../drivers/display/bcm.zig") else struct {
+    pub fn init() !void {}
+    pub fn clear(_: u16) void {}
+    pub fn isReady() bool {
+        return true;
+    }
+};
+
 // ============================================================
 // Architecture Detection
 // ============================================================
@@ -295,6 +309,16 @@ export fn handleFiq() void {
 
 /// Kernel initialization - called from _start after stack setup
 export fn kernelInit() noreturn {
+    // ================================================================
+    // SINGLE BINARY APPROACH: Initialize hardware directly first
+    // This ensures LCD works before any HAL abstraction kicks in
+    // ================================================================
+
+    // Step 0: Disable interrupts immediately (critical for bare metal)
+    if (is_arm) {
+        pp5021c_init.disableInterrupts();
+    }
+
     // Step 1: Clear BSS section
     if (is_arm) {
         clearBss();
@@ -322,21 +346,41 @@ export fn kernelInit() noreturn {
     }
     boot_state = .cache_initialized;
 
-    // Step 5: Copy IRAM sections (if any)
+    // Step 5: Initialize PP5021C GPIO and devices
+    // This sets up GPIO for BCM control
+    if (is_arm) {
+        pp5021c_init.initMinimal();
+    }
+
+    // Step 6: Initialize BCM2722 LCD controller
+    // This is the critical step that was missing before!
+    if (is_arm) {
+        bcm.init() catch {
+            // BCM init failed - we can't display anything
+            // Just halt here - at least we tried
+            haltLoop();
+        };
+
+        // Clear screen to black to show we're alive
+        bcm.clear(0x0000);
+    }
+
+    // Step 7: Copy IRAM sections (if any)
     if (is_arm) {
         copyIram();
     }
 
-    // Step 6: Initialize mode-specific stacks (IRQ, FIQ)
+    // Step 8: Initialize mode-specific stacks (IRQ, FIQ)
     if (is_arm) {
         initStacks();
     }
     boot_state = .stacks_initialized;
 
-    // Step 7: Initialize HAL
+    // Step 9: Initialize HAL (for higher-level abstractions)
     hal.init();
 
-    // Step 8: Initialize hardware through HAL
+    // Step 10: Initialize remaining hardware through HAL
+    // Note: LCD is already initialized via BCM, so this should skip LCD init
     hal.current_hal.system_init() catch {
         // Hardware init failed - halt
         haltLoop();
