@@ -10,10 +10,41 @@ A custom operating system for the Apple iPod Video (5th Generation), written ent
 
 ## Features
 
-- **Native Audio Playback**: WAV, AIFF, FLAC, and MP3 support
-- **Full Hardware Support**: LCD, click wheel, audio codec, storage
-- **Complete Simulator**: Test without hardware using the PP5021C emulator
-- **Modern Codebase**: Clean Zig implementation with 590+ unit tests
+### Audio Playback
+- **Multiple Formats**: WAV, AIFF, FLAC, and MP3 support
+- **Gapless Playback**: Seamless track transitions with dual-decoder architecture
+- **DSP Effects**: 5-band EQ, bass boost, stereo widening, volume ramping
+- **Playlist Support**: M3U and PLS playlist parsing
+
+### Music Library
+- **Library Browser**: Browse by Artists, Albums, or Songs
+- **Music Database**: Scan and index tracks with metadata extraction
+- **Shuffle & Repeat**: All playback modes (off, one, all)
+- **Playback Queue**: Full queue management with next/previous navigation
+
+### Album Art
+- **Embedded Art Extraction**: ID3v2 (MP3), FLAC PICTURE, M4A covr atoms
+- **Image Decoding**: BMP and JPEG with optimized IDCT
+- **Smart Scaling**: Bilinear interpolation to 80x80 with Floyd-Steinberg dithering
+- **Caching System**: Persistent cache with idle-time pre-loading
+
+### User Interface
+- **iPod-like Navigation**: Click wheel with acceleration, 5-button input
+- **Now Playing Screen**: Real-time position, metadata, album art display
+- **Settings Menus**: Display, Audio, Playback, System with persistence
+- **Volume Overlay**: Global volume control from any screen
+- **Theme Support**: Customizable UI themes
+
+### Hardware Support
+- **Full Hardware Integration**: LCD, click wheel, audio codec, storage
+- **DMA Audio Pipeline**: Interrupt-driven output for smooth playback
+- **Storage Detection**: Auto-detect HDD vs iFlash with optimized buffering
+- **Power Management**: PCF50605 PMU integration
+
+### Developer Experience
+- **Complete Simulator**: PP5021C emulator with SDL2 GUI
+- **Extensive Tests**: 820+ unit tests across all modules
+- **Clean Codebase**: ~67,000 lines of documented Zig code
 
 ## Quick Start
 
@@ -62,9 +93,10 @@ zig build sim -- --help
 
 | Input | Action |
 |-------|--------|
-| Arrow keys | Navigate menu |
+| Arrow keys / Mouse wheel | Navigate / Scroll |
 | Enter/Space | Select / Play-Pause |
-| Escape | Menu |
+| Left/Right | Previous/Next track |
+| Escape | Menu / Back |
 | Q | Quit |
 
 See [Simulator Guide](docs/008-simulator-guide.md) for complete documentation.
@@ -102,7 +134,7 @@ See [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md) for safe 
 | **WAV** | 8/16/24/32-bit, float | Up to 192kHz | PCM and WAVE_FORMAT_EXTENSIBLE |
 | **AIFF** | 8/16/24/32-bit | Up to 192kHz | AIFF and AIFF-C |
 | **FLAC** | 8-24 bit | Up to 192kHz | All compression levels |
-| **MP3** | N/A | 32-48kHz | VBR/CBR 32-320 kbps |
+| **MP3** | N/A | 32-48kHz | VBR/CBR 32-320 kbps, ID3v1/v2 tags |
 
 ## Project Structure
 
@@ -111,16 +143,49 @@ zigpod/
 ├── src/
 │   ├── main.zig           # Entry point
 │   ├── hal/               # Hardware Abstraction Layer
-│   ├── kernel/            # Kernel (memory, interrupts, timer)
-│   ├── drivers/           # Device drivers
-│   ├── audio/             # Audio engine and decoders
-│   ├── ui/                # User interface
-│   ├── library/           # Music library (iTunesDB)
-│   ├── simulator/         # PP5021C simulator
+│   ├── kernel/            # Kernel (memory, interrupts, timer, DMA)
+│   ├── drivers/           # Device drivers (LCD, click wheel, codec, storage)
+│   ├── audio/             # Audio engine, decoders, DSP, album art
+│   ├── ui/                # User interface (screens, menus, themes)
+│   ├── library/           # Music library and database
+│   ├── simulator/         # PP5021C simulator with SDL2 GUI
 │   └── tools/             # JTAG, flasher, recovery tools
 ├── docs/                  # Documentation
 ├── linker/                # Linker scripts
 └── build.zig              # Build configuration
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Application Layer                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │ File Browser│  │Music Browser│  │    Now Playing      │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│                       UI Framework                           │
+│  ┌────────┐  ┌────────┐  ┌─────────┐  ┌────────────────┐   │
+│  │ Menus  │  │ Themes │  │ Overlays│  │ Settings/Persist│   │
+│  └────────┘  └────────┘  └─────────┘  └────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
+│                      Audio Engine                            │
+│  ┌─────────┐  ┌─────────┐  ┌─────┐  ┌─────────┐  ┌──────┐  │
+│  │ Decoders│  │   DSP   │  │Queue│  │Album Art│  │ DMA  │  │
+│  │WAV/MP3/ │  │EQ/Bass/ │  │Mgmt │  │Extract/ │  │Pipe- │  │
+│  │FLAC/AAC │  │Stereo   │  │     │  │Decode   │  │line  │  │
+│  └─────────┘  └─────────┘  └─────┘  └─────────┘  └──────┘  │
+├─────────────────────────────────────────────────────────────┤
+│                   Hardware Abstraction                       │
+│  ┌─────┐  ┌──────────┐  ┌───────┐  ┌───────┐  ┌─────────┐  │
+│  │ LCD │  │Click Wheel│  │ Codec │  │  I2S  │  │ Storage │  │
+│  └─────┘  └──────────┘  └───────┘  └───────┘  └─────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│                     Kernel / Drivers                         │
+│  ┌────────┐  ┌──────────┐  ┌─────┐  ┌─────┐  ┌──────────┐  │
+│  │ Memory │  │Interrupts│  │Timer│  │ DMA │  │  FAT32   │  │
+│  └────────┘  └──────────┘  └─────┘  └─────┘  └──────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Documentation
@@ -166,7 +231,7 @@ zigpod/
 ### Running Tests
 
 ```bash
-# Run all tests (590+ tests)
+# Run all tests (820+ tests)
 zig build test
 
 # Run with verbose output
