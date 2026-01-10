@@ -50,21 +50,35 @@ const COLOR32_WHITE: u32 = 0xFFFFFFFF;
 const COLOR32_RED: u32 = 0xF800F800;
 const COLOR32_GREEN: u32 = 0x07E007E0;
 const COLOR32_BLUE: u32 = 0x001F001F;
+const COLOR32_YELLOW: u32 = 0xFFE0FFE0;
+const COLOR32_CYAN: u32 = 0x07FF07FF;
+const COLOR32_MAGENTA: u32 = 0xF81FF81F;
 
-// Click wheel registers (I2C-like interface at 0x7000C100)
-const WHEEL_DATA: *volatile u32 = @ptrFromInt(0x7000C100);
-const WHEEL_CFG: *volatile u32 = @ptrFromInt(0x7000C104);
-const WHEEL_PERIOD: *volatile u32 = @ptrFromInt(0x7000C108);
-const WHEEL_STATUS: *volatile u32 = @ptrFromInt(0x7000C10C);
+// 5.5G PWM backlight control
+const PWM_BACKLIGHT: *volatile u32 = @ptrFromInt(0x6000B004);
 
-// Device enable registers
-const DEV_EN: *volatile u32 = @ptrFromInt(0x6000D000);
-const DEV_RS: *volatile u32 = @ptrFromInt(0x6000D010);
-const DEV_INIT1: *volatile u32 = @ptrFromInt(0x6000D020);
+// Click wheel registers - CORRECTED from Rockbox research
+// See docs/ROCKBOX_REFERENCE.md for details
+const WHEEL_CTRL: *volatile u32 = @ptrFromInt(0x7000C100);   // Control register
+const WHEEL_STATUS: *volatile u32 = @ptrFromInt(0x7000C104); // Status register
+const WHEEL_TX: *volatile u32 = @ptrFromInt(0x7000C120);     // TX data
+const WHEEL_DATA: *volatile u32 = @ptrFromInt(0x7000C140);   // RX data (button/wheel)
 
-// Device bits
-const DEV_OPTO: u32 = 0x00800000;
-const INIT_BUTTONS: u32 = 0x00000040;
+// Device enable registers - CORRECTED addresses from Rockbox
+const DEV_RS: *volatile u32 = @ptrFromInt(0x60006004);   // Device reset
+const DEV_EN: *volatile u32 = @ptrFromInt(0x6000600C);   // Device enable
+const DEV_INIT1: *volatile u32 = @ptrFromInt(0x70000010); // Device init 1
+
+// Device bits - CORRECTED from Rockbox
+const DEV_OPTO: u32 = 0x00010000;      // Click wheel enable (was 0x00800000 - WRONG!)
+const INIT_BUTTONS: u32 = 0x00040000;  // Button detection enable (was 0x00000040 - WRONG!)
+
+// Wheel controller magic values from Rockbox
+const WHEEL_CTRL_INIT: u32 = 0xC00A1F00;
+const WHEEL_STATUS_INIT: u32 = 0x01000000;
+const WHEEL_STATUS_DATA_READY: u32 = 0x04000000;  // Bit 26
+const WHEEL_PACKET_MASK: u32 = 0x800000FF;
+const WHEEL_PACKET_VALID: u32 = 0x8000001A;
 
 // Button bits from wheel packet
 const BTN_SELECT: u8 = 0x01;
@@ -73,45 +87,73 @@ const BTN_LEFT: u8 = 0x04;
 const BTN_PLAY: u8 = 0x08;
 const BTN_MENU: u8 = 0x10;
 
-// Initialize click wheel
+// Initialize click wheel - CORRECTED from Rockbox research
+// See docs/ROCKBOX_REFERENCE.md Section 1 for details
 fn initWheel() void {
-    // Enable OPTO device (click wheel)
+    // Step 1: Enable OPTO device (click wheel optical sensor)
     DEV_EN.* |= DEV_OPTO;
 
-    // Reset OPTO
+    // Step 2: Reset sequence (minimum 5 microseconds)
     DEV_RS.* |= DEV_OPTO;
     var i: u32 = 0;
-    while (i < 50000) : (i += 1) {
+    while (i < 500) : (i += 1) {  // ~5us at 80MHz
         asm volatile ("nop");
     }
     DEV_RS.* &= ~DEV_OPTO;
 
-    // Initialize buttons
+    // Step 3: Enable button detection
     DEV_INIT1.* |= INIT_BUTTONS;
 
-    // Configure wheel interface (from Rockbox)
-    WHEEL_DATA.* = 0xC00A1F00;
-    WHEEL_CFG.* = 0x01000000;
+    // Step 4: Configure wheel controller with magic values from Rockbox
+    // CRITICAL: These were written to wrong registers before!
+    WHEEL_CTRL.* = WHEEL_CTRL_INIT;      // 0xC00A1F00
+    WHEEL_STATUS.* = WHEEL_STATUS_INIT;  // 0x01000000
 }
 
-// Read wheel data packet
+// Read wheel data packet - CORRECTED with proper validation
 fn readWheel() u32 {
-    // Check if data available
-    const status = WHEEL_STATUS.*;
-    if ((status & 0x01) != 0) {
-        return WHEEL_DATA.*;
+    // Check if data available (bit 26 of status register)
+    if ((WHEEL_STATUS.* & WHEEL_STATUS_DATA_READY) == 0) {
+        return 0;
     }
-    return 0;
+
+    // Read data from correct register (0x7000C140, not 0x7000C100!)
+    const data = WHEEL_DATA.*;
+
+    // Validate packet format: (data & 0x800000FF) must equal 0x8000001A
+    if ((data & WHEEL_PACKET_MASK) != WHEEL_PACKET_VALID) {
+        return 0;  // Invalid packet
+    }
+
+    return data;
 }
 
-// Extract button state from wheel packet
+// Extract button state from wheel packet - CORRECTED bit positions
+// Buttons are in bits 8-12 of the packet:
+//   Bit 8:  SELECT (center)
+//   Bit 9:  RIGHT (forward)
+//   Bit 10: LEFT (back)
+//   Bit 11: PLAY/PAUSE
+//   Bit 12: MENU
 fn getButtons(packet: u32) u8 {
-    return @truncate((packet >> 16) & 0xFF);
+    var buttons: u8 = 0;
+    if (packet & 0x00000100 != 0) buttons |= BTN_SELECT;  // Bit 8
+    if (packet & 0x00000200 != 0) buttons |= BTN_RIGHT;   // Bit 9
+    if (packet & 0x00000400 != 0) buttons |= BTN_LEFT;    // Bit 10
+    if (packet & 0x00000800 != 0) buttons |= BTN_PLAY;    // Bit 11
+    if (packet & 0x00001000 != 0) buttons |= BTN_MENU;    // Bit 12
+    return buttons;
 }
 
 // Extract wheel position from wheel packet (0-95)
+// Wheel position is in bits 16-22, bit 30 indicates touch
 fn getWheelPosition(packet: u32) u8 {
-    return @truncate((packet >> 8) & 0xFF);
+    return @truncate((packet >> 16) & 0x7F);  // 7 bits, not 8
+}
+
+// Check if wheel is being touched
+fn isWheelTouched(packet: u32) bool {
+    return (packet & 0x40000000) != 0;  // Bit 30
 }
 
 fn bcmWriteAddr(addr: u32) void {
@@ -243,14 +285,26 @@ fn drawMenuItems() void {
 }
 
 export fn _zigpod_main() void {
-    // Initialize click wheel
+    // Set backlight to maximum (5.5G enhancement)
+    PWM_BACKLIGHT.* = 0x0000FFFF;
+
+    // Initialize click wheel with CORRECTED sequence
     initWheel();
+
+    // Show startup sequence to confirm boot
+    fillScreen(COLOR32_RED);
+    delay();
+    fillScreen(COLOR32_GREEN);
+    delay();
+    fillScreen(COLOR32_BLUE);
+    delay();
 
     // Draw initial UI
     drawUI();
 
     var last_buttons: u8 = 0;
     var last_wheel_pos: u8 = 0;
+    var wheel_accumulated: i16 = 0;
 
     // Interactive main loop
     while (true) {
@@ -258,50 +312,58 @@ export fn _zigpod_main() void {
         if (packet != 0) {
             const buttons = getButtons(packet);
             const wheel_pos = getWheelPosition(packet);
+            const wheel_touched = isWheelTouched(packet);
 
-            // Handle button presses (on release)
-            if (last_buttons != 0 and buttons == 0) {
-                if ((last_buttons & BTN_MENU) != 0) {
-                    // Menu pressed - move up
-                    if (selected_item > 0) {
-                        selected_item -= 1;
-                        drawMenuItems();
-                    }
-                } else if ((last_buttons & BTN_PLAY) != 0) {
-                    // Play pressed - move down
-                    if (selected_item < MENU_ITEMS - 1) {
-                        selected_item += 1;
-                        drawMenuItems();
-                    }
-                } else if ((last_buttons & BTN_SELECT) != 0) {
-                    // Select pressed - flash screen to show selection
+            // Visual feedback for button presses (immediate, not on release)
+            // This helps debug whether buttons are being read correctly
+            if (buttons != last_buttons) {
+                if ((buttons & BTN_SELECT) != 0) {
+                    // SELECT = White flash
                     fillScreen(COLOR32_WHITE);
-                    delay();
+                } else if ((buttons & BTN_MENU) != 0) {
+                    // MENU = Red
+                    fillScreen(COLOR32_RED);
+                } else if ((buttons & BTN_PLAY) != 0) {
+                    // PLAY = Green
+                    fillScreen(COLOR32_GREEN);
+                } else if ((buttons & BTN_LEFT) != 0) {
+                    // LEFT = Blue
+                    fillScreen(COLOR32_BLUE);
+                } else if ((buttons & BTN_RIGHT) != 0) {
+                    // RIGHT = Yellow
+                    fillScreen(COLOR32_YELLOW);
+                } else if (buttons == 0 and last_buttons != 0) {
+                    // Button released - back to UI
                     drawUI();
                     drawMenuItems();
                 }
             }
 
-            // Handle wheel rotation
-            if (wheel_pos != last_wheel_pos and wheel_pos < 96) {
+            // Handle wheel rotation for menu navigation
+            if (wheel_touched and wheel_pos != last_wheel_pos and wheel_pos < 96) {
                 // Calculate delta with wraparound handling
                 var delta: i16 = @as(i16, wheel_pos) - @as(i16, last_wheel_pos);
                 if (delta > 48) delta -= 96;
                 if (delta < -48) delta += 96;
 
-                // Only act on significant movement
-                if (delta > 4) {
+                // Accumulate small movements
+                wheel_accumulated += delta;
+
+                // Only act on significant accumulated movement
+                if (wheel_accumulated > 6) {
                     // Clockwise - move down
                     if (selected_item < MENU_ITEMS - 1) {
                         selected_item += 1;
                         drawMenuItems();
                     }
-                } else if (delta < -4) {
+                    wheel_accumulated = 0;
+                } else if (wheel_accumulated < -6) {
                     // Counter-clockwise - move up
                     if (selected_item > 0) {
                         selected_item -= 1;
                         drawMenuItems();
                     }
+                    wheel_accumulated = 0;
                 }
 
                 last_wheel_pos = wheel_pos;
