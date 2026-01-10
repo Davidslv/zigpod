@@ -69,6 +69,10 @@ zig build sim
 
 # Run simulator with GUI (requires SDL2)
 zig build sim -Dsdl2=true
+
+# Detect connected iPod (useful for hardware development)
+zig build ipod-detect
+./zig-out/bin/ipod-detect -v   # Verbose mode with partition layout
 ```
 
 ## Using the Simulator
@@ -103,29 +107,86 @@ See [Simulator Guide](docs/008-simulator-guide.md) for complete documentation.
 
 ## Installing on Hardware
 
-> **Warning**: Installing custom firmware carries risk. Always have a backup and test device.
+> **Note**: ZigPod uses a dual-boot approach that preserves your original Apple firmware. You can always boot back to the original OS by holding Menu during startup.
 
 ### Prerequisites
 
-1. iPod Video 5th/5.5th Generation
-2. JTAG adapter (FT2232H recommended)
-3. Working Disk Mode
+1. iPod Video 5th/5.5th Generation (A1136)
+2. USB cable
+3. Working Disk Mode (hold Menu+Select, then Select+Play)
 
 ### Installation Steps
 
-1. **Test in simulator first** - Verify your build works
-2. **Create backup** - Use Disk Mode to backup your device
-3. **Follow safety protocol** - See [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md)
+1. **Test in simulator first** - Verify your build works in the simulator
+2. **Create full backup** - Essential for recovery
 
 ```bash
-# Build for ARM target
-zig build -Dtarget=arm-freestanding-eabi
+# Put iPod in Disk Mode:
+# Hold MENU + SELECT until Apple logo, then immediately hold SELECT + PLAY
 
-# Flash using JTAG tools (see hardware testing protocol)
-zigpod-flasher install --image zig-out/bin/zigpod.bin
+# Create full disk backup (macOS - find your disk number first)
+diskutil list | grep -i ipod
+sudo dd if=/dev/diskX of=ipod_backup.img bs=1m status=progress
 ```
 
-See [Hardware Testing Protocol](docs/006-hardware-testing-protocol.md) for safe deployment procedures.
+3. **Build ZigPod**
+
+```bash
+# Build firmware for ARM
+zig build firmware
+
+# Build the bootloader
+zig build bootloader
+```
+
+4. **Install bootloader** (preserves original firmware)
+
+```bash
+# Install dual-boot bootloader using ipodpatcher
+ipodpatcher -a zig-out/bin/zigpod-bootloader.bin
+```
+
+5. **Copy ZigPod firmware to iPod**
+
+```bash
+# Mount iPod in Disk Mode, then:
+mkdir -p /Volumes/IPOD/.zigpod
+cp zig-out/bin/firmware.bin /Volumes/IPOD/.zigpod/
+
+# Safely eject
+diskutil eject /dev/diskX
+```
+
+6. **Boot ZigPod** - Reset iPod (Menu + Select). ZigPod boots by default.
+
+### Boot Mode Selection
+
+| Button | Hold Duration | Action |
+|--------|---------------|--------|
+| None | - | Boot ZigPod (default) |
+| Menu | 2 seconds | Boot original Apple firmware |
+| Play | 2 seconds | Enter DFU update mode |
+| Menu + Select | 5 seconds | Recovery mode |
+
+### Uninstallation
+
+```bash
+# Restore original bootloader
+ipodpatcher -u
+
+# Optionally remove ZigPod files
+rm -rf /Volumes/IPOD/.zigpod
+```
+
+### Recovery
+
+If ZigPod fails to boot 3 times consecutively, the bootloader automatically falls back to Apple firmware. You can also:
+
+1. **Enter Disk Mode manually**: Hold Menu+Select → when Apple logo appears → hold Select+Play
+2. **Restore from backup**: `sudo dd if=ipod_backup.img of=/dev/diskX bs=1m status=progress`
+3. **Full restore via iTunes**: iTunes can restore the iPod to factory state from Disk Mode
+
+See [Boot Process](docs/hardware/BOOT_PROCESS.md) for detailed boot sequence documentation.
 
 ## Supported Audio Formats
 
@@ -149,7 +210,7 @@ zigpod/
 │   ├── ui/                # User interface (screens, menus, themes)
 │   ├── library/           # Music library and database
 │   ├── simulator/         # PP5021C simulator with SDL2 GUI
-│   └── tools/             # JTAG, flasher, recovery tools
+│   └── tools/             # iPod detection, flasher, recovery tools
 ├── docs/                  # Documentation
 ├── linker/                # Linker scripts
 └── build.zig              # Build configuration
