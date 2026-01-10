@@ -65,7 +65,7 @@ pub const Sdl2Backend = struct {
     lcd_texture: ?*c.SDL_Texture = null,
     config: LcdConfig = .{},
     open: bool = false,
-    button_states: [6]bool = [_]bool{false} ** 6,
+    button_states: [7]bool = [_]bool{false} ** 7,
     wheel_pos: u8 = 0,
     backlight_on: bool = true,
     // Pixel buffer for LCD
@@ -361,6 +361,7 @@ pub const Sdl2Backend = struct {
             c.SDLK_LEFT, c.SDLK_b => .prev,
             c.SDLK_RETURN, c.SDLK_s => .select,
             c.SDLK_h => .hold,
+            c.SDLK_r => .repeat, // R key toggles repeat mode
             // Note: UP/DOWN arrows are handled separately for menu navigation
             else => null,
         };

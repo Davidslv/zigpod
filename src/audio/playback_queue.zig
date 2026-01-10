@@ -2,10 +2,48 @@
 //!
 //! Manages the list of tracks to play, supporting next/previous navigation.
 //! The queue is populated based on playback context (album, artist, all songs, etc.)
-//! Supports shuffle mode with Fisher-Yates algorithm.
+//! Supports shuffle mode with Fisher-Yates algorithm and repeat modes.
 
 const std = @import("std");
 const music_db = @import("../library/music_db.zig");
+
+// ============================================================
+// Repeat Mode
+// ============================================================
+
+/// Repeat mode for playback
+pub const RepeatMode = enum {
+    off, // Stop at end of queue
+    one, // Repeat current track
+    all, // Repeat entire queue (loop)
+
+    /// Cycle to next repeat mode
+    pub fn next(self: RepeatMode) RepeatMode {
+        return switch (self) {
+            .off => .one,
+            .one => .all,
+            .all => .off,
+        };
+    }
+
+    /// Get display string
+    pub fn toString(self: RepeatMode) []const u8 {
+        return switch (self) {
+            .off => "Off",
+            .one => "One",
+            .all => "All",
+        };
+    }
+
+    /// Get icon for status bar
+    pub fn toIcon(self: RepeatMode) []const u8 {
+        return switch (self) {
+            .off => "  ",
+            .one => "R1",
+            .all => "RA",
+        };
+    }
+};
 
 // ============================================================
 // Constants
@@ -81,6 +119,9 @@ pub const PlaybackQueue = struct {
     /// Original position of current track (to restore after unshuffle)
     original_current_track: u16 = 0,
 
+    /// Repeat mode
+    repeat_mode: RepeatMode = .off,
+
     /// Initialize empty queue
     pub fn init() PlaybackQueue {
         return PlaybackQueue{};
@@ -94,6 +135,22 @@ pub const PlaybackQueue = struct {
         self.source_filter = 0;
         self.single_file_path_len = 0;
         self.shuffle_enabled = false;
+        self.repeat_mode = .off;
+    }
+
+    /// Get current repeat mode
+    pub fn getRepeatMode(self: *const PlaybackQueue) RepeatMode {
+        return self.repeat_mode;
+    }
+
+    /// Set repeat mode
+    pub fn setRepeatMode(self: *PlaybackQueue, mode: RepeatMode) void {
+        self.repeat_mode = mode;
+    }
+
+    /// Cycle to next repeat mode
+    pub fn toggleRepeat(self: *PlaybackQueue) void {
+        self.repeat_mode = self.repeat_mode.next();
     }
 
     /// Check if shuffle is enabled
@@ -177,7 +234,7 @@ pub const PlaybackQueue = struct {
         return self.current_index + 1;
     }
 
-    /// Check if there's a next track
+    /// Check if there's a next track (for manual navigation)
     pub fn hasNext(self: *const PlaybackQueue) bool {
         return self.count > 0 and self.current_index + 1 < self.count;
     }
@@ -185,6 +242,16 @@ pub const PlaybackQueue = struct {
     /// Check if there's a previous track
     pub fn hasPrevious(self: *const PlaybackQueue) bool {
         return self.count > 0 and self.current_index > 0;
+    }
+
+    /// Check if auto-advance should continue (respects repeat mode)
+    pub fn canAutoAdvance(self: *const PlaybackQueue) bool {
+        if (self.count == 0) return false;
+        return switch (self.repeat_mode) {
+            .off => self.current_index + 1 < self.count,
+            .one => true, // Always can repeat current track
+            .all => true, // Always can wrap around
+        };
     }
 
     /// Get current track path
@@ -206,20 +273,83 @@ pub const PlaybackQueue = struct {
         return null;
     }
 
-    /// Move to next track
+    /// Move to next track (manual skip - ignores repeat one)
     /// Returns the track path if successful, null if at end
     pub fn next(self: *PlaybackQueue) ?[]const u8 {
-        if (!self.hasNext()) return null;
-        self.current_index += 1;
-        return self.getCurrentTrackPath();
+        if (self.count == 0) return null;
+
+        if (self.current_index + 1 < self.count) {
+            // More tracks ahead
+            self.current_index += 1;
+            return self.getCurrentTrackPath();
+        } else if (self.repeat_mode == .all) {
+            // Wrap to beginning
+            self.current_index = 0;
+            return self.getCurrentTrackPath();
+        }
+
+        return null;
     }
 
     /// Move to previous track
     /// Returns the track path if successful, null if at beginning
     pub fn previous(self: *PlaybackQueue) ?[]const u8 {
-        if (!self.hasPrevious()) return null;
-        self.current_index -= 1;
-        return self.getCurrentTrackPath();
+        if (self.count == 0) return null;
+
+        if (self.current_index > 0) {
+            self.current_index -= 1;
+            return self.getCurrentTrackPath();
+        } else if (self.repeat_mode == .all) {
+            // Wrap to end
+            self.current_index = self.count - 1;
+            return self.getCurrentTrackPath();
+        }
+
+        return null;
+    }
+
+    /// Auto-advance to next track when current finishes (respects repeat mode)
+    /// Returns: .same_track for repeat one, .next_track with path, or .end_of_queue
+    pub const AutoAdvanceResult = union(enum) {
+        same_track: []const u8, // Repeat one - play same track again
+        next_track: []const u8, // Advanced to next track
+        end_of_queue, // No more tracks (repeat off, at end)
+    };
+
+    pub fn autoAdvance(self: *PlaybackQueue) AutoAdvanceResult {
+        if (self.count == 0) return .end_of_queue;
+
+        switch (self.repeat_mode) {
+            .one => {
+                // Repeat current track
+                if (self.getCurrentTrackPath()) |path| {
+                    return .{ .same_track = path };
+                }
+                return .end_of_queue;
+            },
+            .all => {
+                // Advance, wrap if at end
+                if (self.current_index + 1 < self.count) {
+                    self.current_index += 1;
+                } else {
+                    self.current_index = 0; // Wrap to beginning
+                }
+                if (self.getCurrentTrackPath()) |path| {
+                    return .{ .next_track = path };
+                }
+                return .end_of_queue;
+            },
+            .off => {
+                // Stop at end
+                if (self.current_index + 1 < self.count) {
+                    self.current_index += 1;
+                    if (self.getCurrentTrackPath()) |path| {
+                        return .{ .next_track = path };
+                    }
+                }
+                return .end_of_queue;
+            },
+        }
     }
 
     /// Set a single file (from file browser)
@@ -500,4 +630,154 @@ test "playback queue toggle shuffle" {
 
     queue.toggleShuffle();
     try std.testing.expect(!queue.isShuffled());
+}
+
+test "repeat mode cycling" {
+    var mode = RepeatMode.off;
+
+    mode = mode.next();
+    try std.testing.expectEqual(RepeatMode.one, mode);
+
+    mode = mode.next();
+    try std.testing.expectEqual(RepeatMode.all, mode);
+
+    mode = mode.next();
+    try std.testing.expectEqual(RepeatMode.off, mode);
+}
+
+test "repeat mode toggle" {
+    var queue = PlaybackQueue.init();
+
+    try std.testing.expectEqual(RepeatMode.off, queue.getRepeatMode());
+
+    queue.toggleRepeat();
+    try std.testing.expectEqual(RepeatMode.one, queue.getRepeatMode());
+
+    queue.toggleRepeat();
+    try std.testing.expectEqual(RepeatMode.all, queue.getRepeatMode());
+
+    queue.toggleRepeat();
+    try std.testing.expectEqual(RepeatMode.off, queue.getRepeatMode());
+}
+
+test "repeat mode cleared on queue clear" {
+    var queue = PlaybackQueue.init();
+    queue.setRepeatMode(.all);
+
+    try std.testing.expectEqual(RepeatMode.all, queue.getRepeatMode());
+
+    queue.clear();
+    try std.testing.expectEqual(RepeatMode.off, queue.getRepeatMode());
+}
+
+test "next with repeat all wraps around" {
+    var queue = PlaybackQueue.init();
+
+    // Manually populate for testing
+    queue.track_indices[0] = 0;
+    queue.track_indices[1] = 1;
+    queue.track_indices[2] = 2;
+    queue.count = 3;
+    queue.source = .album;
+    queue.setRepeatMode(.all);
+
+    // Move to last position
+    queue.current_index = 2;
+
+    // Next should wrap to beginning
+    _ = queue.next();
+    try std.testing.expectEqual(@as(usize, 0), queue.current_index);
+}
+
+test "previous with repeat all wraps around" {
+    var queue = PlaybackQueue.init();
+
+    // Manually populate for testing
+    queue.track_indices[0] = 0;
+    queue.track_indices[1] = 1;
+    queue.track_indices[2] = 2;
+    queue.count = 3;
+    queue.source = .album;
+    queue.setRepeatMode(.all);
+
+    // At first position
+    queue.current_index = 0;
+
+    // Previous should wrap to end
+    _ = queue.previous();
+    try std.testing.expectEqual(@as(usize, 2), queue.current_index);
+}
+
+test "auto advance repeat one" {
+    var queue = PlaybackQueue.init();
+
+    // Use single file for simpler testing
+    queue.setSingleFile("/test.mp3");
+    queue.setRepeatMode(.one);
+
+    const result = queue.autoAdvance();
+    // Repeat one returns same_track with current path
+    switch (result) {
+        .same_track => |path| {
+            try std.testing.expectEqualStrings("/test.mp3", path);
+        },
+        else => try std.testing.expect(false), // Should be same_track
+    }
+}
+
+test "auto advance repeat all at end" {
+    var queue = PlaybackQueue.init();
+
+    // Use single file approach - simpler for testing
+    queue.setSingleFile("/music/track.mp3");
+    queue.setRepeatMode(.all);
+
+    const result = queue.autoAdvance();
+    // With single file and repeat all, wraps to same track
+    switch (result) {
+        .next_track => |path| {
+            try std.testing.expectEqualStrings("/music/track.mp3", path);
+        },
+        else => try std.testing.expect(false), // Should be next_track
+    }
+}
+
+test "auto advance repeat off at end" {
+    var queue = PlaybackQueue.init();
+
+    queue.track_indices[0] = 0;
+    queue.track_indices[1] = 1;
+    queue.track_indices[2] = 2;
+    queue.count = 3;
+    queue.source = .album;
+    queue.current_index = 2; // At last position
+    queue.setRepeatMode(.off);
+
+    const result = queue.autoAdvance();
+    switch (result) {
+        .end_of_queue => {}, // Expected
+        else => try std.testing.expect(false), // Should be end_of_queue
+    }
+}
+
+test "can auto advance" {
+    var queue = PlaybackQueue.init();
+
+    queue.track_indices[0] = 0;
+    queue.track_indices[1] = 1;
+    queue.count = 2;
+    queue.source = .album;
+    queue.current_index = 1; // At last position
+
+    // Repeat off - can't advance at end
+    queue.setRepeatMode(.off);
+    try std.testing.expect(!queue.canAutoAdvance());
+
+    // Repeat one - can always advance (replay same)
+    queue.setRepeatMode(.one);
+    try std.testing.expect(queue.canAutoAdvance());
+
+    // Repeat all - can always advance (wrap)
+    queue.setRepeatMode(.all);
+    try std.testing.expect(queue.canAutoAdvance());
 }

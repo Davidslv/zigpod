@@ -23,6 +23,7 @@ pub const Button = enum(u8) {
     prev = 3,
     select = 4,
     hold = 5,
+    repeat = 6, // Toggle repeat mode (R key in simulator)
 };
 
 /// Input event
@@ -115,7 +116,7 @@ pub const GuiBackend = struct {
 /// Null backend (headless mode)
 pub const NullBackend = struct {
     open: bool = true,
-    button_states: [6]bool = [_]bool{false} ** 6,
+    button_states: [7]bool = [_]bool{false} ** 7,
     wheel_pos: u8 = 0,
     event_queue: std.ArrayList(Event) = undefined,
     allocator: std.mem.Allocator,

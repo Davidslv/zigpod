@@ -94,11 +94,18 @@ pub const NowPlayingState = struct {
             self.metadata.album = track_info.getAlbum();
         }
 
-        // Update queue position and shuffle state
+        // Update queue position, shuffle, and repeat state
         const queue = playback_queue.getQueue();
         self.queue_position = queue.getCurrentPosition();
         self.queue_total = queue.getCount();
         self.is_shuffled = queue.isShuffled();
+
+        // Sync repeat mode from queue
+        self.repeat_mode = switch (queue.getRepeatMode()) {
+            .off => .off,
+            .one => .one,
+            .all => .all,
+        };
 
         const vol = audio.getVolume();
         // Convert dB (-89 to +6) to percentage (0-100)

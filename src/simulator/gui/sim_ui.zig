@@ -6,6 +6,33 @@
 const std = @import("std");
 
 // ============================================================
+// Repeat Mode (moved to top level for PlayerInfo access)
+// ============================================================
+
+/// Repeat mode for playback
+pub const RepeatMode = enum {
+    off, // Stop at end
+    one, // Repeat current track
+    all, // Repeat entire queue
+
+    pub fn next(self: RepeatMode) RepeatMode {
+        return switch (self) {
+            .off => .one,
+            .one => .all,
+            .all => .off,
+        };
+    }
+
+    pub fn toIcon(self: RepeatMode) []const u8 {
+        return switch (self) {
+            .off => "  ",
+            .one => "R1",
+            .all => "RA",
+        };
+    }
+};
+
+// ============================================================
 // Constants
 // ============================================================
 
@@ -60,6 +87,9 @@ pub const SimulatorUI = struct {
     shuffle_enabled: bool = false,
     shuffle_order: [32]usize = [_]usize{0} ** 32, // Shuffled indices
     original_order: [32]usize = [_]usize{0} ** 32, // Original indices for unshuffle
+
+    // Repeat mode
+    repeat_mode: RepeatMode = .off,
 
     const Self = @This();
 
@@ -188,6 +218,47 @@ pub const SimulatorUI = struct {
         self.shuffle_enabled = false;
     }
 
+    /// Toggle repeat mode (off -> one -> all -> off)
+    pub fn toggleRepeat(self: *Self) void {
+        self.repeat_mode = self.repeat_mode.next();
+    }
+
+    /// Auto-advance to next track when current finishes (respects repeat mode)
+    /// Returns the path to play, or null if playback should stop
+    pub const AutoAdvanceResult = enum {
+        same_track, // Repeat one - play same track again
+        next_track, // Advanced to next track
+        end_of_queue, // No more tracks
+    };
+
+    pub fn autoAdvance(self: *Self) struct { result: AutoAdvanceResult, path: ?[]const u8 } {
+        if (self.queue_count == 0) return .{ .result = .end_of_queue, .path = null };
+
+        switch (self.repeat_mode) {
+            .one => {
+                // Repeat current track - don't advance, just return current path
+                return .{ .result = .same_track, .path = self.getQueueTrackPath() };
+            },
+            .all => {
+                // Advance, wrap to beginning if at end
+                if (self.queue_position + 1 < self.queue_count) {
+                    self.queue_position += 1;
+                } else {
+                    self.queue_position = 0; // Wrap to beginning
+                }
+                return .{ .result = .next_track, .path = self.getQueueTrackPath() };
+            },
+            .off => {
+                // Only advance if not at end
+                if (self.queue_position + 1 < self.queue_count) {
+                    self.queue_position += 1;
+                    return .{ .result = .next_track, .path = self.getQueueTrackPath() };
+                }
+                return .{ .result = .end_of_queue, .path = null };
+            },
+        }
+    }
+
     /// Get the actual queue index for current position (handles shuffle)
     fn getActualIndex(self: *const Self, pos: usize) usize {
         if (self.shuffle_enabled and pos < self.queue_count) {
@@ -307,6 +378,7 @@ pub const SimulatorUI = struct {
         switch (button) {
             .play_pause => return .toggle_play,
             .select => return .toggle_shuffle,
+            .repeat => return .toggle_repeat,
             .menu => {
                 self.screen = .file_browser;
             },
@@ -421,6 +493,7 @@ pub const Button = enum {
     left,
     right,
     select,
+    repeat, // Toggle repeat mode (R key)
 };
 
 pub const Action = union(enum) {
@@ -429,6 +502,7 @@ pub const Action = union(enum) {
     seek_forward: void,
     volume_change: i8,
     toggle_shuffle: void,
+    toggle_repeat: void,
 };
 
 // ============================================================
@@ -532,6 +606,7 @@ pub const PlayerInfo = struct {
     queue_position: usize = 0,
     queue_total: usize = 0,
     shuffle_enabled: bool = false,
+    repeat_mode: RepeatMode = .off,
 };
 
 fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
@@ -623,9 +698,13 @@ fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
         drawText(framebuffer, 10, ctrl_y, "[S]", COLOR_TEXT_DIM);
     }
 
+    // Repeat indicator (next to shuffle)
+    const repeat_color = if (player.repeat_mode != .off) COLOR_ACCENT else COLOR_TEXT_DIM;
+    drawText(framebuffer, 40, ctrl_y, player.repeat_mode.toIcon(), repeat_color);
+
     // Footer with controls hint
     fillRect(framebuffer, 0, HEIGHT - FOOTER_HEIGHT, WIDTH, FOOTER_HEIGHT, COLOR_FOOTER_BG);
-    const hint = if (player.shuffle_enabled) "<< Prev  Space  Next >>  [Shuffle ON]" else "<< Prev  Space  Next >>  Enter:Shuffle";
+    const hint = "S:Shuffle  R:Repeat  Space:Play/Pause";
     drawText(framebuffer, 10, HEIGHT - FOOTER_HEIGHT + 6, hint, COLOR_TEXT_DIM);
 }
 

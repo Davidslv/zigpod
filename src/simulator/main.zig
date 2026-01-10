@@ -268,18 +268,35 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
             }
         }
 
-        // Check for track end and auto-advance
+        // Check for track end and auto-advance (respects repeat mode)
         if (player.hasTrackEnded() and ui.screen == .now_playing) {
             player.clearEndedState();
-            // Try to play next track
-            if (ui.nextTrack()) |next_path| {
-                out.print("Auto-advancing to: {s}\n", .{next_path});
-                player.loadWav(next_path) catch |err| {
-                    out.print("Failed to load next track: {}\n", .{err});
-                };
-                player.play();
-            } else {
-                out.print("Playback finished (end of queue)\n", .{});
+            // Auto-advance respecting repeat mode
+            const advance_result = ui.autoAdvance();
+            switch (advance_result.result) {
+                .same_track => {
+                    // Repeat one - replay same track
+                    if (advance_result.path) |path| {
+                        out.print("Repeating track: {s}\n", .{path});
+                        player.loadWav(path) catch |err| {
+                            out.print("Failed to reload track: {}\n", .{err});
+                        };
+                        player.play();
+                    }
+                },
+                .next_track => {
+                    // Play next track (or wrapped to beginning for repeat all)
+                    if (advance_result.path) |path| {
+                        out.print("Auto-advancing to: {s}\n", .{path});
+                        player.loadWav(path) catch |err| {
+                            out.print("Failed to load next track: {}\n", .{err});
+                        };
+                        player.play();
+                    }
+                },
+                .end_of_queue => {
+                    out.print("Playback finished (end of queue)\n", .{});
+                },
             }
         }
 
@@ -294,6 +311,7 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
             .queue_position = ui.queue_position,
             .queue_total = ui.queue_count,
             .shuffle_enabled = ui.shuffle_enabled,
+            .repeat_mode = ui.repeat_mode,
         };
 
         // Render UI to framebuffer
@@ -321,6 +339,7 @@ fn mapGuiButton(button: gui.Button) sim_ui.Button {
         .prev => .left,
         .next => .right,
         .select => .select,
+        .repeat => .repeat,
         else => .none,
     };
 }
@@ -365,6 +384,10 @@ fn handleUiAction(ui: *sim_ui.SimulatorUI, player: *audio_player.AudioPlayer, ac
             } else {
                 out.print("Shuffle: OFF\n", .{});
             }
+        },
+        .toggle_repeat => {
+            ui.toggleRepeat();
+            out.print("Repeat: {s}\n", .{ui.repeat_mode.toIcon()});
         },
     }
 }
