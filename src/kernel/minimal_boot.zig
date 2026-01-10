@@ -90,20 +90,37 @@ const WHEEL_STATUS_CLEAR: u32 = 0x0C000000;       // Clear bits
 const WHEEL_CTRL_START: u32 = 0x80000000;         // Start transfer
 const WHEEL_CTRL_ACK: u32 = 0x60000000;           // Acknowledge bits
 
-// Button bits from wheel packet
-const BTN_SELECT: u8 = 0x01;
-const BTN_RIGHT: u8 = 0x02;
-const BTN_LEFT: u8 = 0x04;
-const BTN_PLAY: u8 = 0x08;
-const BTN_MENU: u8 = 0x10;
+// Button bits from wheel packet - 5.5G CONFIRMED mapping
+// These are the bit positions in the data word (bits 8-13)
+const BTN_SELECT: u32 = 0x00000100;  // Bit 8
+const BTN_RIGHT: u32 = 0x00000200;   // Bit 9
+const BTN_LEFT: u32 = 0x00000400;    // Bit 10
+const BTN_PLAY: u32 = 0x00000800;    // Bit 11
+const BTN_MENU: u32 = 0x00002000;    // Bit 13 (NOT bit 12!)
 
-// Initialize click wheel - minimal init, Apple bootloader does most of it
+// Initialize click wheel - full sequence from Rockbox opto_i2c_init()
 fn initWheel() void {
-    // Enable OPTO device if not already enabled
+    // Step 1: Enable OPTO device
     DEV_EN.* |= DEV_OPTO;
 
-    // Enable button detection
+    // Step 2: Reset the OPTO device
+    DEV_RS.* |= DEV_OPTO;
+
+    // Step 3: Wait for reset (at least 5us)
+    var i: u32 = 0;
+    while (i < 5000) : (i += 1) {
+        asm volatile ("nop");
+    }
+
+    // Step 4: Release reset
+    DEV_RS.* &= ~DEV_OPTO;
+
+    // Step 5: Enable button detection
     DEV_INIT1.* |= INIT_BUTTONS;
+
+    // Step 6: Configure wheel controller (from Rockbox opto_i2c_init)
+    WHEEL_CTRL.* = 0xC00A1F00;
+    WHEEL_STATUS.* = 0x01000000;
 }
 
 // Send configuration command to click wheel (from Rockbox bootloader)
@@ -352,10 +369,7 @@ export fn _zigpod_main() void {
     // Set backlight to maximum (5.5G enhancement)
     PWM_BACKLIGHT.* = 0x0000FFFF;
 
-    // Initialize click wheel
-    initWheel();
-
-    // Show startup sequence to confirm boot
+    // Show startup sequence
     fillScreen(COLOR32_RED);
     delay();
     fillScreen(COLOR32_GREEN);
@@ -363,45 +377,64 @@ export fn _zigpod_main() void {
     fillScreen(COLOR32_BLUE);
     delay();
 
-    // Start with black screen for button test
+    // Initialize wheel (we know this works)
+    DEV_EN.* |= DEV_OPTO;
+    DEV_RS.* |= DEV_OPTO;
+    var i: u32 = 0;
+    while (i < 5000) : (i += 1) asm volatile ("nop");
+    DEV_RS.* &= ~DEV_OPTO;
+    DEV_INIT1.* |= INIT_BUTTONS;
+    WHEEL_CTRL.* = 0xC00A1F00;
+    WHEEL_STATUS.* = 0x01000000;
+
+    // Show CYAN = init complete
+    fillScreen(COLOR32_CYAN);
+    delay();
+
+    // Now just poll and show what we see
+    // BLACK = no data, colors = button press
     fillScreen(COLOR32_BLACK);
 
-    var last_buttons: u8 = 0;
-
-    // Simple button test loop
-    // Each button shows a different color
     while (true) {
-        // Poll click wheel (bootloader-style)
-        const buttons = readWheel();
+        const status = WHEEL_STATUS.*;
 
-        // Visual feedback for button presses
-        if (buttons != last_buttons) {
-            if (buttons == 0) {
-                // No button - black
-                fillScreen(COLOR32_BLACK);
-            } else if ((buttons & BTN_SELECT) != 0) {
-                // SELECT (center) = White
-                fillScreen(COLOR32_WHITE);
-            } else if ((buttons & BTN_MENU) != 0) {
-                // MENU = Red
-                fillScreen(COLOR32_RED);
-            } else if ((buttons & BTN_PLAY) != 0) {
-                // PLAY = Green
-                fillScreen(COLOR32_GREEN);
-            } else if ((buttons & BTN_LEFT) != 0) {
-                // LEFT = Blue
-                fillScreen(COLOR32_BLUE);
-            } else if ((buttons & BTN_RIGHT) != 0) {
-                // RIGHT = Yellow
-                fillScreen(COLOR32_YELLOW);
+        // Check data ready bit
+        if ((status & 0x04000000) != 0) {
+            const data = WHEEL_DATA.*;
+
+            // Clear/acknowledge the data (from Rockbox)
+            WHEEL_STATUS.* = WHEEL_STATUS.* | 0x0C000000;
+            WHEEL_CTRL.* = WHEEL_CTRL.* | 0x60000000;
+
+            // Validate packet format: (data & 0x800000FF) == 0x8000001A
+            if ((data & 0x800000FF) == 0x8000001A) {
+                // 5.5G Button mapping (CONFIRMED):
+                // Bit 8  (0x0100) = SELECT
+                // Bit 9  (0x0200) = RIGHT
+                // Bit 10 (0x0400) = LEFT
+                // Bit 11 (0x0800) = PLAY
+                // Bit 13 (0x2000) = MENU (NOT bit 12!)
+
+                if ((data & 0x00002000) != 0) {
+                    fillScreen(COLOR32_RED);     // MENU = Red
+                } else if ((data & 0x00000100) != 0) {
+                    fillScreen(COLOR32_WHITE);   // SELECT = White
+                } else if ((data & 0x00000800) != 0) {
+                    fillScreen(COLOR32_GREEN);   // PLAY = Green
+                } else if ((data & 0x00000400) != 0) {
+                    fillScreen(COLOR32_BLUE);    // LEFT = Blue
+                } else if ((data & 0x00000200) != 0) {
+                    fillScreen(COLOR32_YELLOW);  // RIGHT = Yellow
+                } else {
+                    // No button pressed
+                    fillScreen(COLOR32_BLACK);
+                }
             }
-            last_buttons = buttons;
+            // Ignore invalid packets silently
         }
 
-        // Small delay between polls
-        var i: u32 = 0;
-        while (i < 50000) : (i += 1) {
-            asm volatile ("nop");
-        }
+        // Small delay
+        var j: u32 = 0;
+        while (j < 5000) : (j += 1) asm volatile ("nop");
     }
 }

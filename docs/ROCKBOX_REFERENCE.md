@@ -100,6 +100,8 @@ pub fn clickwheel_read() WheelData {
 
 ### Button Bit Definitions
 
+**Rockbox documentation (iPod 4G/5G):**
+
 | Bit | Value | Button |
 |-----|-------|--------|
 | 0 | 0x01 | SELECT (center) |
@@ -107,6 +109,18 @@ pub fn clickwheel_read() WheelData {
 | 2 | 0x04 | LEFT (back) |
 | 3 | 0x08 | PLAY/PAUSE |
 | 4 | 0x10 | MENU |
+
+**iPod 5.5G CONFIRMED mapping (bits in data word):**
+
+| Bit | Mask | Button |
+|-----|------|--------|
+| 8 | 0x0100 | SELECT (center) |
+| 9 | 0x0200 | RIGHT (forward) |
+| 10 | 0x0400 | LEFT (back) |
+| 11 | 0x0800 | PLAY/PAUSE |
+| 13 | 0x2000 | MENU (**NOT bit 12!**) |
+
+**IMPORTANT:** On 5.5G, MENU is on bit 13, not bit 12 as in some Rockbox docs!
 
 ### Wheel Position
 
