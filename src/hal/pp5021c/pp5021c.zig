@@ -9,6 +9,7 @@
 const std = @import("std");
 const reg = @import("registers.zig");
 const hal_types = @import("../hal.zig");
+const bcm = @import("../../drivers/display/bcm.zig");
 
 /// Interrupt handling module - public for direct access to FIQ/audio setup
 pub const interrupts = @import("interrupts.zig");
@@ -804,53 +805,15 @@ fn bcmCommand(cmd: u32) HalError!u32 {
 }
 
 fn hwLcdInit() HalError!void {
-    // Enable LCD device clock
-    reg.modifyReg(reg.DEV_EN, 0, reg.DEV_LCD);
-    hwDelayMs(10);
-
-    // Setup LCD GPIO pins
-    hwGpioSetDirection(reg.LCD_GPIO_PORT, reg.LCD_ENABLE_PIN, .output);
-    hwGpioSetDirection(reg.LCD_GPIO_PORT, reg.LCD_RESET_PIN, .output);
-
-    // Reset sequence
-    hwGpioWrite(reg.LCD_GPIO_PORT, reg.LCD_RESET_PIN, false);
-    hwDelayMs(10);
-    hwGpioWrite(reg.LCD_GPIO_PORT, reg.LCD_RESET_PIN, true);
-    hwDelayMs(50);
-
-    // Enable LCD
-    hwGpioWrite(reg.LCD_GPIO_PORT, reg.LCD_ENABLE_PIN, true);
-    hwDelayMs(reg.BCM_INIT_DELAY_US / 1000);
-
-    // Verify BCM is responding by getting dimensions
-    const width = bcmCommand(reg.BCMCMD_GET_WIDTH) catch {
-        // BCM not responding - this is expected if firmware isn't loaded
-        // On real hardware, the ROM bootloader loads BCM firmware
-        lcd_initialized = true;
-        return;
+    // Use the BCM driver for proper initialization
+    // This handles the full 3-stage bootstrap and firmware upload
+    bcm.init() catch |err| {
+        // BCM init failed - convert to HalError
+        switch (err) {
+            error.VmcsFirmwareNotFound => return HalError.DeviceNotReady,
+            error.BcmFirmwareTimeout => return HalError.Timeout,
+        }
     };
-
-    const height = bcmCommand(reg.BCMCMD_GET_HEIGHT) catch {
-        lcd_initialized = true;
-        return;
-    };
-
-    // Verify dimensions match expected
-    if (width != reg.LCD_WIDTH or height != reg.LCD_HEIGHT) {
-        // Dimensions mismatch - BCM may be misconfigured
-        // Continue anyway, firmware may configure it
-    }
-
-    // Get framebuffer memory address from BCM
-    bcm_framebuffer_addr = bcmCommand(reg.BCMCMD_GETMEMADDR) catch 0;
-
-    // Wake the display
-    bcmSendCommand(reg.BCMCMD_LCD_WAKE) catch {};
-    hwDelayMs(10);
-
-    // Power on
-    bcmSendCommand(reg.BCMCMD_LCD_POWER) catch {};
-    hwDelayMs(10);
 
     lcd_initialized = true;
 }
@@ -880,70 +843,44 @@ fn hwLcdFillRect(x: u16, y: u16, width: u16, height: u16, color: u16) void {
 
 fn hwLcdUpdate(framebuffer: []const u8) HalError!void {
     if (!lcd_initialized) return HalError.DeviceNotReady;
+    if (!bcm.isReady()) return HalError.DeviceNotReady;
 
-    // Send update command
-    try bcmSendCommand(reg.BCMCMD_LCD_UPDATE);
-
-    // Transfer framebuffer data
-    // The BCM expects RGB565 data in 32-bit words
-    const words = framebuffer.len / 4;
-    var i: usize = 0;
-    while (i < words) : (i += 1) {
-        const offset = i * 4;
-        const word: u32 = @as(u32, framebuffer[offset]) |
-            (@as(u32, framebuffer[offset + 1]) << 8) |
-            (@as(u32, framebuffer[offset + 2]) << 16) |
-            (@as(u32, framebuffer[offset + 3]) << 24);
-
-        try bcmWaitWriteReady();
-        reg.writeReg(u32, reg.BCM_DATA, word);
-    }
-
-    // Finalize transfer
-    try bcmSendCommand(reg.BCMCMD_FINALIZE);
+    // Use BCM driver for full update
+    // Convert u8 slice to u16 slice for BCM
+    const total_pixels = @as(usize, bcm.LCD_WIDTH) * @as(usize, bcm.LCD_HEIGHT);
+    const pixel_count = @min(framebuffer.len / 2, total_pixels);
+    const pixels: [*]const u16 = @ptrCast(@alignCast(framebuffer.ptr));
+    bcm.updateFull(pixels[0..pixel_count]);
 }
 
 fn hwLcdUpdateRect(x: u16, y: u16, width: u16, height: u16, framebuffer: []const u8) HalError!void {
     if (!lcd_initialized) return HalError.DeviceNotReady;
+    if (!bcm.isReady()) return HalError.DeviceNotReady;
 
-    // Clamp to screen bounds
-    const x_end = @min(x + width, reg.LCD_WIDTH);
-    const y_end = @min(y + height, reg.LCD_HEIGHT);
-    const actual_width = x_end - x;
-    const actual_height = y_end - y;
+    // Extract the rectangular region pixels and use BCM driver
+    const total_pixels = @as(usize, bcm.LCD_WIDTH) * @as(usize, bcm.LCD_HEIGHT);
+    const pixel_count = @min(framebuffer.len / 2, total_pixels);
+    const pixels: [*]const u16 = @ptrCast(@alignCast(framebuffer.ptr));
 
-    if (actual_width == 0 or actual_height == 0) return;
+    // Use BCM's updateRect for partial updates
+    // Extract just the rect data
+    const rect_size = @as(usize, width) * @as(usize, height);
+    var rect_buf: [320 * 240]u16 = undefined;
+    var buf_idx: usize = 0;
 
-    // Send update rect command with coordinates
-    try bcmSendCommand(reg.BCMCMD_LCD_UPDATERECT);
-
-    // Send rectangle coordinates as 32-bit values
-    try bcmWrite32(reg.BCM_WR_CMD, @as(u32, x));
-    try bcmWrite32(reg.BCM_WR_CMD, @as(u32, y));
-    try bcmWrite32(reg.BCM_WR_CMD, @as(u32, actual_width));
-    try bcmWrite32(reg.BCM_WR_CMD, @as(u32, actual_height));
-
-    // Transfer only the rectangular region
     var py: u16 = y;
-    while (py < y_end) : (py += 1) {
+    while (py < y + height and py < bcm.LCD_HEIGHT) : (py += 1) {
         var px: u16 = x;
-        while (px < x_end) : (px += 2) {
-            // Read 2 pixels (4 bytes) at a time
-            const offset = (@as(usize, py) * reg.LCD_WIDTH + px) * 2;
-            if (offset + 3 < framebuffer.len) {
-                const word: u32 = @as(u32, framebuffer[offset]) |
-                    (@as(u32, framebuffer[offset + 1]) << 8) |
-                    (@as(u32, framebuffer[offset + 2]) << 16) |
-                    (@as(u32, framebuffer[offset + 3]) << 24);
-
-                try bcmWaitWriteReady();
-                reg.writeReg(u32, reg.BCM_DATA, word);
+        while (px < x + width and px < bcm.LCD_WIDTH) : (px += 1) {
+            const src_idx = @as(usize, py) * @as(usize, bcm.LCD_WIDTH) + @as(usize, px);
+            if (src_idx < pixel_count and buf_idx < rect_size) {
+                rect_buf[buf_idx] = pixels[src_idx];
+                buf_idx += 1;
             }
         }
     }
 
-    // Finalize transfer
-    try bcmSendCommand(reg.BCMCMD_FINALIZE);
+    bcm.updateRect(x, y, width, height, rect_buf[0..buf_idx]);
 }
 
 fn hwLcdSetBacklight(on: bool) void {
@@ -958,8 +895,8 @@ fn hwLcdSetBacklight(on: bool) void {
 fn hwLcdSleep() void {
     if (!lcd_initialized) return;
 
-    // Send sleep command to BCM
-    bcmSendCommand(reg.BCMCMD_LCD_SLEEP) catch {};
+    // Use BCM driver for sleep
+    bcm.sleep();
 
     // Turn off backlight
     hwLcdSetBacklight(false);
@@ -968,9 +905,13 @@ fn hwLcdSleep() void {
 fn hwLcdWake() HalError!void {
     if (!lcd_initialized) return HalError.DeviceNotReady;
 
-    // Wake command
-    try bcmSendCommand(reg.BCMCMD_LCD_WAKE);
-    hwDelayMs(10);
+    // Re-initialize BCM (wake from sleep)
+    bcm.init() catch |err| {
+        switch (err) {
+            error.VmcsFirmwareNotFound => return HalError.DeviceNotReady,
+            error.BcmFirmwareTimeout => return HalError.Timeout,
+        }
+    };
 
     // Turn on backlight
     hwLcdSetBacklight(true);
