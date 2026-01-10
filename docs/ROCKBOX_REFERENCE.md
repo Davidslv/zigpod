@@ -648,6 +648,60 @@ fn readWheel() ?WheelPacket {
 2. **Wrong WHEEL_DATA address** - We were reading from control register, not data register
 3. **No packet validation** - We weren't checking if data was valid
 4. **Missing WHEEL_CTRL magic** - Controller wasn't properly configured
+5. **CRITICAL: Wrong approach** - We were passively waiting for data, but must ACTIVELY POLL
+
+### Bootloader-Style Polling (CORRECT APPROACH)
+
+The click wheel uses a request-response protocol. You must SEND a command to GET data back:
+
+```zig
+// Send command to wheel controller
+fn wheelSendCommand(val: u32) void {
+    GPIOB_ENABLE.* &= ~@as(u32, 0x80);
+    WHEEL_STATUS.* |= 0x0C000000;  // Clear
+    WHEEL_TX.* = val;              // Send command
+    WHEEL_CTRL.* |= 0x80000000;    // Start transfer
+
+    // Configure GPIO B
+    GPIOB_OUTPUT_VAL.* &= ~@as(u32, 0x10);
+    GPIOB_OUTPUT_EN.* |= 0x10;
+
+    // Wait for completion (bit 31 goes low)
+    while ((WHEEL_STATUS.* & 0x80000000) != 0) {}
+
+    // Cleanup
+    WHEEL_CTRL.* &= ~@as(u32, 0x80000000);
+    GPIOB_ENABLE.* |= 0x80;
+    GPIOB_OUTPUT_VAL.* |= 0x10;
+    GPIOB_OUTPUT_EN.* &= ~@as(u32, 0x10);
+    WHEEL_STATUS.* |= 0x0C000000;
+    WHEEL_CTRL.* |= 0x60000000;
+}
+
+// Poll for buttons
+fn readWheel() u8 {
+    wheelSendCommand(0x8000023A);  // Polling command
+
+    // Wait for data
+    if ((WHEEL_STATUS.* & 0x04000000) == 0) return 0;
+
+    const data = WHEEL_DATA.*;
+
+    // Validate: (data & ~0x7FFF0000) should equal 0x8000023A
+    if ((data & ~@as(u32, 0x7FFF0000)) != 0x8000023A) return 0;
+
+    // Extract buttons: ((data << 11) >> 27) ^ 0x1F
+    return @truncate((data << 11) >> 27) ^ 0x1F;
+}
+```
+
+### GPIO B Registers for Click Wheel
+
+| Register | Address | Description |
+|----------|---------|-------------|
+| GPIOB_ENABLE | 0x6000D020 | GPIO B enable |
+| GPIOB_OUTPUT_EN | 0x6000D030 | GPIO B output enable |
+| GPIOB_OUTPUT_VAL | 0x6000D034 | GPIO B output value |
 
 ---
 
