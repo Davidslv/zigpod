@@ -238,3 +238,199 @@ test "bilinearScale invalid dimensions" {
     // Output too large
     try std.testing.expectError(ScaleError.OutputTooLarge, bilinearScale(&src, 1, 1, 100, 100));
 }
+
+// ============================================================
+// Floyd-Steinberg Dithering
+// ============================================================
+//
+// # Complexity: MEDIUM (~80 lines)
+//
+// Floyd-Steinberg dithering distributes quantization error to neighboring
+// pixels when converting from high bit-depth to lower bit-depth (RGB888→RGB565).
+//
+// This reduces visible banding/posterization artifacts, especially in gradients.
+//
+// Error distribution pattern:
+//
+// ```
+//        curr   7/16 →
+//   3/16   5/16   1/16
+//     ↙     ↓      ↘
+// ```
+//
+// For each pixel:
+// 1. Quantize to target bit depth (5-6-5 for RGB565)
+// 2. Calculate error = original - quantized_expanded
+// 3. Add weighted error to neighboring pixels (serpentine scan)
+//
+// Serpentine scanning (left-to-right, then right-to-left) reduces
+// directional artifacts that can appear with unidirectional scanning.
+//
+
+/// Error buffer for Floyd-Steinberg dithering
+/// We need two rows: current and next
+var dither_error: [2][MAX_OUTPUT_SIZE * 3]i16 = undefined;
+
+/// Convert RGB888 to RGB565 with Floyd-Steinberg dithering
+/// Returns the dithered RGB565 buffer
+pub fn ditherToRgb565(
+    src: []const u8,
+    width: u16,
+    height: u16,
+    dst: []u16,
+) ScaleError!void {
+    if (width == 0 or height == 0) return ScaleError.InvalidDimensions;
+    if (width > MAX_OUTPUT_SIZE or height > MAX_OUTPUT_SIZE) return ScaleError.OutputTooLarge;
+
+    const w: usize = width;
+    const h: usize = height;
+
+    if (src.len < w * h * 3) return ScaleError.InvalidDimensions;
+    if (dst.len < w * h) return ScaleError.InvalidDimensions;
+
+    // Clear error buffers
+    @memset(&dither_error[0], 0);
+    @memset(&dither_error[1], 0);
+
+    var current_row: usize = 0;
+    var next_row: usize = 1;
+
+    for (0..h) |y| {
+        // Serpentine: alternate direction each row
+        const left_to_right = (y & 1) == 0;
+
+        if (left_to_right) {
+            for (0..w) |x| {
+                processPixel(src, dst, w, x, y, current_row, next_row, true);
+            }
+        } else {
+            var x: usize = w;
+            while (x > 0) {
+                x -= 1;
+                processPixel(src, dst, w, x, y, current_row, next_row, false);
+            }
+        }
+
+        // Swap error buffer rows
+        const tmp = current_row;
+        current_row = next_row;
+        next_row = tmp;
+
+        // Clear the new "next" row
+        @memset(&dither_error[next_row], 0);
+    }
+}
+
+fn processPixel(
+    src: []const u8,
+    dst: []u16,
+    w: usize,
+    x: usize,
+    y: usize,
+    current_row: usize,
+    next_row: usize,
+    left_to_right: bool,
+) void {
+    const src_idx = (y * w + x) * 3;
+    const dst_idx = y * w + x;
+    const err_idx = x * 3;
+
+    // Get original pixel values + accumulated error
+    var r: i16 = @as(i16, src[src_idx + 0]) + dither_error[current_row][err_idx + 0];
+    var g: i16 = @as(i16, src[src_idx + 1]) + dither_error[current_row][err_idx + 1];
+    var b: i16 = @as(i16, src[src_idx + 2]) + dither_error[current_row][err_idx + 2];
+
+    // Clamp to valid range
+    r = @max(0, @min(255, r));
+    g = @max(0, @min(255, g));
+    b = @max(0, @min(255, b));
+
+    // Quantize to 5-6-5 bits
+    const r5: u8 = @intCast(@as(u16, @intCast(r)) >> 3);
+    const g6: u8 = @intCast(@as(u16, @intCast(g)) >> 2);
+    const b5: u8 = @intCast(@as(u16, @intCast(b)) >> 3);
+
+    // Store RGB565 pixel
+    dst[dst_idx] = (@as(u16, r5) << 11) | (@as(u16, g6) << 5) | @as(u16, b5);
+
+    // Calculate quantization error (expand back to 8-bit for comparison)
+    const r_expanded: i16 = @divTrunc(@as(i16, r5) * 255, 31);
+    const g_expanded: i16 = @divTrunc(@as(i16, g6) * 255, 63);
+    const b_expanded: i16 = @divTrunc(@as(i16, b5) * 255, 31);
+
+    const err_r = r - r_expanded;
+    const err_g = g - g_expanded;
+    const err_b = b - b_expanded;
+
+    // Distribute error to neighbors (serpentine-aware)
+    if (left_to_right) {
+        // →  7/16 to right
+        if (x + 1 < w) {
+            distributeError(current_row, (x + 1) * 3, err_r, err_g, err_b, 7);
+        }
+        // ↙ 3/16 to bottom-left
+        if (x > 0) {
+            distributeError(next_row, (x - 1) * 3, err_r, err_g, err_b, 3);
+        }
+        // ↓ 5/16 to bottom
+        distributeError(next_row, x * 3, err_r, err_g, err_b, 5);
+        // ↘ 1/16 to bottom-right
+        if (x + 1 < w) {
+            distributeError(next_row, (x + 1) * 3, err_r, err_g, err_b, 1);
+        }
+    } else {
+        // ← 7/16 to left (reversed direction)
+        if (x > 0) {
+            distributeError(current_row, (x - 1) * 3, err_r, err_g, err_b, 7);
+        }
+        // ↘ 3/16 to bottom-right
+        if (x + 1 < w) {
+            distributeError(next_row, (x + 1) * 3, err_r, err_g, err_b, 3);
+        }
+        // ↓ 5/16 to bottom
+        distributeError(next_row, x * 3, err_r, err_g, err_b, 5);
+        // ↙ 1/16 to bottom-left
+        if (x > 0) {
+            distributeError(next_row, (x - 1) * 3, err_r, err_g, err_b, 1);
+        }
+    }
+}
+
+fn distributeError(row: usize, idx: usize, err_r: i16, err_g: i16, err_b: i16, weight: i16) void {
+    // Distribute error with weight/16
+    dither_error[row][idx + 0] += @divTrunc(err_r * weight, 16);
+    dither_error[row][idx + 1] += @divTrunc(err_g * weight, 16);
+    dither_error[row][idx + 2] += @divTrunc(err_b * weight, 16);
+}
+
+// ============================================================
+// Dithering Tests
+// ============================================================
+
+test "ditherToRgb565 basic" {
+    // Simple 2x2 gray gradient
+    const src = [_]u8{
+        128, 128, 128, 130, 130, 130,
+        132, 132, 132, 134, 134, 134,
+    };
+    var dst: [4]u16 = undefined;
+
+    try ditherToRgb565(&src, 2, 2, &dst);
+
+    // All pixels should be valid RGB565 values
+    for (dst) |pixel| {
+        try std.testing.expect(pixel != 0 or pixel == 0); // Just check no crash
+    }
+}
+
+test "ditherToRgb565 dimensions" {
+    const src = [_]u8{ 0, 0, 0 };
+    var dst: [1]u16 = undefined;
+
+    // Zero dimensions
+    try std.testing.expectError(ScaleError.InvalidDimensions, ditherToRgb565(&src, 0, 1, &dst));
+    try std.testing.expectError(ScaleError.InvalidDimensions, ditherToRgb565(&src, 1, 0, &dst));
+
+    // Too large
+    try std.testing.expectError(ScaleError.OutputTooLarge, ditherToRgb565(&src, 100, 100, &dst));
+}

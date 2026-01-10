@@ -42,6 +42,14 @@ pub const dma_pipeline = @import("dma_pipeline.zig");
 // Export playback queue for track navigation
 pub const playback_queue = @import("playback_queue.zig");
 
+// Export album art pipeline (extraction, decoding, scaling, caching)
+pub const album_art = @import("album_art.zig");
+pub const art_decode = @import("art_decode.zig");
+pub const art_extract = @import("art_extract.zig");
+pub const art_scale = @import("art_scale.zig");
+pub const art_stream = @import("art_stream.zig");
+pub const art_cache = @import("art_cache.zig");
+
 // Import FAT32 for file reading
 const fat32 = @import("../drivers/storage/fat32.zig");
 

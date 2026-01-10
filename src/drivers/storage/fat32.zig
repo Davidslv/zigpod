@@ -530,6 +530,25 @@ pub fn readFile(path: []const u8, buffer: []u8) FatError!usize {
     return bytes_read;
 }
 
+/// Read bytes from a file at a specific offset (for streaming)
+/// Returns the number of bytes read
+pub fn readFileAt(path: []const u8, offset: usize, buffer: []u8) FatError!usize {
+    var fs = global_fs orelse return FatError.not_initialized;
+
+    // Parse path and find file
+    const file = try openFile(&fs, path);
+    var f = file;
+
+    // Seek to offset
+    if (offset > 0) {
+        f.seek(@intCast(offset)) catch return FatError.io_error;
+    }
+
+    // Read bytes
+    const bytes_read = f.read(buffer) catch return FatError.io_error;
+    return bytes_read;
+}
+
 /// Write data to a file, creating it if it doesn't exist
 /// This replaces the entire file contents
 pub fn writeFile(path: []const u8, data: []const u8) FatError!void {
@@ -557,6 +576,46 @@ pub fn writeFile(path: []const u8, data: []const u8) FatError!void {
     } else {
         // Create new file
         try createNewFile(&fs, &dir, filename, data);
+    }
+}
+
+/// Delete a file by path
+pub fn deleteFile(path: []const u8) FatError!void {
+    var fs = global_fs orelse return FatError.not_initialized;
+
+    // Split path into directory and filename
+    var dir_end: usize = 0;
+    for (path, 0..) |c, i| {
+        if (c == '/') dir_end = i;
+    }
+
+    const dir_path = if (dir_end > 0) path[0..dir_end] else "/";
+    const filename = if (dir_end < path.len - 1) path[dir_end + 1 ..] else return FatError.file_not_found;
+
+    // Open parent directory
+    var dir = openDirectory(&fs, dir_path) catch return FatError.file_not_found;
+
+    // Find the file
+    dir.rewind();
+    const result = findEntryWithPosition(&dir, filename) catch return FatError.io_error;
+
+    if (result.entry) |entry| {
+        // Free cluster chain if file has data
+        if (entry.getCluster() >= 2) {
+            fs.freeChain(entry.getCluster()) catch return FatError.io_error;
+        }
+
+        // Mark directory entry as deleted
+        var cluster_buffer: [32768]u8 = undefined;
+        const cluster_data = cluster_buffer[0..fs.cluster_size];
+        fs.readCluster(result.cluster, cluster_data) catch return FatError.io_error;
+
+        // Mark first byte of name as 0xE5 (deleted)
+        cluster_data[result.offset] = 0xE5;
+
+        fs.writeCluster(result.cluster, cluster_data) catch return FatError.io_error;
+    } else {
+        return FatError.file_not_found;
     }
 }
 

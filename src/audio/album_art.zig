@@ -75,6 +75,7 @@ const fat32 = @import("../drivers/storage/fat32.zig");
 const art_extract = @import("art_extract.zig");
 const art_decode = @import("art_decode.zig");
 const art_scale = @import("art_scale.zig");
+const art_stream = @import("art_stream.zig");
 
 // ============================================================
 // Constants
@@ -358,13 +359,39 @@ fn loadExternalArt(dir: []const u8) bool {
 // ============================================================
 
 /// Try to extract and decode embedded art from audio file
+/// Uses stream-based extraction to minimize peak RAM usage
 fn loadEmbeddedArt(track_path: []const u8) bool {
     // Detect audio format from extension
     const format = detectAudioFormat(track_path);
     if (format == .unknown) return false;
 
+    // Try stream-based extraction first (lower peak RAM)
+    // This locates art in the file without loading entire file into memory
+    const location = switch (format) {
+        .mp3 => art_stream.locateArtInMp3(track_path),
+        .flac => art_stream.locateArtInFlac(track_path),
+        .m4a => art_stream.locateArtInM4a(track_path),
+        .unknown => null,
+    };
+
+    if (location) |loc| {
+        // Stream-based: read only the art bytes
+        if (loc.size <= MAX_EMBEDDED_ART_SIZE) {
+            const art_data = art_stream.readArtData(track_path, loc, &extract_buffer);
+            if (art_data) |data| {
+                return decodeAndScaleArt(data, loc.format);
+            }
+        }
+    }
+
+    // Fallback: load file header and use in-memory extraction
+    // This handles edge cases where streaming failed
+    return loadEmbeddedArtFallback(track_path, format);
+}
+
+/// Fallback extraction method - loads more data into memory
+fn loadEmbeddedArtFallback(track_path: []const u8, format: AudioFormat) bool {
     // Read file header (enough for tag parsing)
-    // We read a larger chunk to find embedded art
     var file_buffer: [MAX_EMBEDDED_ART_SIZE]u8 = undefined;
     const bytes_read = fat32.readFile(track_path, &file_buffer) catch return false;
     if (bytes_read < 128) return false;
@@ -381,6 +408,19 @@ fn loadEmbeddedArt(track_path: []const u8) bool {
 
     // Detect image format
     const img_format = art_decode.detectFormat(art_data);
+    return decodeAndScaleArt(art_data, convertStreamFormat(img_format));
+}
+
+/// Decode art data and scale to display size
+fn decodeAndScaleArt(art_data: []const u8, stream_format: art_stream.ArtLocation.ImageFormat) bool {
+    // Convert stream format to decode format
+    const img_format = switch (stream_format) {
+        .jpeg => art_decode.ImageFormat.jpeg,
+        .png => art_decode.ImageFormat.png,
+        .bmp => art_decode.ImageFormat.bmp,
+        .unknown => art_decode.detectFormat(art_data),
+    };
+
     if (img_format == .unknown) return false;
 
     // Decode
@@ -395,9 +435,23 @@ fn loadEmbeddedArt(track_path: []const u8) bool {
         ART_SIZE,
     ) catch return false;
 
-    // Convert and store
-    convertToRgb565(scaled, &current_art.pixels);
+    // Convert to RGB565 with Floyd-Steinberg dithering for better quality
+    // Dithering reduces banding artifacts when converting 24-bit to 16-bit color
+    art_scale.ditherToRgb565(scaled, ART_SIZE, ART_SIZE, &current_art.pixels) catch {
+        // Fallback to simple conversion if dithering fails
+        convertToRgb565(scaled, &current_art.pixels);
+    };
     return true;
+}
+
+/// Convert art_decode format to art_stream format
+fn convertStreamFormat(format: art_decode.ImageFormat) art_stream.ArtLocation.ImageFormat {
+    return switch (format) {
+        .jpeg => .jpeg,
+        .png => .png,
+        .bmp => .bmp,
+        .unknown => .unknown,
+    };
 }
 
 // ============================================================
