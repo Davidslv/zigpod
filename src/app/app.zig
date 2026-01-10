@@ -388,10 +388,19 @@ fn handleNowPlayingInput(event: clickwheel.InputEvent) void {
         .toggle_shuffle => {
             const queue = audio.playback_queue.getQueue();
             queue.toggleShuffle();
+            // Sync to settings
+            settings_ui.getSettings().shuffle = queue.isShuffled();
         },
         .toggle_repeat => {
             const queue = audio.playback_queue.getQueue();
             queue.toggleRepeat();
+            // Sync to settings
+            const settings = settings_ui.getSettings();
+            settings.repeat = switch (queue.getRepeatMode()) {
+                .off => .off,
+                .one => .one,
+                .all => .all,
+            };
         },
         .open_menu => app_state.popScreen(),
         .back => app_state.popScreen(),

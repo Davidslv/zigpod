@@ -9,6 +9,7 @@ const lcd = @import("../drivers/display/lcd.zig");
 const audio = @import("../audio/audio.zig");
 const codec = @import("../drivers/audio/codec.zig");
 const theme_loader = @import("theme_loader.zig");
+const playback_queue = @import("../audio/playback_queue.zig");
 
 // ============================================================
 // Settings Storage
@@ -57,6 +58,25 @@ pub const Settings = struct {
         _ = self.brightness;
         // Apply theme from registry
         theme_loader.getRegistry().selectTheme(self.theme_index);
+    }
+
+    // Apply playback settings to the queue
+    pub fn applyPlaybackSettings(self: *const Settings) void {
+        const queue = playback_queue.getQueue();
+
+        // Sync shuffle state
+        if (self.shuffle and !queue.isShuffled()) {
+            queue.shuffle();
+        } else if (!self.shuffle and queue.isShuffled()) {
+            queue.unshuffle();
+        }
+
+        // Sync repeat mode
+        queue.setRepeatMode(switch (self.repeat) {
+            .off => .off,
+            .one => .one,
+            .all => .all,
+        });
     }
 
     /// Get current theme name for display
@@ -903,16 +923,32 @@ pub fn adjustTreble(delta: i8) void {
     settings.applyAudioSettings();
 }
 
-/// Toggle shuffle
+/// Toggle shuffle - syncs with playback queue
 pub fn toggleShuffle() void {
     const settings = getSettings();
     settings.shuffle = !settings.shuffle;
+
+    // Sync with playback queue
+    const queue = playback_queue.getQueue();
+    if (settings.shuffle and !queue.isShuffled()) {
+        queue.shuffle();
+    } else if (!settings.shuffle and queue.isShuffled()) {
+        queue.unshuffle();
+    }
 }
 
-/// Cycle repeat mode
+/// Cycle repeat mode - syncs with playback queue
 pub fn cycleRepeat() void {
     const settings = getSettings();
     settings.repeat = settings.repeat.next();
+
+    // Sync with playback queue
+    const queue = playback_queue.getQueue();
+    queue.setRepeatMode(switch (settings.repeat) {
+        .off => .off,
+        .one => .one,
+        .all => .all,
+    });
 }
 
 /// Cycle to next theme (built-in + custom)
@@ -1136,6 +1172,7 @@ pub fn loadSettings() bool {
     current_settings = deserializeSettings(serialized);
     current_settings.applyDisplaySettings();
     current_settings.applyAudioSettings();
+    current_settings.applyPlaybackSettings();
     return true;
 }
 
@@ -1147,6 +1184,7 @@ pub fn initSettings() void {
     }
     current_settings.applyDisplaySettings();
     current_settings.applyAudioSettings();
+    current_settings.applyPlaybackSettings();
 }
 
 /// Mark settings as dirty (needs save)
