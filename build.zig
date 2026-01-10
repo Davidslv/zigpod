@@ -103,6 +103,32 @@ pub fn build(b: *std.Build) void {
     sim_step.dependOn(&run_sim.step);
 
     // ============================================================
+    // iPod Detection Tool (Host)
+    // ============================================================
+
+    const ipod_detect_exe = b.addExecutable(.{
+        .name = "ipod-detect",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/ipod_detect.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+
+    b.installArtifact(ipod_detect_exe);
+
+    const run_ipod_detect = b.addRunArtifact(ipod_detect_exe);
+    run_ipod_detect.step.dependOn(b.getInstallStep());
+
+    // Pass command line args
+    if (b.args) |args| {
+        run_ipod_detect.addArgs(args);
+    }
+
+    const ipod_detect_step = b.step("ipod-detect", "Detect connected iPod devices");
+    ipod_detect_step.dependOn(&run_ipod_detect.step);
+
+    // ============================================================
     // UI Demo (Native with SDL2)
     // ============================================================
 
