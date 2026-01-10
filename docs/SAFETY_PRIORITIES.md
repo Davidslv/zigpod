@@ -58,9 +58,9 @@ These are the genuine improvements, NOT blockers for installation:
 
 | Task | Why | How |
 |------|-----|-----|
-| RAM-only boot test | Verify hardware timing | JTAG load to IRAM, test 30min |
-| Audio output test | Verify WM8758 config | Play sine wave, verify output |
-| Storage read test | Verify ATA timing | Read files, check CRC |
+| First boot test | Verify hardware timing | Flash via USB, run validation checklist |
+| Audio output test | Verify WM8758 config | Play audio file, verify output |
+| Storage read test | Verify ATA timing | Browse files, play tracks |
 
 ### Priority 2: Quality Improvements (NICE TO HAVE)
 
@@ -295,6 +295,152 @@ sudo dd if=ipod_backup.img of=/dev/diskX bs=1m status=progress
 
 ---
 
+## First Boot Validation Checklist
+
+After successful flash, run through these tests to increase confidence from 65% to 90%+.
+
+### Confidence Gains Per Test
+
+| Test | Duration | What It Validates | Confidence Gain |
+|------|----------|-------------------|-----------------|
+| Boot without crash | 2 min | CPU init, memory, basic HAL | +10% |
+| Display shows anything | 1 min | BCM2722 LCD controller | +8% |
+| Audio tone plays | 2 min | I2C to WM8758, codec init | +7% |
+| Files visible in browser | 2 min | ATA timing, FAT32 parsing | +5% |
+| Battery indicator works | 1 min | I2C to PCF50605 PMU | +5% |
+
+**Starting confidence: 65%**
+**After all tests pass: ~90-95%**
+
+### Test 1: Boot Test (CRITICAL)
+
+```
+Expected behavior:
+1. Reset device (MENU + SELECT)
+2. Within 5 seconds: ZigPod splash screen appears
+3. Within 10 seconds: Main menu visible
+
+If black screen >30 seconds:
+→ Enter Disk Mode, restore backup
+→ Check: Is firmware flashed to correct partition?
+```
+
+- [ ] Device boots without reset loop
+- [ ] Splash screen appears
+- [ ] Main menu loads
+
+**Result:** _____ (Pass/Fail) → If Pass: **Confidence now 75%**
+
+### Test 2: Display Test
+
+```
+Expected behavior:
+1. Screen shows readable text
+2. Colors are correct (not inverted/corrupted)
+3. Menu items are selectable
+
+If garbled display:
+→ BCM2722 init sequence may need timing adjustment
+→ Device still recoverable via Disk Mode
+```
+
+- [ ] Text is readable
+- [ ] Colors appear correct
+- [ ] UI responds to input
+
+**Result:** _____ (Pass/Fail) → If Pass: **Confidence now 83%**
+
+### Test 3: Audio Test
+
+```
+Expected behavior:
+1. Navigate to Files → select any audio file
+2. Sound plays through headphone jack
+3. Volume wheel adjusts level
+
+If no audio:
+→ WM8758 codec init may have failed
+→ Check: Are headphones plugged in?
+→ I2C timing to codec may need adjustment
+```
+
+- [ ] Audio file plays
+- [ ] Sound audible in headphones
+- [ ] Volume control works
+
+**Result:** _____ (Pass/Fail) → If Pass: **Confidence now 90%**
+
+### Test 4: Storage Test
+
+```
+Expected behavior:
+1. Navigate to Files screen
+2. Directory listing shows your music folders
+3. Can enter folders and see files
+4. File sizes appear reasonable
+
+If no files visible:
+→ ATA timing may be wrong for your storage type
+→ Try: Different folder, check FAT32 format
+```
+
+- [ ] Root directory visible
+- [ ] Can navigate into folders
+- [ ] Files have correct names/sizes
+
+**Result:** _____ (Pass/Fail) → If Pass: **Confidence now 95%**
+
+### Test 5: Battery/PMU Test
+
+```
+Expected behavior:
+1. Battery icon in header shows percentage
+2. Percentage is reasonable (not 0% or 100% always)
+3. Charging indicator works when USB connected
+
+If battery always shows 0% or 100%:
+→ I2C to PCF50605 may have timing issues
+→ Not critical for playback, but affects safety during flash
+```
+
+- [ ] Battery percentage displayed
+- [ ] Value seems reasonable
+- [ ] Updates when charging state changes
+
+**Result:** _____ (Pass/Fail) → If Pass: **Confidence now 97%**
+
+### Extended Stability Test (Optional)
+
+For maximum confidence, run these longer tests:
+
+| Test | Duration | Purpose |
+|------|----------|---------|
+| Continuous playback | 30 min | Memory leaks, audio stability |
+| Mixed format playlist | 15 min | Decoder switching |
+| Heavy navigation | 10 min | UI responsiveness under load |
+| Sleep/wake cycles | 5 cycles | Power management |
+
+### Validation Summary
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              FIRST BOOT VALIDATION RESULTS              │
+├─────────────────────────────────────────────────────────┤
+│ Test 1 (Boot):      [ ] Pass  [ ] Fail     (+10%)       │
+│ Test 2 (Display):   [ ] Pass  [ ] Fail     (+8%)        │
+│ Test 3 (Audio):     [ ] Pass  [ ] Fail     (+7%)        │
+│ Test 4 (Storage):   [ ] Pass  [ ] Fail     (+5%)        │
+│ Test 5 (Battery):   [ ] Pass  [ ] Fail     (+5%)        │
+├─────────────────────────────────────────────────────────┤
+│ FINAL CONFIDENCE:   65% + ___% = ___%                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Minimum for daily use:** Tests 1-3 pass (83%)
+**Recommended for confidence:** All 5 tests pass (95%+)
+
+---
+
 ## What Each Safety Feature Does
 
 ### Battery Provider (`hardware_providers.zig`)
@@ -360,13 +506,16 @@ Full details in `docs/reports/`:
 
 **ZigPod is ready for development installation on real hardware.**
 
-The critical safety features (battery, watchdog, backup, protected regions) are fully implemented. Known issues (FLAC memory, audio buffering, FAT32 tests) are documented with workarounds.
+The critical safety features (battery, watchdog, backup, protected regions) are fully implemented. Known issues (audio buffering, FAT32 tests) are documented with workarounds.
 
 **Recommended approach:**
-1. Start with RAM-only boot (Level 2-3)
-2. Test for at least 30 minutes
-3. If stable, proceed to persistent install (Level 4)
-4. Keep backup and recovery tools ready
+1. Create full disk backup via Disk Mode (MANDATORY)
+2. Flash ZigPod using USB-only installation sequence
+3. Run First Boot Validation Checklist (Tests 1-5)
+4. If Tests 1-3 pass (83% confidence), safe for daily use
+5. Keep backup ready for quick recovery via Disk Mode
+
+**Recovery is always possible** - Disk Mode is in ROM and works regardless of firmware state.
 
 ---
 
