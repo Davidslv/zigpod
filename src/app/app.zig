@@ -385,6 +385,10 @@ fn handleNowPlayingInput(event: clickwheel.InputEvent) void {
             const timestamp: u32 = @intCast(hal.getTicksUs() / 1000);
             ui.getOverlay().showVolume(app_state.now_playing_state.volume, timestamp);
         },
+        .toggle_shuffle => {
+            const queue = audio.playback_queue.getQueue();
+            queue.toggleShuffle();
+        },
         .open_menu => app_state.popScreen(),
         .back => app_state.popScreen(),
         else => {},

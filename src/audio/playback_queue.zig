@@ -2,6 +2,7 @@
 //!
 //! Manages the list of tracks to play, supporting next/previous navigation.
 //! The queue is populated based on playback context (album, artist, all songs, etc.)
+//! Supports shuffle mode with Fisher-Yates algorithm.
 
 const std = @import("std");
 const music_db = @import("../library/music_db.zig");
@@ -12,6 +13,30 @@ const music_db = @import("../library/music_db.zig");
 
 /// Maximum tracks in the queue
 pub const MAX_QUEUE_SIZE: usize = 256;
+
+// ============================================================
+// Simple PRNG for shuffle (LCG - works in embedded context)
+// ============================================================
+
+var prng_state: u32 = 12345;
+
+/// Seed the PRNG (call with timer value or similar)
+pub fn seedRandom(seed: u32) void {
+    prng_state = if (seed == 0) 12345 else seed;
+}
+
+/// Get next random number (LCG: x = (a*x + c) mod m)
+fn nextRandom() u32 {
+    // Parameters from Numerical Recipes
+    prng_state = prng_state *% 1664525 +% 1013904223;
+    return prng_state;
+}
+
+/// Get random number in range [0, max)
+fn randomRange(max: usize) usize {
+    if (max == 0) return 0;
+    return nextRandom() % max;
+}
 
 // ============================================================
 // Queue Source
@@ -49,6 +74,13 @@ pub const PlaybackQueue = struct {
     single_file_path: [256]u8 = [_]u8{0} ** 256,
     single_file_path_len: usize = 0,
 
+    /// Shuffle mode
+    shuffle_enabled: bool = false,
+    /// Original order backup (for unshuffling)
+    original_order: [MAX_QUEUE_SIZE]u16 = [_]u16{0} ** MAX_QUEUE_SIZE,
+    /// Original position of current track (to restore after unshuffle)
+    original_current_track: u16 = 0,
+
     /// Initialize empty queue
     pub fn init() PlaybackQueue {
         return PlaybackQueue{};
@@ -61,6 +93,72 @@ pub const PlaybackQueue = struct {
         self.source = .none;
         self.source_filter = 0;
         self.single_file_path_len = 0;
+        self.shuffle_enabled = false;
+    }
+
+    /// Check if shuffle is enabled
+    pub fn isShuffled(self: *const PlaybackQueue) bool {
+        return self.shuffle_enabled;
+    }
+
+    /// Toggle shuffle mode
+    pub fn toggleShuffle(self: *PlaybackQueue) void {
+        if (self.shuffle_enabled) {
+            self.unshuffle();
+        } else {
+            self.shuffle();
+        }
+    }
+
+    /// Enable shuffle - randomize queue order
+    pub fn shuffle(self: *PlaybackQueue) void {
+        if (self.count <= 1 or self.source == .single_file) return;
+
+        // Save original order
+        @memcpy(self.original_order[0..self.count], self.track_indices[0..self.count]);
+
+        // Remember current track to keep it at current position
+        const current_track = self.track_indices[self.current_index];
+        self.original_current_track = current_track;
+
+        // Fisher-Yates shuffle, but keep current track in place
+        // Move current track to position 0 first
+        self.track_indices[self.current_index] = self.track_indices[0];
+        self.track_indices[0] = current_track;
+
+        // Shuffle the rest (from index 1 onwards)
+        var i: usize = self.count - 1;
+        while (i > 1) : (i -= 1) {
+            const j = 1 + randomRange(i); // Random index from 1 to i
+            const tmp = self.track_indices[i];
+            self.track_indices[i] = self.track_indices[j];
+            self.track_indices[j] = tmp;
+        }
+
+        // Current track is now at index 0
+        self.current_index = 0;
+        self.shuffle_enabled = true;
+    }
+
+    /// Disable shuffle - restore original order
+    pub fn unshuffle(self: *PlaybackQueue) void {
+        if (!self.shuffle_enabled or self.count <= 1) return;
+
+        // Get current track before restoring
+        const current_track = self.track_indices[self.current_index];
+
+        // Restore original order
+        @memcpy(self.track_indices[0..self.count], self.original_order[0..self.count]);
+
+        // Find current track in original order
+        for (self.track_indices[0..self.count], 0..) |track, i| {
+            if (track == current_track) {
+                self.current_index = i;
+                break;
+            }
+        }
+
+        self.shuffle_enabled = false;
     }
 
     /// Check if queue is empty
@@ -351,4 +449,55 @@ test "playback queue clear" {
     queue.clear();
     try std.testing.expect(queue.isEmpty());
     try std.testing.expectEqual(QueueSource.none, queue.source);
+}
+
+test "playback queue shuffle" {
+    var queue = PlaybackQueue.init();
+
+    // Manually populate for testing
+    for (0..10) |i| {
+        queue.track_indices[i] = @intCast(i);
+    }
+    queue.count = 10;
+    queue.current_index = 3;
+    queue.source = .album;
+
+    // Current track before shuffle
+    const current_before = queue.track_indices[queue.current_index];
+
+    // Enable shuffle
+    queue.shuffle();
+    try std.testing.expect(queue.isShuffled());
+    try std.testing.expectEqual(@as(usize, 10), queue.count);
+
+    // Current track should still be accessible (at position 0 after shuffle)
+    try std.testing.expectEqual(current_before, queue.track_indices[0]);
+    try std.testing.expectEqual(@as(usize, 0), queue.current_index);
+
+    // Unshuffle
+    queue.unshuffle();
+    try std.testing.expect(!queue.isShuffled());
+
+    // Original order should be restored
+    for (0..10) |i| {
+        try std.testing.expectEqual(@as(u16, @intCast(i)), queue.track_indices[i]);
+    }
+}
+
+test "playback queue toggle shuffle" {
+    var queue = PlaybackQueue.init();
+
+    for (0..5) |i| {
+        queue.track_indices[i] = @intCast(i);
+    }
+    queue.count = 5;
+    queue.source = .album;
+
+    try std.testing.expect(!queue.isShuffled());
+
+    queue.toggleShuffle();
+    try std.testing.expect(queue.isShuffled());
+
+    queue.toggleShuffle();
+    try std.testing.expect(!queue.isShuffled());
 }

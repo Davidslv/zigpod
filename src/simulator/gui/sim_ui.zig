@@ -56,6 +56,11 @@ pub const SimulatorUI = struct {
     queue_count: usize = 0,
     queue_position: usize = 0,
 
+    // Shuffle mode
+    shuffle_enabled: bool = false,
+    shuffle_order: [32]usize = [_]usize{0} ** 32, // Shuffled indices
+    original_order: [32]usize = [_]usize{0} ** 32, // Original indices for unshuffle
+
     const Self = @This();
 
     pub fn init() Self {
@@ -110,7 +115,8 @@ pub const SimulatorUI = struct {
     /// Get full path of current queue track
     fn getQueueTrackPath(self: *Self) []const u8 {
         if (self.queue_position >= self.queue_count) return "";
-        const entry = &self.queue[self.queue_position];
+        const actual_idx = self.getActualIndex(self.queue_position);
+        const entry = &self.queue[actual_idx];
         return self.getFullPath(entry.getName());
     }
 
@@ -122,6 +128,72 @@ pub const SimulatorUI = struct {
     /// Check if there's a previous track
     pub fn hasPrevious(self: *const Self) bool {
         return self.queue_count > 0 and self.queue_position > 0;
+    }
+
+    /// Toggle shuffle mode
+    pub fn toggleShuffle(self: *Self) void {
+        if (self.shuffle_enabled) {
+            self.disableShuffle();
+        } else {
+            self.enableShuffle();
+        }
+    }
+
+    /// Enable shuffle
+    pub fn enableShuffle(self: *Self) void {
+        if (self.queue_count <= 1) return;
+
+        // Save original order
+        for (0..self.queue_count) |i| {
+            self.original_order[i] = i;
+            self.shuffle_order[i] = i;
+        }
+
+        // Get current track index before shuffle
+        const current_actual = self.shuffle_order[self.queue_position];
+
+        // Fisher-Yates shuffle, keeping current track at position 0
+        self.shuffle_order[self.queue_position] = self.shuffle_order[0];
+        self.shuffle_order[0] = current_actual;
+
+        // Shuffle the rest
+        var prng: u32 = @truncate(@as(u64, @bitCast(std.time.milliTimestamp())));
+        var i: usize = self.queue_count - 1;
+        while (i > 1) : (i -= 1) {
+            prng = prng *% 1664525 +% 1013904223;
+            const j = 1 + (prng % i);
+            const tmp = self.shuffle_order[i];
+            self.shuffle_order[i] = self.shuffle_order[j];
+            self.shuffle_order[j] = tmp;
+        }
+
+        self.queue_position = 0;
+        self.shuffle_enabled = true;
+    }
+
+    /// Disable shuffle
+    pub fn disableShuffle(self: *Self) void {
+        if (!self.shuffle_enabled) return;
+
+        // Find current track in shuffled order
+        const current_shuffled_idx = self.shuffle_order[self.queue_position];
+
+        // Restore original order
+        for (0..self.queue_count) |i| {
+            self.shuffle_order[i] = i;
+        }
+
+        // Find position of current track in original order
+        self.queue_position = current_shuffled_idx;
+        self.shuffle_enabled = false;
+    }
+
+    /// Get the actual queue index for current position (handles shuffle)
+    fn getActualIndex(self: *const Self, pos: usize) usize {
+        if (self.shuffle_enabled and pos < self.queue_count) {
+            return self.shuffle_order[pos];
+        }
+        return pos;
     }
 
     pub fn handleInput(self: *Self, button: Button, wheel_delta: i8) ?Action {
@@ -234,6 +306,7 @@ pub const SimulatorUI = struct {
 
         switch (button) {
             .play_pause => return .toggle_play,
+            .select => return .toggle_shuffle,
             .menu => {
                 self.screen = .file_browser;
             },
@@ -355,6 +428,7 @@ pub const Action = union(enum) {
     play_file: []const u8,
     seek_forward: void,
     volume_change: i8,
+    toggle_shuffle: void,
 };
 
 // ============================================================
@@ -457,6 +531,7 @@ pub const PlayerInfo = struct {
     volume: u8 = 100,
     queue_position: usize = 0,
     queue_total: usize = 0,
+    shuffle_enabled: bool = false,
 };
 
 fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
@@ -541,9 +616,17 @@ fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
         drawText(framebuffer, WIDTH / 2 + 35, ctrl_y, ">|", COLOR_TEXT_DIM);
     }
 
+    // Shuffle indicator (bottom left, before controls)
+    if (player.shuffle_enabled) {
+        drawText(framebuffer, 10, ctrl_y, "[S]", COLOR_ACCENT);
+    } else {
+        drawText(framebuffer, 10, ctrl_y, "[S]", COLOR_TEXT_DIM);
+    }
+
     // Footer with controls hint
     fillRect(framebuffer, 0, HEIGHT - FOOTER_HEIGHT, WIDTH, FOOTER_HEIGHT, COLOR_FOOTER_BG);
-    drawText(framebuffer, 10, HEIGHT - FOOTER_HEIGHT + 6, "<< Prev   Space   Next >>", COLOR_TEXT_DIM);
+    const hint = if (player.shuffle_enabled) "<< Prev  Space  Next >>  [Shuffle ON]" else "<< Prev  Space  Next >>  Enter:Shuffle";
+    drawText(framebuffer, 10, HEIGHT - FOOTER_HEIGHT + 6, hint, COLOR_TEXT_DIM);
 }
 
 // ============================================================

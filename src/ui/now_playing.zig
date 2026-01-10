@@ -94,10 +94,11 @@ pub const NowPlayingState = struct {
             self.metadata.album = track_info.getAlbum();
         }
 
-        // Update queue position
+        // Update queue position and shuffle state
         const queue = playback_queue.getQueue();
         self.queue_position = queue.getCurrentPosition();
         self.queue_total = queue.getCount();
+        self.is_shuffled = queue.isShuffled();
 
         const vol = audio.getVolume();
         // Convert dB (-89 to +6) to percentage (0-100)

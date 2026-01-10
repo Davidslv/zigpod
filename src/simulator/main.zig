@@ -293,6 +293,7 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
             .volume = player.volume,
             .queue_position = ui.queue_position,
             .queue_total = ui.queue_count,
+            .shuffle_enabled = ui.shuffle_enabled,
         };
 
         // Render UI to framebuffer
@@ -356,6 +357,14 @@ fn handleUiAction(ui: *sim_ui.SimulatorUI, player: *audio_player.AudioPlayer, ac
             const current: i16 = player.volume;
             const new_vol = std.math.clamp(current + delta, 0, 100);
             player.setVolume(@intCast(new_vol));
+        },
+        .toggle_shuffle => {
+            ui.toggleShuffle();
+            if (ui.shuffle_enabled) {
+                out.print("Shuffle: ON\n", .{});
+            } else {
+                out.print("Shuffle: OFF\n", .{});
+            }
         },
     }
 }
