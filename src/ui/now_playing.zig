@@ -7,6 +7,7 @@ const std = @import("std");
 const ui = @import("ui.zig");
 const lcd = @import("../drivers/display/lcd.zig");
 const audio = @import("../audio/audio.zig");
+const playback_queue = audio.playback_queue;
 
 // ============================================================
 // Constants
@@ -56,6 +57,10 @@ pub const NowPlayingState = struct {
     repeat_mode: RepeatMode = .off,
     volume: u8 = 50, // 0-100
 
+    // Queue position
+    queue_position: usize = 0,
+    queue_total: usize = 0,
+
     /// Calculate progress percentage (0-100)
     pub fn getProgressPercent(self: *const NowPlayingState) u8 {
         if (self.total_time_ms == 0) return 0;
@@ -88,6 +93,11 @@ pub const NowPlayingState = struct {
             self.metadata.artist = track_info.getArtist();
             self.metadata.album = track_info.getAlbum();
         }
+
+        // Update queue position
+        const queue = playback_queue.getQueue();
+        self.queue_position = queue.getCurrentPosition();
+        self.queue_total = queue.getCount();
 
         const vol = audio.getVolume();
         // Convert dB (-89 to +6) to percentage (0-100)
@@ -188,8 +198,13 @@ fn drawTrackInfo(state: *const NowPlayingState, theme: ui.Theme) void {
     // Album
     lcd.drawString(INFO_X, ALBUM_ART_Y + 32, meta.album, theme.disabled, null);
 
-    // Track number if available
-    if (meta.track_number > 0 and meta.total_tracks > 0) {
+    // Queue position (show "Track X of Y" when playing from album/artist)
+    if (state.queue_total > 1) {
+        var buf: [32]u8 = undefined;
+        const track_str = std.fmt.bufPrint(&buf, "Track {d} of {d}", .{ state.queue_position, state.queue_total }) catch "";
+        lcd.drawString(INFO_X, ALBUM_ART_Y + 52, track_str, theme.disabled, null);
+    } else if (meta.track_number > 0 and meta.total_tracks > 0) {
+        // Fall back to metadata track number
         var buf: [32]u8 = undefined;
         const track_str = std.fmt.bufPrint(&buf, "Track {d}/{d}", .{ meta.track_number, meta.total_tracks }) catch "";
         lcd.drawString(INFO_X, ALBUM_ART_Y + 52, track_str, theme.disabled, null);

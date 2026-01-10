@@ -324,6 +324,10 @@ fn handleFileBrowserInput(event: clickwheel.InputEvent) void {
             // Get the full path of the selected file
             var path_buffer: [256]u8 = undefined;
             if (app_state.file_browser.getSelectedPath(&path_buffer)) |path| {
+                // Set single file in playback queue (no next/prev from file browser)
+                const queue = audio.playback_queue.getQueue();
+                queue.setSingleFile(path);
+
                 // Load and play the file
                 audio.loadFile(path) catch |err| {
                     // Show error message

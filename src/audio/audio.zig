@@ -39,6 +39,9 @@ pub const audio_hw = @import("audio_hw.zig");
 // DMA audio pipeline for interrupt-driven output
 pub const dma_pipeline = @import("dma_pipeline.zig");
 
+// Export playback queue for track navigation
+pub const playback_queue = @import("playback_queue.zig");
+
 // Import FAT32 for file reading
 const fat32 = @import("../drivers/storage/fat32.zig");
 
@@ -623,21 +626,42 @@ pub fn restartTrack() void {
     }
 }
 
-/// Skip to next track (requires playlist, for now just stops)
+/// Skip to next track in queue
 pub fn nextTrack() void {
-    // For now, stop playback - full implementation needs playlist
-    stop();
+    const queue = playback_queue.getQueue();
+
+    if (queue.next()) |path| {
+        // Load and play next track
+        loadFile(path) catch |err| {
+            log.warn("Failed to load next track: {s}", .{@errorName(err)});
+            // Try next track if this one fails
+            nextTrack();
+        };
+    } else {
+        // No more tracks - stop playback
+        log.info("End of queue reached", .{});
+        stop();
+    }
 }
 
 /// Go to previous track or restart current
-/// Restarts if more than 3 seconds into track, otherwise would go to previous
+/// Restarts if more than 3 seconds into track, otherwise goes to previous
 pub fn prevTrack() void {
     const position_ms = getPositionMs();
+    const queue = playback_queue.getQueue();
+
     if (position_ms > 3000) {
         // More than 3 seconds in - restart current track
         restartTrack();
+    } else if (queue.previous()) |path| {
+        // Go to previous track
+        loadFile(path) catch |err| {
+            log.warn("Failed to load previous track: {s}", .{@errorName(err)});
+            // Just restart current if previous fails
+            restartTrack();
+        };
     } else {
-        // Less than 3 seconds - for now just restart (needs playlist for prev)
+        // No previous track - restart current
         restartTrack();
     }
 }

@@ -276,6 +276,8 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
             .duration_ms = player.getTrackInfo().duration_ms,
             .is_playing = player.getState() == .playing,
             .volume = player.volume,
+            .queue_position = ui.queue_position,
+            .queue_total = ui.queue_count,
         };
 
         // Render UI to framebuffer

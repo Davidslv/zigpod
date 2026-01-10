@@ -51,6 +51,11 @@ pub const SimulatorUI = struct {
     current_path_len: usize = 0,
     audio_playing: bool = false,
 
+    // Playback queue (all audio files in current directory)
+    queue: [32]FileEntry = undefined,
+    queue_count: usize = 0,
+    queue_position: usize = 0,
+
     const Self = @This();
 
     pub fn init() Self {
@@ -60,6 +65,63 @@ pub const SimulatorUI = struct {
         @memcpy(ui.current_path[0..default_path.len], default_path);
         ui.current_path_len = default_path.len;
         return ui;
+    }
+
+    /// Build queue from current directory's audio files
+    fn buildQueue(self: *Self, start_file: []const u8) void {
+        self.queue_count = 0;
+        self.queue_position = 0;
+
+        // Copy audio files from file list to queue
+        for (self.files[0..self.file_count]) |entry| {
+            if (!entry.is_dir) {
+                if (self.queue_count < self.queue.len) {
+                    self.queue[self.queue_count] = entry;
+                    // Check if this is the starting file
+                    if (std.mem.eql(u8, entry.getName(), start_file)) {
+                        self.queue_position = self.queue_count;
+                    }
+                    self.queue_count += 1;
+                }
+            }
+        }
+    }
+
+    /// Get next track in queue
+    pub fn nextTrack(self: *Self) ?[]const u8 {
+        if (self.queue_count == 0) return null;
+        if (self.queue_position + 1 < self.queue_count) {
+            self.queue_position += 1;
+            return self.getQueueTrackPath();
+        }
+        return null;
+    }
+
+    /// Get previous track in queue
+    pub fn prevTrack(self: *Self) ?[]const u8 {
+        if (self.queue_count == 0) return null;
+        if (self.queue_position > 0) {
+            self.queue_position -= 1;
+            return self.getQueueTrackPath();
+        }
+        return null;
+    }
+
+    /// Get full path of current queue track
+    fn getQueueTrackPath(self: *Self) []const u8 {
+        if (self.queue_position >= self.queue_count) return "";
+        const entry = &self.queue[self.queue_position];
+        return self.getFullPath(entry.getName());
+    }
+
+    /// Check if there's a next track
+    pub fn hasNext(self: *const Self) bool {
+        return self.queue_count > 0 and self.queue_position + 1 < self.queue_count;
+    }
+
+    /// Check if there's a previous track
+    pub fn hasPrevious(self: *const Self) bool {
+        return self.queue_count > 0 and self.queue_position > 0;
     }
 
     pub fn handleInput(self: *Self, button: Button, wheel_delta: i8) ?Action {
@@ -144,6 +206,8 @@ pub const SimulatorUI = struct {
                         // Navigate into directory
                         self.navigateToDir(entry.getName());
                     } else {
+                        // Build queue from all audio files in this folder
+                        self.buildQueue(entry.getName());
                         // Play audio file
                         return Action{ .play_file = self.getFullPath(entry.getName()) };
                     }
@@ -163,13 +227,28 @@ pub const SimulatorUI = struct {
     }
 
     fn handleNowPlayingInput(self: *Self, button: Button, wheel_delta: i8) ?Action {
-        _ = wheel_delta;
+        // Volume control with wheel
+        if (wheel_delta != 0) {
+            return Action{ .volume_change = wheel_delta * 5 };
+        }
+
         switch (button) {
             .play_pause => return .toggle_play,
-            .menu, .left => {
+            .menu => {
                 self.screen = .file_browser;
             },
-            .right => return .seek_forward,
+            .left => {
+                // Previous track
+                if (self.prevTrack()) |path| {
+                    return Action{ .play_file = path };
+                }
+            },
+            .right => {
+                // Next track
+                if (self.nextTrack()) |path| {
+                    return Action{ .play_file = path };
+                }
+            },
             else => {},
         }
         return null;
@@ -376,6 +455,8 @@ pub const PlayerInfo = struct {
     duration_ms: u64 = 0,
     is_playing: bool = false,
     volume: u8 = 100,
+    queue_position: usize = 0,
+    queue_total: usize = 0,
 };
 
 fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
@@ -388,19 +469,33 @@ fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
     fillRect(framebuffer, 0, 0, WIDTH, HEADER_HEIGHT, COLOR_HEADER_BG);
     drawText(framebuffer, 10, 8, "Now Playing", COLOR_HEADER_FG);
 
+    // Queue position in header (right side)
+    if (player.queue_total > 1) {
+        var queue_buf: [16]u8 = undefined;
+        const queue_str = std.fmt.bufPrint(&queue_buf, "{d}/{d}", .{ player.queue_position + 1, player.queue_total }) catch "";
+        drawTextRight(framebuffer, WIDTH - 10, 8, queue_str, COLOR_TEXT_DIM);
+    }
+
     // Album art placeholder
-    const art_size: usize = 100;
+    const art_size: usize = 80;
     const art_x = (WIDTH - art_size) / 2;
-    const art_y: usize = 45;
+    const art_y: usize = 40;
     fillRect(framebuffer, art_x, art_y, art_size, art_size, rgb565(50, 50, 70));
     drawMusicNote(framebuffer, art_x + art_size / 2, art_y + art_size / 2);
 
     // Track info
-    drawTextCentered(framebuffer, 160, player.title, COLOR_TEXT);
-    drawTextCentered(framebuffer, 175, player.artist, COLOR_TEXT_DIM);
+    drawTextCentered(framebuffer, 130, player.title, COLOR_TEXT);
+    drawTextCentered(framebuffer, 145, player.artist, COLOR_TEXT_DIM);
+
+    // Track position text
+    if (player.queue_total > 1) {
+        var track_buf: [32]u8 = undefined;
+        const track_str = std.fmt.bufPrint(&track_buf, "Track {d} of {d}", .{ player.queue_position + 1, player.queue_total }) catch "";
+        drawTextCentered(framebuffer, 160, track_str, COLOR_TEXT_DIM);
+    }
 
     // Progress bar
-    const bar_y: usize = 195;
+    const bar_y: usize = 180;
     const bar_x: usize = 20;
     const bar_w: usize = WIDTH - 40;
     const bar_h: usize = 6;
@@ -419,15 +514,36 @@ fn renderNowPlaying(framebuffer: []u16, info: ?PlayerInfo) void {
     drawText(framebuffer, bar_x, bar_y + 10, pos_str, COLOR_TEXT_DIM);
     drawTextRight(framebuffer, bar_x + bar_w, bar_y + 10, dur_str, COLOR_TEXT_DIM);
 
-    // Play/Pause indicator
+    // Play/Pause indicator with prev/next arrows
+    const ctrl_y: usize = 205;
+
+    // Previous arrow (if available)
+    if (player.queue_position > 0) {
+        drawText(framebuffer, WIDTH / 2 - 50, ctrl_y, "|<", COLOR_TEXT);
+    } else {
+        drawText(framebuffer, WIDTH / 2 - 50, ctrl_y, "|<", COLOR_TEXT_DIM);
+    }
+
+    // Play/Pause
     if (player.is_playing) {
         // Pause bars
-        fillRect(framebuffer, WIDTH / 2 - 10, 220, 6, 12, COLOR_TEXT);
-        fillRect(framebuffer, WIDTH / 2 + 4, 220, 6, 12, COLOR_TEXT);
+        fillRect(framebuffer, WIDTH / 2 - 6, ctrl_y, 4, 10, COLOR_TEXT);
+        fillRect(framebuffer, WIDTH / 2 + 2, ctrl_y, 4, 10, COLOR_TEXT);
     } else {
         // Play triangle
-        drawPlayTriangle(framebuffer, WIDTH / 2, 226);
+        drawPlayTriangle(framebuffer, WIDTH / 2, ctrl_y + 5);
     }
+
+    // Next arrow (if available)
+    if (player.queue_position + 1 < player.queue_total) {
+        drawText(framebuffer, WIDTH / 2 + 35, ctrl_y, ">|", COLOR_TEXT);
+    } else {
+        drawText(framebuffer, WIDTH / 2 + 35, ctrl_y, ">|", COLOR_TEXT_DIM);
+    }
+
+    // Footer with controls hint
+    fillRect(framebuffer, 0, HEIGHT - FOOTER_HEIGHT, WIDTH, FOOTER_HEIGHT, COLOR_FOOTER_BG);
+    drawText(framebuffer, 10, HEIGHT - FOOTER_HEIGHT + 6, "<< Prev   Space   Next >>", COLOR_TEXT_DIM);
 }
 
 // ============================================================

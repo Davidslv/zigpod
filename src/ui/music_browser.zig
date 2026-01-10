@@ -8,6 +8,7 @@ const ui = @import("ui.zig");
 const lcd = @import("../drivers/display/lcd.zig");
 const music_db = @import("../library/music_db.zig");
 const audio = @import("../audio/audio.zig");
+const playback_queue = audio.playback_queue;
 const clickwheel = @import("../drivers/input/clickwheel.zig");
 
 // ============================================================
@@ -227,25 +228,51 @@ pub const MusicBrowser = struct {
 
     fn handleSongSelect(self: *MusicBrowser) BrowserAction {
         const db = music_db.getDb();
+        const queue = playback_queue.getQueue();
 
-        // Find the actual track
+        // Find the actual track and populate queue based on context
         var track_idx: ?usize = null;
+        var position_in_queue: usize = 0;
+
         if (self.filter_album_idx) |album_idx| {
-            // Filtered by album
+            // Playing from album - populate queue with album tracks
             var count: usize = 0;
             for (db.tracks[0..db.track_count], 0..) |track, i| {
                 if (track.valid and track.album_idx == album_idx) {
                     if (count == self.selected_index) {
                         track_idx = i;
-                        break;
+                        position_in_queue = count;
                     }
                     count += 1;
                 }
             }
+
+            // Populate queue with this album's tracks
+            if (track_idx != null) {
+                queue.setFromAlbum(album_idx, position_in_queue);
+            }
+        } else if (self.filter_artist_idx) |artist_idx| {
+            // Playing from artist view (all songs mode) - queue all artist tracks
+            var count: usize = 0;
+            for (db.tracks[0..db.track_count], 0..) |track, i| {
+                if (track.valid and track.artist_idx == artist_idx) {
+                    if (count == self.selected_index) {
+                        track_idx = i;
+                        position_in_queue = count;
+                    }
+                    count += 1;
+                }
+            }
+
+            if (track_idx != null) {
+                queue.setFromArtist(artist_idx, position_in_queue);
+            }
         } else {
-            // All songs
+            // All songs view
             if (self.selected_index < db.getTrackCount()) {
                 track_idx = self.selected_index;
+                position_in_queue = self.selected_index;
+                queue.setFromAllSongs(position_in_queue);
             }
         }
 
