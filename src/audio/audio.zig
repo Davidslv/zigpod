@@ -1109,10 +1109,21 @@ pub fn process() hal.HalError!void {
                 log.info("Gapless transition successful", .{});
                 next_track_requested = false;
             } else {
-                // No next track, stop playback
-                log.info("Playback complete (no next track)", .{});
-                state = .stopped;
-                slot.state = .empty;
+                // No preloaded next track - try auto-advance from queue
+                const queue = playback_queue.getQueue();
+                if (queue.next()) |next_path| {
+                    log.info("Auto-advancing to next track in queue", .{});
+                    slot.state = .empty;
+                    loadFile(next_path) catch |err| {
+                        log.warn("Failed to load next track: {s}", .{@errorName(err)});
+                        state = .stopped;
+                    };
+                } else {
+                    // No next track in queue, stop playback
+                    log.info("Playback complete (end of queue)", .{});
+                    state = .stopped;
+                    slot.state = .empty;
+                }
             }
         }
     }

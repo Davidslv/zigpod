@@ -337,6 +337,20 @@ pub const AudioPlayer = struct {
         if (self.track_info.duration_ms == 0) return 0;
         return @intCast((self.position_ms * 100) / self.track_info.duration_ms);
     }
+
+    /// Check if track finished playing (reached end)
+    pub fn hasTrackEnded(self: *const Self) bool {
+        // Track ended if we were playing, are now stopped, and reached near the end
+        return self.state == .stopped and
+            self.converted_data.len > 0 and
+            self.audio_offset >= self.converted_data.len - 4096; // Within last buffer
+    }
+
+    /// Reset the ended state (call after handling track end)
+    pub fn clearEndedState(self: *Self) void {
+        self.audio_offset = 0;
+        self.position_ms = 0;
+    }
 };
 
 // ============================================================

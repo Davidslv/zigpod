@@ -268,6 +268,21 @@ fn runGuiMode(allocator: std.mem.Allocator, state: *SimulatorState, options: Opt
             }
         }
 
+        // Check for track end and auto-advance
+        if (player.hasTrackEnded() and ui.screen == .now_playing) {
+            player.clearEndedState();
+            // Try to play next track
+            if (ui.nextTrack()) |next_path| {
+                out.print("Auto-advancing to: {s}\n", .{next_path});
+                player.loadWav(next_path) catch |err| {
+                    out.print("Failed to load next track: {}\n", .{err});
+                };
+                player.play();
+            } else {
+                out.print("Playback finished (end of queue)\n", .{});
+            }
+        }
+
         // Build player info for UI
         const player_info = sim_ui.PlayerInfo{
             .title = player.getTrackInfo().getTitle(),
