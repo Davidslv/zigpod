@@ -278,62 +278,70 @@ fn isIpodProductId(product_id: u16) bool {
 
 /// Find disk device for iPod in Disk Mode
 fn findDiskDevice(allocator: std.mem.Allocator, info: *IpodInfo) !void {
-    // Run diskutil list to find external disks
-    const output = runCommand(allocator, &.{ "diskutil", "list", "external" }) catch return;
+    // Run diskutil list to find all disks
+    const output = runCommand(allocator, &.{ "diskutil", "list" }) catch return;
     defer allocator.free(output);
 
-    // Look for iPod-like devices (usually shows as "Apple iPod" or just appears as external)
+    // Look specifically for Apple_HFS iPod partition
     var lines = std.mem.splitScalar(u8, output, '\n');
+    var current_disk: ?[]const u8 = null;
+
     while (lines.next()) |line| {
-        // Look for disk identifier like /dev/disk2
+        // Track which disk we're looking at
         if (std.mem.indexOf(u8, line, "/dev/disk")) |start| {
-            // Extract disk path
             var end = start + 9; // "/dev/disk"
             while (end < line.len and (line[end] >= '0' and line[end] <= '9')) {
                 end += 1;
             }
+            current_disk = line[start..end];
+        }
 
-            const disk_path = line[start..end];
-            const len = @min(disk_path.len, info.disk_path.len);
-            @memcpy(info.disk_path[0..len], disk_path[0..len]);
-            info.disk_path_len = len;
-            info.in_disk_mode = true;
+        // Look for Apple_HFS iPod partition (the actual iPod data partition)
+        if (std.mem.indexOf(u8, line, "Apple_HFS") != null and
+            std.mem.indexOf(u8, line, "iPod") != null)
+        {
+            if (current_disk) |disk| {
+                const len = @min(disk.len, info.disk_path.len);
+                @memcpy(info.disk_path[0..len], disk[0..len]);
+                info.disk_path_len = len;
+                info.in_disk_mode = true;
 
-            // Get disk size
-            const disk_info = runCommand(allocator, &.{ "diskutil", "info", disk_path }) catch continue;
-            defer allocator.free(disk_info);
+                // Get disk size using diskutil info
+                const disk_info = runCommand(allocator, &.{ "diskutil", "info", disk }) catch return;
+                defer allocator.free(disk_info);
 
-            // Parse size from "Disk Size:" line
-            var info_lines = std.mem.splitScalar(u8, disk_info, '\n');
-            while (info_lines.next()) |info_line| {
-                if (std.mem.indexOf(u8, info_line, "Disk Size:")) |_| {
-                    // Extract byte count in parentheses
-                    if (std.mem.indexOf(u8, info_line, "(")) |paren_start| {
-                        if (std.mem.indexOf(u8, info_line, " Bytes")) |bytes_end| {
-                            if (bytes_end > paren_start) {
-                                const size_str = info_line[paren_start + 1 .. bytes_end];
-                                // Remove commas
-                                var clean_size: [32]u8 = undefined;
-                                var clean_len: usize = 0;
-                                for (size_str) |c| {
-                                    if (c >= '0' and c <= '9') {
-                                        clean_size[clean_len] = c;
-                                        clean_len += 1;
+                // Parse disk info
+                var info_lines = std.mem.splitScalar(u8, disk_info, '\n');
+                while (info_lines.next()) |info_line| {
+                    // Get disk size
+                    if (std.mem.indexOf(u8, info_line, "Disk Size:")) |_| {
+                        if (std.mem.indexOf(u8, info_line, "(")) |paren_start| {
+                            if (std.mem.indexOf(u8, info_line, " Bytes")) |bytes_end| {
+                                if (bytes_end > paren_start) {
+                                    const size_str = info_line[paren_start + 1 .. bytes_end];
+                                    var clean_size: [32]u8 = undefined;
+                                    var clean_len: usize = 0;
+                                    for (size_str) |c| {
+                                        if (c >= '0' and c <= '9') {
+                                            clean_size[clean_len] = c;
+                                            clean_len += 1;
+                                        }
                                     }
+                                    info.disk_size = std.fmt.parseInt(u64, clean_size[0..clean_len], 10) catch 0;
                                 }
-                                info.disk_size = std.fmt.parseInt(u64, clean_size[0..clean_len], 10) catch 0;
                             }
                         }
                     }
-                }
 
-                // Also check for "iPod" in device info to confirm
-                if (std.mem.indexOf(u8, info_line, "iPod") != null) {
-                    info.in_disk_mode = true;
+                    // Check Media Type to confirm it's an iPod
+                    if (std.mem.indexOf(u8, info_line, "Media Type:") != null and
+                        std.mem.indexOf(u8, info_line, "iPod") != null)
+                    {
+                        info.in_disk_mode = true;
+                    }
                 }
+                return;
             }
-
-            break;
         }
     }
 }
@@ -371,20 +379,103 @@ pub fn detectIpod(allocator: std.mem.Allocator) DetectionResult {
         }
     }
 
-    // If not found via ioreg, check for disk mode directly
+    // If not found via ioreg USB parsing, try direct ioreg search
     if (!result.found) {
-        // Check diskutil for iPod
+        const ioreg_ipod = runCommand(allocator, &.{ "ioreg", "-r", "-c", "IOUSBHostDevice", "-l" }) catch return result;
+        defer allocator.free(ioreg_ipod);
+
+        // Find the iPod section specifically
+        if (std.mem.indexOf(u8, ioreg_ipod, "\"kUSBProductString\" = \"iPod\"")) |ipod_pos| {
+            result.found = true;
+
+            // Search AFTER the iPod string for idProduct (it comes after in the output)
+            // Look in the 500 bytes after the iPod string
+            const search_end = @min(ipod_pos + 500, ioreg_ipod.len);
+            const search_region = ioreg_ipod[ipod_pos..search_end];
+
+            // Try "idProduct" = NNNN" format (with spaces, standard ioreg format)
+            if (std.mem.indexOf(u8, search_region, "\"idProduct\" = ")) |id_pos| {
+                const num_start = id_pos + 14; // length of "\"idProduct\" = "
+                var num_end = num_start;
+                while (num_end < search_region.len and search_region[num_end] >= '0' and search_region[num_end] <= '9') {
+                    num_end += 1;
+                }
+                if (num_end > num_start) {
+                    result.ipod.product_id = std.fmt.parseInt(u16, search_region[num_start..num_end], 10) catch 0;
+                }
+            }
+
+            // Also try "idProduct\"=NNNN" format (no spaces, in USB Device Info dict)
+            if (result.ipod.product_id == 0) {
+                if (std.mem.indexOf(u8, search_region, "\"idProduct\"=")) |id_pos| {
+                    const num_start = id_pos + 12;
+                    var num_end = num_start;
+                    while (num_end < search_region.len and search_region[num_end] >= '0' and search_region[num_end] <= '9') {
+                        num_end += 1;
+                    }
+                    if (num_end > num_start) {
+                        result.ipod.product_id = std.fmt.parseInt(u16, search_region[num_start..num_end], 10) catch 0;
+                    }
+                }
+            }
+
+            // Extract serial - it appears BEFORE the iPod string in the output
+            // Look in the 500 bytes before the iPod string
+            const serial_search_start = if (ipod_pos > 500) ipod_pos - 500 else 0;
+            const serial_search_region = ioreg_ipod[serial_search_start..ipod_pos];
+
+            // Try "USB Serial Number" = "XXXX" format (standard ioreg format)
+            if (std.mem.indexOf(u8, serial_search_region, "\"USB Serial Number\" = \"")) |serial_idx| {
+                const start = serial_idx + 23;
+                if (std.mem.indexOfPos(u8, serial_search_region, start, "\"")) |end| {
+                    const serial = serial_search_region[start..end];
+                    const len = @min(serial.len, result.ipod.serial.len);
+                    @memcpy(result.ipod.serial[0..len], serial[0..len]);
+                    result.ipod.serial_len = len;
+                }
+            }
+
+            // Also try "kUSBSerialNumberString" format (after iPod string, in USB Device Info)
+            if (result.ipod.serial_len == 0) {
+                if (std.mem.indexOf(u8, search_region, "\"kUSBSerialNumberString\"=\"")) |serial_idx| {
+                    const start = serial_idx + 25;
+                    if (std.mem.indexOfPos(u8, search_region, start, "\"")) |end| {
+                        const serial = search_region[start..end];
+                        const len = @min(serial.len, result.ipod.serial.len);
+                        @memcpy(result.ipod.serial[0..len], serial[0..len]);
+                        result.ipod.serial_len = len;
+                    }
+                }
+            }
+
+            // Determine model from product ID
+            const model_name: []const u8 = switch (result.ipod.product_id) {
+                4617 => "iPod Video 5G/5.5G", // 0x1209
+                4705 => "iPod Classic 6G", // 0x1261
+                4706 => "iPod Classic 6G 120GB", // 0x1262
+                4707 => "iPod Classic 7G", // 0x1263
+                else => "iPod",
+            };
+            @memcpy(result.ipod.product_name[0..model_name.len], model_name);
+            result.ipod.product_name_len = model_name.len;
+        }
+
+        // Find disk device
+        findDiskDevice(allocator, &result.ipod) catch {};
+    }
+
+    // Fallback: check for disk mode directly via diskutil
+    if (!result.found) {
         const disk_output = runCommand(allocator, &.{ "diskutil", "list" }) catch return result;
         defer allocator.free(disk_output);
 
-        if (std.mem.indexOf(u8, disk_output, "iPod") != null or
-            std.mem.indexOf(u8, disk_output, "IPOD") != null)
+        if (std.mem.indexOf(u8, disk_output, "Apple_HFS iPod") != null or
+            std.mem.indexOf(u8, disk_output, "Apple_HFS IPOD") != null)
         {
             result.found = true;
-            const name = "iPod (Disk Mode)";
+            const name = "iPod (via diskutil)";
             @memcpy(result.ipod.product_name[0..name.len], name);
             result.ipod.product_name_len = name.len;
-            result.ipod.in_disk_mode = true;
 
             findDiskDevice(allocator, &result.ipod) catch {};
         }
