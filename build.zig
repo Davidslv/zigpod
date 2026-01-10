@@ -32,14 +32,15 @@ pub fn build(b: *std.Build) void {
     const firmware = b.addExecutable(.{
         .name = "zigpod",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            // Use minimal_boot.zig directly (same as working minimal-test)
+            .root_source_file = b.path("src/kernel/minimal_boot.zig"),
             .target = arm_target,
-            .optimize = if (optimize == .Debug) .ReleaseSafe else optimize,
+            .optimize = .ReleaseSmall,
         }),
     });
 
-    // Use the single binary linker script (loads at 0x10000000)
-    firmware.setLinkerScript(b.path("linker/single_binary.ld"));
+    // Use minimal linker script (same as working minimal test)
+    firmware.setLinkerScript(b.path("linker/minimal.ld"));
 
     // Generate raw binary for flashing
     const firmware_bin = firmware.addObjCopy(.{
@@ -54,6 +55,32 @@ pub fn build(b: *std.Build) void {
 
     const firmware_step = b.step("firmware", "Build ZigPod single-binary firmware (install with: ipodpatcher -ab zigpod.bin)");
     firmware_step.dependOn(&install_bin.step);
+
+    // ============================================================
+    // Minimal Boot Test (for hardware debugging)
+    // ============================================================
+    // Builds a tiny binary that just loops - for testing if code runs at all
+
+    const minimal_test = b.addExecutable(.{
+        .name = "zigpod-minimal",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kernel/minimal_boot.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+
+    minimal_test.setLinkerScript(b.path("linker/minimal.ld"));
+
+    const minimal_bin = minimal_test.addObjCopy(.{
+        .basename = "zigpod-minimal.bin",
+        .format = .bin,
+    });
+
+    const install_minimal = b.addInstallFile(minimal_bin.getOutput(), "bin/zigpod-minimal.bin");
+
+    const minimal_step = b.step("minimal-test", "Build minimal test binary (just infinite loop)");
+    minimal_step.dependOn(&install_minimal.step);
 
     // ============================================================
     // ZigPod Bootloader (ARM target)

@@ -140,11 +140,18 @@ comptime {
 }
 
 fn _start_arm() callconv(.naked) noreturn {
-    // Disable interrupts, set up stack, and jump to init
-    // kernelInit is noreturn so we don't need anything after
+    // Disable interrupts (ARM7TDMI compatible - NOT cpsid which is ARMv6+)
     asm volatile (
-        \\cpsid if
-        \\ldr sp, =__stack_top
+        \\msr cpsr_c, #0xdf
+    );
+
+    // Set up stack in SDRAM (hardcoded - linker symbols may not work reliably)
+    asm volatile (
+        \\ldr sp, =0x40008000
+    );
+
+    // Jump to kernel init
+    asm volatile (
         \\b kernelInit
     );
 }
@@ -307,93 +314,59 @@ export fn handleFiq() void {
 // Initialization Functions
 // ============================================================
 
+// Inline BCM code (same as working minimal_boot.zig)
+const BCM_DATA32: *volatile u32 = @ptrFromInt(0x30000000);
+const BCM_WR_ADDR32: *volatile u32 = @ptrFromInt(0x30010000);
+const BCM_CONTROL: *volatile u16 = @ptrFromInt(0x30030000);
+const BCMA_CMDPARAM: u32 = 0xE0000;
+const BCMA_COMMAND: u32 = 0x1F8;
+const BCMCMD_LCD_UPDATE: u32 = 0xFFFF0000;
+
+fn inlineBcmWriteAddr(addr: u32) void {
+    BCM_WR_ADDR32.* = addr;
+    while ((BCM_CONTROL.* & 0x2) == 0) {
+        asm volatile ("nop");
+    }
+}
+
+fn inlineFillScreen(color: u32) void {
+    inlineBcmWriteAddr(BCMA_CMDPARAM);
+    var i: u32 = 0;
+    while (i < 320 * 240 / 2) : (i += 1) {
+        BCM_DATA32.* = color;
+    }
+    inlineBcmWriteAddr(BCMA_COMMAND);
+    BCM_DATA32.* = BCMCMD_LCD_UPDATE;
+    BCM_CONTROL.* = 0x31;
+}
+
+fn inlineDelay() void {
+    var i: u32 = 0;
+    while (i < 3000000) : (i += 1) {
+        asm volatile ("nop");
+    }
+}
+
 /// Kernel initialization - called from _start after stack setup
 export fn kernelInit() noreturn {
-    // ================================================================
-    // SINGLE BINARY APPROACH: Initialize hardware directly first
-    // This ensures LCD works before any HAL abstraction kicks in
-    // ================================================================
+    // Use inline BCM code (same as working minimal_boot.zig)
+    // Don't use bcm.zig module - it may have issues
 
-    // Step 0: Disable interrupts immediately (critical for bare metal)
-    if (is_arm) {
-        pp5021c_init.disableInterrupts();
+    // RED = We're running
+    inlineFillScreen(0xF800F800);
+    inlineDelay();
+
+    // GREEN = Still alive
+    inlineFillScreen(0x07E007E0);
+    inlineDelay();
+
+    // CYAN = Success
+    inlineFillScreen(0x07FF07FF);
+
+    // Idle loop
+    while (true) {
+        asm volatile ("nop");
     }
-
-    // Step 1: Clear BSS section
-    if (is_arm) {
-        clearBss();
-    }
-    boot_state = .bss_cleared;
-
-    // Step 2: Initialize clock system (PLL for 80MHz)
-    // This must happen early because all timing depends on it
-    if (is_arm) {
-        clock.init();
-    }
-    boot_state = .clocks_initialized;
-
-    // Step 3: Initialize SDRAM controller
-    // Required before any DRAM access
-    if (is_arm) {
-        sdram.init();
-    }
-    boot_state = .sdram_initialized;
-
-    // Step 4: Initialize cache controller
-    // Enables I-cache and D-cache for performance
-    if (is_arm) {
-        cache.init();
-    }
-    boot_state = .cache_initialized;
-
-    // Step 5: Initialize PP5021C GPIO and devices
-    // This sets up GPIO for BCM control
-    if (is_arm) {
-        pp5021c_init.initMinimal();
-    }
-
-    // Step 6: Initialize BCM2722 LCD controller
-    // This is the critical step that was missing before!
-    if (is_arm) {
-        bcm.init() catch {
-            // BCM init failed - we can't display anything
-            // Just halt here - at least we tried
-            haltLoop();
-        };
-
-        // Clear screen to black to show we're alive
-        bcm.clear(0x0000);
-    }
-
-    // Step 7: Copy IRAM sections (if any)
-    if (is_arm) {
-        copyIram();
-    }
-
-    // Step 8: Initialize mode-specific stacks (IRQ, FIQ)
-    if (is_arm) {
-        initStacks();
-    }
-    boot_state = .stacks_initialized;
-
-    // Step 9: Initialize HAL (for higher-level abstractions)
-    hal.init();
-
-    // Step 10: Initialize remaining hardware through HAL
-    // Note: LCD is already initialized via BCM, so this should skip LCD init
-    hal.current_hal.system_init() catch {
-        // Hardware init failed - halt
-        haltLoop();
-    };
-
-    boot_state = .hardware_initialized;
-    boot_state = .running;
-
-    // Enter main application
-    @import("../main.zig").main();
-
-    // Should not return
-    shutdown();
 }
 
 /// Clear BSS section to zero (ARM only)

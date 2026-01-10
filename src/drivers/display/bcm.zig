@@ -378,6 +378,29 @@ fn bcmBootstrapStage3() !void {
     }
 }
 
+/// Check if BCM is already initialized (e.g., by Apple bootloader)
+fn bcmAlreadyInitialized() bool {
+    // Check if BCM_CONTROL has the write-ready bit set
+    // If Apple bootloader initialized BCM, this should be responsive
+    const control = BCM_CONTROL.*;
+
+    // If we can read control and it's not all 1s or 0s, BCM is likely ready
+    if (control != 0 and control != 0xFFFF) {
+        // Try to check if BCM responds to command reads
+        // Wait briefly for read address to be ready
+        var timeout: u32 = 0;
+        while ((BCM_RD_ADDR.* & 1) == 0 and timeout < 1000) : (timeout += 1) {
+            asm volatile ("nop");
+        }
+
+        if (timeout < 1000) {
+            // BCM is responding - Apple already initialized it
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Full BCM initialization
 pub fn init() !void {
     if (bcm_state == .ready) {
@@ -386,6 +409,14 @@ pub fn init() !void {
 
     bcm_state = .initializing;
 
+    // Check if Apple bootloader already initialized BCM
+    if (bcmAlreadyInitialized()) {
+        // BCM is already working - skip full bootstrap
+        bcm_state = .ready;
+        return;
+    }
+
+    // Full initialization needed - BCM not yet ready
     // Initialize GPIO pins for BCM
     bcmInitGpio();
 
@@ -432,13 +463,14 @@ pub fn updateFull(framebuffer: []const u16) void {
     // Set destination address to command parameter area
     bcmWriteAddr(BCMA_CMDPARAM);
 
-    // Write framebuffer data
+    // Write framebuffer data - blast without waiting between writes
     for (framebuffer) |pixel| {
         BCM_DATA.* = pixel;
     }
 
-    // Trigger LCD update
-    bcmWrite32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
+    // Trigger LCD update (matching working minimal test pattern)
+    bcmWriteAddr(BCMA_COMMAND);
+    BCM_DATA32.* = BCMCMD_LCD_UPDATE;
     BCM_CONTROL.* = 0x31;
 }
 
@@ -479,8 +511,9 @@ pub fn updateRect(x: u16, y: u16, width: u16, height: u16, data: []const u16) vo
         }
     }
 
-    // Trigger LCD update
-    bcmWrite32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
+    // Trigger LCD update (matching working minimal test pattern)
+    bcmWriteAddr(BCMA_COMMAND);
+    BCM_DATA32.* = BCMCMD_LCD_UPDATE;
     BCM_CONTROL.* = 0x31;
 }
 
@@ -494,14 +527,17 @@ pub fn clear(color: u16) void {
 
     bcmWriteAddr(BCMA_CMDPARAM);
 
-    // Fill framebuffer with color
-    const total_pixels = @as(u32, LCD_WIDTH) * @as(u32, LCD_HEIGHT);
-    for (0..total_pixels) |_| {
-        BCM_DATA.* = color;
+    // Fill framebuffer with color using 32-bit writes (2 pixels at a time)
+    // This matches the working minimal test approach
+    const color32: u32 = @as(u32, color) | (@as(u32, color) << 16);
+    const total_words = (@as(u32, LCD_WIDTH) * @as(u32, LCD_HEIGHT)) / 2;
+    for (0..total_words) |_| {
+        BCM_DATA32.* = color32;
     }
 
     // Trigger LCD update
-    bcmWrite32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
+    bcmWriteAddr(BCMA_COMMAND);
+    BCM_DATA32.* = BCMCMD_LCD_UPDATE;
     BCM_CONTROL.* = 0x31;
 }
 
