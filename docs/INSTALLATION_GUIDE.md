@@ -115,22 +115,43 @@ Use [Win32 Disk Imager](https://sourceforge.net/projects/win32diskimager/) to cr
 
 ipodpatcher is the Rockbox tool for installing bootloaders on iPods.
 
-### macOS
+### macOS (Apple Silicon)
+
+The Rockbox ipodpatcher binary is 32-bit Intel only. On Apple Silicon Macs, use the pre-built arm64 version in this repo:
 
 ```bash
-# Download ipodpatcher
-curl -L -o ipodpatcher.dmg https://download.rockbox.org/bootloader/ipod/ipodpatcher/macosx/ipodpatcher.dmg
-
-# Mount the DMG
-hdiutil attach ipodpatcher.dmg
-
-# Copy to a convenient location
-cp /Volumes/ipodpatcher/ipodpatcher ./
-
-# Make executable
+# Use the pre-built arm64 binary
+cp tools/ipodpatcher-build/ipodpatcher-arm64 ./ipodpatcher
 chmod +x ipodpatcher
+```
 
-# Unmount
+Or build from source:
+
+```bash
+# Download Rockbox source
+mkdir -p tools/ipodpatcher-build && cd tools/ipodpatcher-build
+curl -L "https://github.com/Rockbox/rockbox/archive/refs/heads/master.zip" -o rockbox.zip
+unzip -q rockbox.zip "rockbox-master/utils/ipodpatcher/*"
+cd rockbox-master/utils/ipodpatcher
+
+# Build for arm64
+clang -o ipodpatcher -Wall -DVERSION='"5.0-zigpod"' \
+    main.c ipodpatcher.c ipodio-posix.c arc4.c fat32format.c ipodpatcher-aupd.c \
+    -framework IOKit -framework CoreFoundation
+
+# Copy to project root
+cp ipodpatcher ../../../ipodpatcher-arm64
+cd ../../..
+```
+
+### macOS (Intel)
+
+```bash
+# Download ipodpatcher (Intel only - won't work on Apple Silicon)
+curl -L -o ipodpatcher.dmg https://download.rockbox.org/bootloader/ipod/ipodpatcher/macosx/ipodpatcher.dmg
+hdiutil attach ipodpatcher.dmg
+cp /Volumes/ipodpatcher/ipodpatcher ./
+chmod +x ipodpatcher
 hdiutil detach /Volumes/ipodpatcher
 ```
 
@@ -185,23 +206,32 @@ The bootloader enables dual-boot between ZigPod and the original Apple firmware.
 ```bash
 # Make sure iPod is in Disk Mode
 
+# Find your iPod disk device
+diskutil list | grep -A5 "external"
+# Look for Apple_partition_scheme - note the disk number (e.g., disk4)
+
+# Unmount the data partition (required to avoid "Resource busy")
+diskutil unmount /dev/diskXs3  # Replace X with your disk number
+
 # Install the ZigPod bootloader
-sudo ./ipodpatcher -a zig-out/bin/zigpod-bootloader.bin
+# Use -ab flag for raw binary files
+sudo ./ipodpatcher /dev/diskX -ab zig-out/bin/zigpod-bootloader.bin
 ```
 
 You should see:
 ```
-[INFO] Scanning disk devices...
-[INFO] Ipod found - Video (64MB RAM) ("Apple iPod")
-[INFO] Reading partition table...
-[INFO] Bootloader installed successfully.
+[INFO] Reading partition table from /dev/diskX
+[INFO] Ipod model: Video (aka 5th Generation)
+[INFO] Reading original firmware...
+[INFO] Wrote XXXXXXX bytes to firmware partition
+[INFO] Bootloader zig-out/bin/zigpod-bootloader.bin written to device.
 ```
 
 ### Windows
 
 Run Command Prompt as Administrator:
 ```cmd
-ipodpatcher.exe -a zig-out\bin\zigpod-bootloader.bin
+ipodpatcher.exe -ab zig-out\bin\zigpod-bootloader.bin
 ```
 
 ---
