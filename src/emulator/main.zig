@@ -412,6 +412,11 @@ pub fn main() !void {
         lcd_mod.Lcd2Bridge.debug_block_active_false,
         lcd_mod.Lcd2Bridge.debug_pixels_remaining_zero,
     });
+    print("LCD BCM: wr_addr_count={d}, first=0x{X:0>8}, last=0x{X:0>8}\n", .{
+        lcd_mod.LcdController.debug_wr_addr_count,
+        lcd_mod.LcdController.debug_first_wr_addr,
+        lcd_mod.LcdController.debug_last_wr_addr,
+    });
 
     // ATA debug
     const ata_mod = @import("peripherals/ata.zig");
@@ -480,6 +485,33 @@ pub fn main() !void {
             emu.getPc(),
             emu.total_cycles,
         });
+    }
+
+    // Dump framebuffer to PPM file for debugging
+    if (lcd_stats.pixel_writes > 0) {
+        const fb = emu.getFramebuffer();
+        const ppm_file = std.fs.cwd().createFile("/tmp/zigpod_lcd.ppm", .{}) catch null;
+        if (ppm_file) |file| {
+            defer file.close();
+            // PPM header
+            _ = file.write("P6\n320 240\n255\n") catch {};
+            // Convert RGB565 to RGB888
+            var y: u32 = 0;
+            while (y < 240) : (y += 1) {
+                var x: u32 = 0;
+                while (x < 320) : (x += 1) {
+                    const fb_offset = (y * 320 + x) * 2;
+                    const lo = fb[fb_offset];
+                    const hi = fb[fb_offset + 1];
+                    const rgb565 = @as(u16, lo) | (@as(u16, hi) << 8);
+                    const r = @as(u8, @truncate((rgb565 >> 11) & 0x1F)) << 3;
+                    const g = @as(u8, @truncate((rgb565 >> 5) & 0x3F)) << 2;
+                    const b = @as(u8, @truncate(rgb565 & 0x1F)) << 3;
+                    _ = file.write(&[_]u8{ r, g, b }) catch {};
+                }
+            }
+            print("Framebuffer saved to /tmp/zigpod_lcd.ppm\n", .{});
+        }
     }
 
     print("Emulator stopped.\n", .{});

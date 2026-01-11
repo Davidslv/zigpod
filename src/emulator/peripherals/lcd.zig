@@ -169,8 +169,9 @@ pub const LcdController = struct {
     pub fn writePixel(self: *Self, color: u16) void {
         const offset = (@as(usize, self.y_pos) * LCD_WIDTH + self.x_pos) * 2;
         if (offset + 1 < FRAMEBUFFER_SIZE) {
-            self.framebuffer[offset] = @truncate(color);
-            self.framebuffer[offset + 1] = @truncate(color >> 8);
+            // BCM2722 sends big-endian RGB565, swap bytes for little-endian storage
+            self.framebuffer[offset] = @truncate(color >> 8);
+            self.framebuffer[offset + 1] = @truncate(color);
             self.debug_pixel_writes += 1;
         }
 
@@ -224,15 +225,43 @@ pub const LcdController = struct {
         };
     }
 
+    /// BCM internal address for framebuffer (BCMA_CMDPARAM)
+    const BCMA_CMDPARAM: u32 = 0xE0000;
+
+    /// Debug: count WR_ADDR writes
+    pub var debug_wr_addr_count: u32 = 0;
+    pub var debug_first_wr_addr: u32 = 0;
+    pub var debug_last_wr_addr: u32 = 0;
+
     /// Write register
     pub fn write(self: *Self, offset: u32, value: u32) void {
-        switch (offset) {
+        // BCM only decodes address bits 16-18 for register selection
+        // All addresses in range 0x30000000-0x3000FFFF map to DATA32
+        const bcm_reg = offset & 0x70000;
+        switch (bcm_reg) {
             REG_DATA32 => {
-                // Interpret as two 16-bit pixels
-                self.writePixel(@truncate(value));
-                self.writePixel(@truncate(value >> 16));
+                // Write 32-bit value to BCM internal address (auto-incrementing)
+                // The framebuffer starts at BCMA_CMDPARAM (0xE0000)
+                if (self.write_addr >= BCMA_CMDPARAM) {
+                    const fb_offset = self.write_addr - BCMA_CMDPARAM;
+                    if (fb_offset + 3 < FRAMEBUFFER_SIZE) {
+                        // Write 4 bytes (2 pixels) in little-endian order
+                        self.framebuffer[fb_offset] = @truncate(value);
+                        self.framebuffer[fb_offset + 1] = @truncate(value >> 8);
+                        self.framebuffer[fb_offset + 2] = @truncate(value >> 16);
+                        self.framebuffer[fb_offset + 3] = @truncate(value >> 24);
+                        self.debug_pixel_writes += 2;
+                    }
+                }
+                // Auto-increment BCM write address
+                self.write_addr += 4;
             },
-            REG_WR_ADDR32 => self.write_addr = value,
+            REG_WR_ADDR32 => {
+                self.write_addr = value;
+                debug_wr_addr_count += 1;
+                if (debug_wr_addr_count == 1) debug_first_wr_addr = value;
+                debug_last_wr_addr = value;
+            },
             REG_CONTROL => {
                 self.control = value;
 
