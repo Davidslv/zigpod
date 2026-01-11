@@ -67,11 +67,20 @@ pub const SystemController = struct {
     /// Cache control
     cache_ctl: u32,
 
+    /// CPU control register (wake/sleep CPU)
+    cpu_ctl: u32,
+
+    /// COP control register (wake/sleep COP)
+    cop_ctl: u32,
+
     /// Device reset callback (called when a device is reset)
     reset_callback: ?*const fn (Device) void,
 
     /// Device enable callback (called when device enable changes)
     enable_callback: ?*const fn (Device, bool) void,
+
+    /// Is this being accessed by COP (for PROC_ID)
+    is_cop_access: bool,
 
     const Self = @This();
 
@@ -88,6 +97,15 @@ pub const SystemController = struct {
     const REG_DEV_INIT1: u32 = 0x40;
     const REG_DEV_INIT2: u32 = 0x44;
     const REG_CACHE_CTL: u32 = 0x80;
+
+    /// Processor control registers (base 0x60007000, offset 0x1000 from sys_ctrl)
+    const REG_CPU_CTL: u32 = 0x1000; // 0x60007000
+    const REG_COP_CTL: u32 = 0x1004; // 0x60007004
+
+    /// Processor ID register (at 0x60000000 - but treated as offset 0 for convenience)
+    /// Returns 0x55 for CPU, 0xAA for COP
+    const PROC_ID_CPU: u32 = 0x55;
+    const PROC_ID_COP: u32 = 0xAA;
 
     /// PP5021C Chip ID (returned by hardware)
     const CHIP_ID_PP5021C: u32 = 0x5021C;
@@ -109,9 +127,27 @@ pub const SystemController = struct {
             .pll_mult = 1,
             .clock_status = DEFAULT_PLL_STATUS,
             .cache_ctl = 0,
+            .cpu_ctl = 0,
+            .cop_ctl = 0,
             .reset_callback = null,
             .enable_callback = null,
+            .is_cop_access = false,
         };
+    }
+
+    /// Set whether current access is from COP (for PROC_ID)
+    pub fn setCopAccess(self: *Self, is_cop: bool) void {
+        self.is_cop_access = is_cop;
+    }
+
+    /// Check if COP is sleeping (waiting in WFI)
+    pub fn isCopSleeping(self: *const Self) bool {
+        return (self.cop_ctl & 0x80000000) != 0;
+    }
+
+    /// Wake up COP
+    pub fn wakeCop(self: *Self) void {
+        self.cop_ctl &= ~@as(u32, 0x80000000);
     }
 
     /// Set reset callback
@@ -187,8 +223,15 @@ pub const SystemController = struct {
             REG_DEV_INIT1 => self.dev_init1,
             REG_DEV_INIT2 => self.dev_init2,
             REG_CACHE_CTL => self.cache_ctl,
+            REG_CPU_CTL => self.cpu_ctl,
+            REG_COP_CTL => self.cop_ctl,
             else => 0,
         };
+    }
+
+    /// Read PROC_ID - returns different value for CPU vs COP
+    pub fn readProcId(self: *const Self) u32 {
+        return if (self.is_cop_access) PROC_ID_COP else PROC_ID_CPU;
     }
 
     /// Write register
@@ -235,6 +278,8 @@ pub const SystemController = struct {
             REG_PLL_DIV => self.pll_div = value,
             REG_PLL_STATUS => {}, // Read-only
             REG_CACHE_CTL => self.cache_ctl = value,
+            REG_CPU_CTL => self.cpu_ctl = value,
+            REG_COP_CTL => self.cop_ctl = value,
             else => {},
         }
     }

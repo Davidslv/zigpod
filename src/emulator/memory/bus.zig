@@ -29,6 +29,7 @@ pub const Region = enum {
     iram,
     lcd,
     lcd_bridge, // LCD2 bridge at 0x70008a00 (what Rockbox uses)
+    proc_id, // Processor ID at 0x60000000
     interrupt_ctrl,
     timers,
     system_ctrl,
@@ -99,6 +100,9 @@ pub const MemoryBus = struct {
     /// Debug: count of LCD bridge writes
     lcd_bridge_write_count: u32,
 
+    /// Flag indicating current access is from COP (for PROC_ID)
+    is_cop_access: bool,
+
     const Self = @This();
 
     /// Boot ROM range
@@ -127,9 +131,12 @@ pub const MemoryBus = struct {
     const TIMER_START: u32 = 0x60005000;
     const TIMER_END: u32 = 0x6000503F;
 
-    /// System Controller
+    /// Processor ID register
+    const PROC_ID_ADDR: u32 = 0x60000000;
+
+    /// System Controller (includes processor control at 0x60007000)
     const SYS_CTRL_START: u32 = 0x60006000;
-    const SYS_CTRL_END: u32 = 0x600063FF;
+    const SYS_CTRL_END: u32 = 0x60007FFF; // Extended to include CPU_CTL/COP_CTL
 
     /// Cache Controller
     const CACHE_CTRL_START: u32 = 0x6000C000;
@@ -197,6 +204,7 @@ pub const MemoryBus = struct {
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
             .lcd_bridge_write_count = 0,
+            .is_cop_access = false,
         };
     }
 
@@ -225,7 +233,13 @@ pub const MemoryBus = struct {
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
             .lcd_bridge_write_count = 0,
+            .is_cop_access = false,
         };
+    }
+
+    /// Set COP access flag (used by emulator when COP is executing)
+    pub fn setCopAccess(self: *Self, is_cop: bool) void {
+        self.is_cop_access = is_cop;
     }
 
     /// Determine which region an address belongs to
@@ -234,6 +248,7 @@ pub const MemoryBus = struct {
         if (addr >= SDRAM_START and addr <= SDRAM_END) return .sdram;
         if (addr >= LCD_START and addr <= LCD_END) return .lcd;
         if (addr >= IRAM_START and addr <= IRAM_END) return .iram;
+        if (addr == PROC_ID_ADDR) return .proc_id;
         if (addr >= INT_CTRL_START and addr <= INT_CTRL_END) return .interrupt_ctrl;
         if (addr >= TIMER_START and addr <= TIMER_END) return .timers;
         if (addr >= SYS_CTRL_START and addr <= SYS_CTRL_END) return .system_ctrl;
@@ -275,6 +290,7 @@ pub const MemoryBus = struct {
             .sdram => self.readSdram(addr),
             .iram => self.readIram(addr),
             .lcd => self.readPeripheral(self.lcd, addr, LCD_START),
+            .proc_id => if (self.is_cop_access) @as(u32, 0xAA) else @as(u32, 0x55),
             .interrupt_ctrl => self.readPeripheral(self.interrupt_ctrl, addr, INT_CTRL_START),
             .timers => self.readPeripheral(self.timers, addr, TIMER_START),
             .system_ctrl => self.readPeripheral(self.system_ctrl, addr, SYS_CTRL_START),
@@ -369,6 +385,7 @@ pub const MemoryBus = struct {
 
         switch (region) {
             .boot_rom => {}, // ROM is read-only
+            .proc_id => {}, // PROC_ID is read-only
             .sdram => self.writeSdram(addr, value),
             .iram => self.writeIram(addr, value),
             .lcd => self.writePeripheral(self.lcd, addr, LCD_START, value),
@@ -512,6 +529,7 @@ pub const MemoryBus = struct {
             .iram => "IRAM",
             .lcd => "LCD",
             .lcd_bridge => "LCD Bridge",
+            .proc_id => "Processor ID",
             .interrupt_ctrl => "Interrupt Controller",
             .timers => "Timers",
             .system_ctrl => "System Controller",

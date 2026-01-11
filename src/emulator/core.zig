@@ -310,7 +310,10 @@ pub const Emulator = struct {
         if (self.cop) |*cop| {
             if (self.sys_ctrl.isEnabled(.cop)) {
                 cop.setIrqLine(self.int_ctrl.hasPendingIrq());
+                // Set COP access flag for PROC_ID
+                self.bus.setCopAccess(true);
                 _ = cop.step(&cpu_bus);
+                self.bus.setCopAccess(false);
             }
         }
 
