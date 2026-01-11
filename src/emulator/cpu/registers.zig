@@ -369,9 +369,12 @@ pub const RegisterFile = struct {
     }
 
     /// Get PC value with pipeline offset for instruction fetch
+    /// Note: PC is already advanced by 4 (ARM) or 2 (Thumb) before execution,
+    /// so we only add the remaining offset to simulate the 3-stage pipeline.
+    /// ARM: instruction at X reads PC as X+8, but r[15] is X+4, so add 4
+    /// Thumb: instruction at X reads PC as X+4, but r[15] is X+2, so add 2
     pub fn getPcWithOffset(self: *const Self) u32 {
-        // ARM mode: PC + 8, Thumb mode: PC + 4
-        const offset: u32 = if (self.cpsr.thumb) 4 else 8;
+        const offset: u32 = if (self.cpsr.thumb) 2 else 4;
         return self.r[15] +% offset;
     }
 

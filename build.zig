@@ -272,6 +272,31 @@ pub fn build(b: *std.Build) void {
     lcd_test_step.dependOn(&install_lcd_test.step);
 
     // ============================================================
+    // Emulator Thumb Mode Test Firmware (ARM + Thumb)
+    // ============================================================
+
+    const thumb_test = b.addExecutable(.{
+        .name = "thumb-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emulator/test_firmware/thumb_test.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+
+    thumb_test.setLinkerScript(b.path("linker/emulator_test.ld"));
+
+    const thumb_test_bin = thumb_test.addObjCopy(.{
+        .basename = "thumb-test.bin",
+        .format = .bin,
+    });
+
+    const install_thumb_test = b.addInstallFile(thumb_test_bin.getOutput(), "bin/thumb-test.bin");
+
+    const thumb_test_step = b.step("thumb-test", "Build Thumb mode test firmware for emulator");
+    thumb_test_step.dependOn(&install_thumb_test.step);
+
+    // ============================================================
     // iPod Detection Tool (Host)
     // ============================================================
 
