@@ -251,20 +251,29 @@ zigpod/
 
 ## Documentation
 
+### Project Overview
+
+| Document | Description |
+|----------|-------------|
+| [Mission Statement](MISSION.md) | Project vision and principles |
+| [Development Roadmap](docs/ROADMAP.md) | Current status and next steps |
+| [Architecture](docs/ARCHITECTURE.md) | System design and components |
+
 ### User Documentation
 
 | Document | Description |
 |----------|-------------|
 | [User Guide](docs/007-user-guide.md) | Using ZigPod on your device |
 | [Simulator Guide](docs/008-simulator-guide.md) | Running and using the simulator |
+| [Installation Guide](docs/INSTALLATION_GUIDE.md) | Installing on hardware |
 
 ### Developer Documentation
 
 | Document | Description |
 |----------|-------------|
-| [Project Vision](docs/001-zigpod.md) | Project goals and guidelines |
-| [Implementation Plan](docs/003-implementation-plan.md) | Development phases |
+| [PP5020 Hardware Reference](docs/hardware/PP5020_COMPLETE_REFERENCE.md) | Complete register reference (from Rockbox) |
 | [Hardware Reference](docs/004-hardware-reference.md) | PP5021C registers and memory map |
+| [Audio System](docs/AUDIO_SYSTEM.md) | Audio pipeline architecture |
 | [iTunesDB Format](docs/005-itunesdb-format.md) | Music database format specification |
 
 ### Hardware Documentation

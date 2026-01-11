@@ -918,45 +918,52 @@ fn hwLcdWake() HalError!void {
 }
 
 // ============================================================
-// Click Wheel Functions
+// Click Wheel Functions (VERIFIED against Rockbox button-clickwheel.c)
 // ============================================================
 
 // Last wheel packet data for caching
 var wheel_last_data: u32 = 0;
 var wheel_last_read_time: u64 = 0;
+var wheel_initialized: bool = false;
 
 fn hwClickwheelInit() HalError!void {
-    // Enable optical device (click wheel)
+    // 1. Enable OPTO device (CRITICAL: use 0x00010000, NOT 0x00800000!)
     var dev_en = reg.readReg(u32, reg.DEV_EN);
     dev_en |= reg.DEV_OPTO;
     reg.writeReg(u32, reg.DEV_EN, dev_en);
 
-    // Reset optical device
+    // 2. Reset sequence
     var dev_rs = reg.readReg(u32, reg.DEV_RS);
     dev_rs |= reg.DEV_OPTO;
     reg.writeReg(u32, reg.DEV_RS, dev_rs);
-    hwDelayUs(5);
+
+    // 3. Wait minimum 5 microseconds (Rockbox does a loop)
+    hwDelayUs(10);
+
+    // 4. Release reset
     dev_rs &= ~reg.DEV_OPTO;
     reg.writeReg(u32, reg.DEV_RS, dev_rs);
 
-    // Initialize buttons
+    // 5. Enable button detection in DEV_INIT1
     var dev_init = reg.readReg(u32, reg.DEV_INIT1);
     dev_init |= reg.INIT_BUTTONS;
     reg.writeReg(u32, reg.DEV_INIT1, dev_init);
 
-    // Configure wheel interface
-    // Set sample period and enable wheel controller
-    reg.writeReg(u32, reg.WHEEL_PERIOD, reg.WHEEL_SAMPLE_RATE_MS * 1000); // Convert to us
-    reg.writeReg(u32, reg.WHEEL_CFG, reg.WHEEL_CFG_ENABLE);
+    // 6. Configure controller with CRITICAL magic values (from Rockbox)
+    reg.writeReg(u32, reg.WHEEL_CTRL, reg.WHEEL_CTRL_INIT);  // 0xC00A1F00
+    reg.writeReg(u32, reg.WHEEL_STATUS, reg.WHEEL_STATUS_INIT);  // 0x01000000
 
     // Configure hold switch GPIO as input
     hwGpioSetDirection(reg.HOLD_GPIO_PORT, reg.HOLD_GPIO_PIN, .input);
 
     hwDelayMs(10); // Allow wheel controller to stabilize
+    wheel_initialized = true;
 }
 
-/// Read raw wheel packet from controller
-fn wheelReadPacket() u32 {
+/// Read raw wheel packet from controller (following Rockbox sequence)
+fn wheelReadPacket() ?u32 {
+    if (!wheel_initialized) return null;
+
     const current_time = hwGetTicksUs();
 
     // Rate limit reads to avoid bus congestion
@@ -964,21 +971,51 @@ fn wheelReadPacket() u32 {
         return wheel_last_data;
     }
 
-    // Check if data is available
+    // Check for data availability (bit 26 of WHEEL_STATUS)
     const status = reg.readReg(u32, reg.WHEEL_STATUS);
-    if ((status & reg.WHEEL_STATUS_DATA) != 0) {
-        wheel_last_data = reg.readReg(u32, reg.WHEEL_DATA);
-        wheel_last_read_time = current_time;
+    if ((status & reg.WHEEL_STATUS_DATA_AVAIL) == 0) {
+        return wheel_last_data; // No new data, return cached
     }
 
-    return wheel_last_data;
+    // Read the wheel data packet
+    const data = reg.readReg(u32, reg.WHEEL_DATA);
+
+    // CRITICAL: Acknowledge the read (from Rockbox)
+    reg.writeReg(u32, reg.WHEEL_STATUS, status | reg.WHEEL_STATUS_ACK);
+    reg.modifyReg(reg.WHEEL_CTRL, 0, reg.WHEEL_CTRL_ACK);
+
+    // Validate packet (lower byte should be 0x1A)
+    // IMPORTANT: On 5.5G, MENU packets may NOT have bit 31 set!
+    // Use permissive validation - only check lower byte
+    if ((data & 0xFF) != reg.WHEEL_PACKET_VALID) {
+        return wheel_last_data; // Invalid packet, return cached
+    }
+
+    wheel_last_data = data;
+    wheel_last_read_time = current_time;
+    return data;
+}
+
+/// Extract button state from wheel packet (convert to normalized byte)
+fn extractButtons(packet: u32) u8 {
+    var buttons: u8 = 0;
+
+    // Extract buttons using raw bit positions from Rockbox
+    if ((packet & reg.WHEEL_BTN_SELECT_BIT) != 0) buttons |= reg.WHEEL_BTN_SELECT;
+    if ((packet & reg.WHEEL_BTN_RIGHT_BIT) != 0) buttons |= reg.WHEEL_BTN_RIGHT;
+    if ((packet & reg.WHEEL_BTN_LEFT_BIT) != 0) buttons |= reg.WHEEL_BTN_LEFT;
+    if ((packet & reg.WHEEL_BTN_PLAY_BIT) != 0) buttons |= reg.WHEEL_BTN_PLAY;
+    // CRITICAL: Check BOTH bit 12 AND bit 13 for MENU (from Rockbox)
+    if ((packet & reg.WHEEL_BTN_MENU_BIT) != 0) buttons |= reg.WHEEL_BTN_MENU;
+
+    return buttons;
 }
 
 fn hwClickwheelReadButtons() u8 {
-    const packet = wheelReadPacket();
+    const packet = wheelReadPacket() orelse return 0;
 
     // Extract button bits from packet
-    var buttons: u8 = @truncate((packet & reg.WHEEL_BUTTON_MASK) >> reg.WHEEL_BUTTON_SHIFT);
+    var buttons = extractButtons(packet);
 
     // Read hold switch from GPIO (active low typically)
     const hold_state = hwGpioRead(reg.HOLD_GPIO_PORT, reg.HOLD_GPIO_PIN);
@@ -990,9 +1027,9 @@ fn hwClickwheelReadButtons() u8 {
 }
 
 fn hwClickwheelReadPosition() u8 {
-    const packet = wheelReadPacket();
+    const packet = wheelReadPacket() orelse return 0;
 
-    // Extract position from packet
+    // Extract position from packet (bits 22-16, 7 bits)
     const position: u8 = @truncate((packet & reg.WHEEL_POSITION_MASK) >> reg.WHEEL_POSITION_SHIFT);
 
     // Clamp to valid range

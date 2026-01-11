@@ -451,49 +451,61 @@ pub const LCD_RESET_PIN: u5 = 5;
 //
 // Based on Rockbox firmware/target/arm/ipod/button-clickwheel.c
 
-// Click wheel controller registers
+// Click wheel controller registers (VERIFIED against Rockbox button-clickwheel.c)
 pub const WHEEL_BASE: usize = 0x7000C100;
-pub const WHEEL_DATA: usize = WHEEL_BASE + 0x00;      // Wheel packet data
-pub const WHEEL_CFG: usize = WHEEL_BASE + 0x04;       // Configuration
-pub const WHEEL_PERIOD: usize = WHEEL_BASE + 0x08;    // Sample period
-pub const WHEEL_STATUS: usize = WHEEL_BASE + 0x0C;    // Status register
+pub const WHEEL_CTRL: usize = WHEEL_BASE + 0x00;      // Control register (0x7000C100)
+pub const WHEEL_STATUS: usize = WHEEL_BASE + 0x04;    // Status register (0x7000C104)
+pub const WHEEL_TX: usize = WHEEL_BASE + 0x20;        // Transmit data (0x7000C120)
+pub const WHEEL_DATA: usize = WHEEL_BASE + 0x40;      // Receive data (0x7000C140)
 
-// Wheel data packet format (32-bit):
-// Bits 31-24: Touch status (0xFF = touched, 0x00 = not touched)
-// Bits 23-16: Button state
-// Bits 15-8:  Wheel position (0-95)
-// Bits 7-0:   Checksum/reserved
+// Wheel data packet format (32-bit) - from Rockbox:
+// Bit 31:     Valid flag (should be set, but 5.5G may have it unset for MENU!)
+// Bit 30:     Wheel is being touched
+// Bits 22-16: Wheel position (0-95, 7 bits)
+// Bits 13-8:  Button state (bits 8-13)
+// Bits 7-0:   Packet type (0x1A = valid packet)
 
-pub const WHEEL_TOUCH_MASK: u32 = 0xFF000000;
-pub const WHEEL_TOUCH_SHIFT: u5 = 24;
-pub const WHEEL_BUTTON_MASK: u32 = 0x00FF0000;
-pub const WHEEL_BUTTON_SHIFT: u5 = 16;
-pub const WHEEL_POSITION_MASK: u32 = 0x0000FF00;
-pub const WHEEL_POSITION_SHIFT: u5 = 8;
+// Button bits in raw wheel data (BEFORE extraction) - from Rockbox
+// These are the raw bit positions in the 32-bit wheel packet
+pub const WHEEL_BTN_SELECT_BIT: u32 = 0x00000100;  // Bit 8
+pub const WHEEL_BTN_RIGHT_BIT: u32 = 0x00000200;   // Bit 9
+pub const WHEEL_BTN_LEFT_BIT: u32 = 0x00000400;    // Bit 10
+pub const WHEEL_BTN_PLAY_BIT: u32 = 0x00000800;    // Bit 11
+pub const WHEEL_BTN_MENU_BIT: u32 = 0x00003000;    // Bits 12 AND 13 (CRITICAL: both!)
 
-// Button bits in wheel packet
+// Extracted button values (after normalization to byte)
 pub const WHEEL_BTN_SELECT: u8 = 0x01;
 pub const WHEEL_BTN_RIGHT: u8 = 0x02;
 pub const WHEEL_BTN_LEFT: u8 = 0x04;
 pub const WHEEL_BTN_PLAY: u8 = 0x08;
 pub const WHEEL_BTN_MENU: u8 = 0x10;
 
+// Wheel position extraction
+pub const WHEEL_POSITION_MASK: u32 = 0x007F0000;   // Bits 22-16 (7 bits)
+pub const WHEEL_POSITION_SHIFT: u5 = 16;
+
+// Wheel touch detection
+pub const WHEEL_TOUCH_BIT: u32 = 0x40000000;       // Bit 30
+
+// Valid packet marker
+pub const WHEEL_PACKET_VALID: u8 = 0x1A;           // Lower byte must be 0x1A
+
 // Hold switch is read from GPIO
 pub const HOLD_GPIO_PORT: u4 = GPIO_PORT_G;
 pub const HOLD_GPIO_PIN: u5 = 0;
 
-// Wheel configuration bits
-pub const WHEEL_CFG_ENABLE: u32 = 0x80000000;
-pub const WHEEL_CFG_RATE_MASK: u32 = 0x0000FF00;
-pub const WHEEL_CFG_INT_EN: u32 = 0x00000001;
+// Wheel control register magic values (from Rockbox)
+pub const WHEEL_CTRL_INIT: u32 = 0xC00A1F00;       // Initialization value
+pub const WHEEL_CTRL_ACK: u32 = 0x60000000;        // Acknowledge bits
 
-// Wheel status bits
-pub const WHEEL_STATUS_READY: u32 = 0x80000000;
-pub const WHEEL_STATUS_DATA: u32 = 0x00000001;
+// Wheel status register bits (from Rockbox)
+pub const WHEEL_STATUS_INIT: u32 = 0x01000000;     // Initial value after init
+pub const WHEEL_STATUS_DATA_AVAIL: u32 = 0x04000000; // Bit 26: Data available
+pub const WHEEL_STATUS_ACK: u32 = 0x0C000000;      // Acknowledge bits
 
 // Wheel constants
-pub const WHEEL_POSITIONS: u8 = 96;               // 0-95 positions
-pub const WHEEL_SAMPLE_RATE_MS: u32 = 10;         // 10ms sample period
+pub const WHEEL_POSITIONS: u8 = 96;                // 0-95 positions
+pub const WHEEL_SAMPLE_RATE_MS: u32 = 10;          // 10ms sample period
 
 // ============================================================
 // USB Controller

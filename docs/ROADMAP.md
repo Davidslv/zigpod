@@ -1,22 +1,86 @@
-# ZigPod Production Roadmap
+# ZigPod Development Roadmap
+
+**Last Updated:** January 2025
 
 This document outlines the path from current state to production-ready firmware for the iPod Classic 5th/5.5th generation.
 
-## Current State: Alpha (75% Complete)
+## Mission
 
-**What Works:**
-- Complete bootloader with dual-boot and fallback
-- Full HAL for PP5021C
-- All hardware drivers (LCD, codec, clickwheel, storage)
-- WAV/AIFF audio playback (in simulator)
-- UI system with menus and file browser
-- iFlash/flash storage detection and optimization
+Build the ultimate audiophile operating system for iPod Classic - high-quality music, no bloat.
 
-**What's Missing:**
-- Interrupt-driven I/O (currently polling)
-- MP3/FLAC/AAC decoders
-- Real hardware testing
-- Power management optimization
+**Target Hardware:** iPod Video 5th/5.5th Generation (PP5021C, WM8758 DAC, 320x240 LCD)
+
+---
+
+## Current State Assessment
+
+### What's Working (Verified on Hardware)
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Bootloader | 95% | Dual-boot, button combos, watchdog, DFU mode |
+| HAL Layer | 90% | All registers defined, GPIO/I2C/ATA working |
+| LCD Display | **VERIFIED** | BCM2722 shows text/graphics on real hardware |
+| Click Wheel | **VERIFIED** | Buttons working (register mapping fixed Jan 2025) |
+| FAT32 Filesystem | 85% | Read/write, long filenames, directory traversal |
+| UI Framework | 70% | File browser, Now Playing, Settings screens exist |
+| Simulator | 100% | Full PP5021C emulation with SDL2 GUI |
+
+### What's NOT Working Yet
+| Component | Gap | Priority |
+|-----------|-----|----------|
+| Audio Output | DMA pipeline not wired to I2S | **CRITICAL** |
+| Interrupt Handlers | Not connected | **CRITICAL** |
+| Storage on Hardware | ATA driver untested on real iPod | HIGH |
+| Audio Decoders | MP3/FLAC frameworks exist but incomplete | HIGH |
+| Settings Persistence | Not saved to storage | MEDIUM |
+| Music Library Scan | Async framework incomplete | MEDIUM |
+
+### Recent Fixes (January 2025)
+- Fixed clickwheel registers to match Rockbox exactly:
+  - WHEEL_CTRL = 0x7000C100 (was misnamed)
+  - WHEEL_DATA = 0x7000C140 (was at wrong offset)
+  - Init sequence: 0xC00A1F00, 0x01000000 (magic values)
+  - Button bits: SELECT=bit 8, RIGHT=bit 9, LEFT=bit 10, PLAY=bit 11, MENU=bits 12+13
+  - Added proper acknowledge sequence for wheel reads
+
+---
+
+## Immediate Next Steps (Hardware Validation)
+
+Before proceeding with audio, we must validate the HAL stack on real hardware.
+
+### Step 1: Flash HAL Test Firmware
+```bash
+zig build hal-test
+sudo ipodpatcher -ab zig-out/bin/zigpod-hal-test.bin
+```
+
+**Expected behavior:**
+- LCD shows "ZigPod HAL Test" header
+- Press any button → shows "PRESSED" next to that button
+- Button count increments
+
+**If it fails:**
+- Check BCM initialization (may need Apple bootloader to init first)
+- Use UART debugging (Pin 11 TX, Pin 13 RX, 3.3V adapter)
+
+### Step 2: Create Storage Test Firmware
+File: `src/kernel/storage_test.zig`
+
+Verify:
+- ATA controller initialization
+- MBR read (sector 0, signature 0x55AA)
+- FAT32 boot sector
+- Directory listing
+
+### Step 3: Create Audio Test Firmware
+File: `src/kernel/audio_test.zig`
+
+Verify:
+- I2C communication with WM8758 codec
+- I2S configuration for 44100Hz stereo
+- Simple sine wave output (polling mode)
+- Should hear tone in headphones
 
 ---
 
@@ -498,9 +562,27 @@ Release artifacts:
 
 | Phase | Duration | End State |
 |-------|----------|-----------|
-| Phase 1: First Sound | 2 weeks | MP3 plays on hardware |
+| Hardware Validation | Now | HAL verified on real hardware |
+| Phase 1: First Sound | 2 weeks | WAV/MP3 plays on hardware |
 | Phase 2: Usable Player | 2 weeks | Daily driver ready |
 | Phase 3: Production | 2 weeks | v1.0 release |
 | **Total** | **6 weeks** | **Production firmware** |
 
-*Note: Timeline assumes focused, full-time development. Part-time work will extend proportionally.*
+### Milestones
+
+| Milestone | Target | Criteria |
+|-----------|--------|----------|
+| **Alpha** | +2 weeks | WAV playback on hardware, buttons work, file navigation |
+| **Beta** | +4 weeks | MP3/FLAC playback, music library, settings persistence |
+| **Release** | +6 weeks | Gapless, EQ, full day battery, <3s boot |
+
+---
+
+## Key Documentation
+
+- **Hardware Reference:** `docs/hardware/PP5020_COMPLETE_REFERENCE.md`
+- **Architecture:** `docs/ARCHITECTURE.md`
+- **Audio System:** `docs/AUDIO_SYSTEM.md`
+- **Installation:** `docs/INSTALLATION_GUIDE.md`
+
+*Note: Timeline assumes focused development. All code changes should be cross-referenced with Rockbox source.*

@@ -83,6 +83,42 @@ pub fn build(b: *std.Build) void {
     minimal_step.dependOn(&install_minimal.step);
 
     // ============================================================
+    // HAL Test Firmware (ARM target)
+    // ============================================================
+    // Tests the HAL stack on real hardware: LCD, fonts, clickwheel
+
+    // Create ARM root module for hal_test imports
+    const hal_test_root_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = arm_target,
+        .optimize = .ReleaseSmall,
+    });
+
+    const hal_test = b.addExecutable(.{
+        .name = "zigpod-hal-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kernel/hal_test.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "zigpod", .module = hal_test_root_module },
+            },
+        }),
+    });
+
+    hal_test.setLinkerScript(b.path("linker/minimal.ld"));
+
+    const hal_test_bin = hal_test.addObjCopy(.{
+        .basename = "zigpod-hal-test.bin",
+        .format = .bin,
+    });
+
+    const install_hal_test = b.addInstallFile(hal_test_bin.getOutput(), "bin/zigpod-hal-test.bin");
+
+    const hal_test_step = b.step("hal-test", "Build HAL test firmware (tests LCD, fonts, clickwheel)");
+    hal_test_step.dependOn(&install_hal_test.step);
+
+    // ============================================================
     // ZigPod Bootloader (ARM target)
     // ============================================================
 
