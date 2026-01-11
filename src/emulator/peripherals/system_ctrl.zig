@@ -113,6 +113,10 @@ pub const SystemController = struct {
     /// Default PLL status indicating PLL is locked and stable
     const DEFAULT_PLL_STATUS: u32 = 0x80000000; // Bit 31 = PLL locked
 
+    /// Default COP_CTL value - bit 9 (0x200) indicates COP is sleeping/ready
+    /// Rockbox startup checks this bit before proceeding
+    const DEFAULT_COP_CTL: u32 = 0x80000200; // Bit 31 = sleeping, bit 9 = ready
+
     pub fn init() Self {
         return .{
             .dev_rs = 0,
@@ -128,7 +132,7 @@ pub const SystemController = struct {
             .clock_status = DEFAULT_PLL_STATUS,
             .cache_ctl = 0,
             .cpu_ctl = 0,
-            .cop_ctl = 0,
+            .cop_ctl = DEFAULT_COP_CTL,
             .reset_callback = null,
             .enable_callback = null,
             .is_cop_access = false,

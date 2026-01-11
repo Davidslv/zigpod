@@ -561,15 +561,16 @@ fn executeBlockTransfer(regs: *RegisterFile, bus: *const MemoryBus, instruction:
 
     // Transfer registers
     var reg_list = bt.register_list;
-    var i: u4 = 0;
-    while (reg_list != 0) : (i += 1) {
+    var i: u5 = 0; // Use u5 to avoid overflow when iterating through 16 registers
+    while (reg_list != 0 and i < 16) : (i += 1) {
         if ((reg_list & 1) != 0) {
+            const reg_num: u4 = @truncate(i);
             if (bt.is_load) {
                 const value = bus.read32(address);
-                regs.set(i, value);
+                regs.set(reg_num, value);
             } else {
-                var value = regs.get(i);
-                if (i == 15) {
+                var value = regs.get(reg_num);
+                if (reg_num == 15) {
                     value = regs.getPcWithOffset() + 4;
                 }
                 bus.write32(address, value);
