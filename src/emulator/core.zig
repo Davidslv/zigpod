@@ -517,18 +517,20 @@ pub const Emulator = struct {
             // Poll GDB for commands
             self.pollGdb();
 
-            // Check if GDB wants us halted
+            // Check if GDB wants us halted (only when connected)
             if (self.gdb) |*g| {
-                if (g.isHalted()) {
-                    // When halted, just poll GDB and don't execute
+                if (g.isConnected() and g.isHalted()) {
+                    // When halted with GDB connected, just poll and don't execute
+                    // Use Thread.sleep to avoid busy-waiting
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
 
                 // Execute one step
                 _ = self.step();
 
-                // Check for breakpoints
-                if (g.checkBreakpoint()) {
+                // Check for breakpoints (only when connected)
+                if (g.isConnected() and g.checkBreakpoint()) {
                     g.setHalted(true);
                     g.running = false;
                     g.notifyBreakpoint();

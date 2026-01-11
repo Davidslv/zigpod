@@ -118,9 +118,21 @@ pub const GdbStub = struct {
         self.halted = halted;
     }
 
-    /// Accept incoming connection (non-blocking)
+    /// Try to accept incoming connection (non-blocking using poll)
     pub fn acceptNonBlocking(self: *Self) bool {
         if (self.listener) |*listener| {
+            // Use poll to check if there's a pending connection
+            var poll_fds = [_]std.posix.pollfd{
+                .{ .fd = listener.stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+
+            const result = std.posix.poll(&poll_fds, 0) catch return false;
+            if (result == 0) {
+                // No pending connection
+                return false;
+            }
+
+            // There's a pending connection, accept it
             const conn = listener.accept() catch return false;
             self.client = conn.stream;
             return true;
@@ -140,18 +152,37 @@ pub const GdbStub = struct {
         }
     }
 
-    /// Poll for incoming data and process commands
+    /// Poll for incoming data and process commands (non-blocking)
     pub fn poll(self: *Self) void {
         if (self.client == null) return;
 
-        // Check for incoming data (non-blocking)
+        // Use poll to check if there's data available (non-blocking)
+        var poll_fds = [_]std.posix.pollfd{
+            .{ .fd = self.client.?.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+
+        const poll_result = std.posix.poll(&poll_fds, 0) catch {
+            self.client = null;
+            return;
+        };
+
+        if (poll_result == 0) {
+            // No data available
+            return;
+        }
+
+        // Check for incoming data
         var buf: [256]u8 = undefined;
         const n = self.client.?.read(&buf) catch {
             self.client = null;
             return;
         };
 
-        if (n == 0) return;
+        if (n == 0) {
+            // Connection closed
+            self.client = null;
+            return;
+        }
 
         // Append to receive buffer
         const space = self.rx_buf.len - self.rx_len;
