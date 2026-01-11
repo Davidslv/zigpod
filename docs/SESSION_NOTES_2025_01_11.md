@@ -183,6 +183,44 @@ Key files:
 
 ---
 
+## Audiophile Direction (User Decision)
+
+During this session, the user defined the project direction:
+
+**Mission**: ZigPod is to be the **best audiophile operating system** - high audio quality is the primary goal.
+
+### User Preferences
+
+| Feature | Decision | Notes |
+|---------|----------|-------|
+| Additional codecs (Opus, Vorbis, APE, WavPack) | **NOT WANTED** | Focus on core formats only |
+| LAME/iTunes gapless parsing | **YES** | Parse encoder delay/padding metadata |
+| Crossfeed DSP | **YES** | Reduce headphone stereo fatigue |
+| Better dithering | **YES** | TPDF with noise shaping |
+| High resolution (24-bit+) | **HIGHLY IMPORTANT** | Priority feature |
+| Performance optimization | **AFTER WORKING** | Get it working first |
+
+### Rockbox vs ZigPod Comparison
+
+A detailed analysis was performed comparing audio subsystems. Key findings:
+
+**Learn from Rockbox**:
+- LAME header parsing for true gapless
+- TPDF dithering implementation
+- bs2b crossfeed algorithm
+- Sample-accurate FLAC seeking
+
+**Keep from ZigPod**:
+- Dual-slot prebuffering architecture (modern gapless approach)
+- Clean Zig implementation
+- Type-safe, maintainable codebase
+
+### Documentation Created
+
+- `docs/AUDIOPHILE_VISION.md` - Comprehensive audiophile roadmap and technical details
+
+---
+
 ## Session Timestamp
 - Date: January 11, 2025
 - Last build: `zig-out/bin/zigpod.bin` (1868 bytes)

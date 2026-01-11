@@ -11,9 +11,16 @@ A from-scratch firmware written in Zig, focused exclusively on delivering the hi
 ### 1. Audio Quality Above All
 
 - Bit-perfect output to the Wolfson WM8758 DAC
-- Support for audiophile formats: FLAC, ALAC, WAV, AIFF at full resolution
+- Support for audiophile formats: FLAC, WAV, AIFF, MP3 at full resolution
+- **High resolution priority**: 24-bit audio is highly important
 - No resampling unless absolutely necessary
 - Clean signal path with minimal processing
+
+**Audiophile Features** (decided January 2025):
+- TPDF dithering with noise shaping
+- LAME/iTunes gapless metadata parsing
+- Crossfeed DSP for headphone listening
+- Sample-accurate FLAC seeking
 
 ### 2. No Bloat
 
@@ -64,3 +71,7 @@ An audiophile picks up their iPod Classic running ZigPod. They navigate to an al
 Every decision should be measured against: **Does this make the music sound better or the experience simpler?**
 
 If the answer is no, we don't need it.
+
+---
+
+*See [docs/AUDIOPHILE_VISION.md](docs/AUDIOPHILE_VISION.md) for detailed technical implementation plans.*

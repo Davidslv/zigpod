@@ -1,5 +1,11 @@
 # ZigPod OS
 
+> **WARNING: This project is under active development and is NOT ready for general use.**
+>
+> Hardware support is incomplete. Audio playback does not work yet. Storage access is being debugged.
+> If you flash this to your iPod, expect it to not function as a music player.
+> The simulator works for development purposes. See [Current Status](#current-status) below.
+
 A custom operating system for the Apple iPod Video (5th Generation), written entirely in Zig.
 
 <p align="center">
@@ -45,6 +51,19 @@ A custom operating system for the Apple iPod Video (5th Generation), written ent
 - **Complete Simulator**: PP5021C emulator with SDL2 GUI
 - **Extensive Tests**: 820+ unit tests across all modules
 - **Clean Codebase**: ~67,000 lines of documented Zig code
+
+## Current Status
+
+| Component | Simulator | Hardware | Notes |
+|-----------|-----------|----------|-------|
+| LCD Display | Works | Works | BCM2722 verified on real iPod |
+| Click Wheel | Works | Works | All 5 buttons verified |
+| Menu UI | Works | Works | Navigation functional |
+| Storage (ATA) | Works | Partial | Reads data, MBR parsing in progress |
+| Audio Playback | Works | Not tested | DMA pipeline not wired to hardware |
+| Interrupts | Simulated | Not wired | Needed for audio |
+
+**Current blocker**: Storage reads 512 bytes successfully but MBR signature bytes need debugging.
 
 ## Quick Start
 
@@ -256,6 +275,7 @@ zigpod/
 | Document | Description |
 |----------|-------------|
 | [Mission Statement](MISSION.md) | Project vision and principles |
+| [Audiophile Vision](docs/AUDIOPHILE_VISION.md) | Audio quality goals and technical roadmap |
 | [Development Roadmap](docs/ROADMAP.md) | Current status and next steps |
 | [Architecture](docs/ARCHITECTURE.md) | System design and components |
 
