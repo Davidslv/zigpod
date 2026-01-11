@@ -30,6 +30,9 @@ const lcd = @import("peripherals/lcd.zig");
 const cache_ctrl = @import("peripherals/cache_ctrl.zig");
 const dma = @import("peripherals/dma.zig");
 
+// Debug
+const gdb_stub = @import("debug/gdb_stub.zig");
+
 pub const Arm7tdmi = arm7tdmi.Arm7tdmi;
 pub const MemoryBus = bus_module.MemoryBus;
 pub const Ram = ram_module.Ram;
@@ -45,6 +48,8 @@ pub const LcdController = lcd.LcdController;
 pub const Lcd2Bridge = lcd.Lcd2Bridge;
 pub const CacheController = cache_ctrl.CacheController;
 pub const DmaController = dma.DmaController;
+pub const GdbStub = gdb_stub.GdbStub;
+pub const GdbCallbacks = gdb_stub.GdbCallbacks;
 
 /// Emulator configuration
 pub const EmulatorConfig = struct {
@@ -116,6 +121,9 @@ pub const Emulator = struct {
 
     /// LCD2 Bridge (used by Rockbox)
     lcd_bridge: Lcd2Bridge,
+
+    /// GDB stub (optional, for debugging)
+    gdb: ?GdbStub,
 
     /// Boot ROM (may be empty)
     boot_rom: []const u8,
@@ -189,6 +197,7 @@ pub const Emulator = struct {
             .wheel = wheel_instance,
             .lcd_ctrl = lcd_ctrl_instance,
             .lcd_bridge = undefined, // Will be initialized below
+            .gdb = null,
             .boot_rom = boot_rom,
             .config = config,
             .running = false,
@@ -396,6 +405,141 @@ pub const Emulator = struct {
     /// Check if CPU is in Thumb mode
     pub fn isThumb(self: *const Self) bool {
         return self.cpu.isThumb();
+    }
+
+    // === GDB Debugging Support ===
+
+    /// Enable GDB debugging on the specified port
+    pub fn enableGdb(self: *Self, port: u16) !void {
+        // Create GDB callbacks
+        const callbacks = GdbCallbacks{
+            .context = @ptrCast(self),
+            .readRegFn = gdbReadReg,
+            .writeRegFn = gdbWriteReg,
+            .readMemFn = gdbReadMem,
+            .writeMemFn = gdbWriteMem,
+            .stepFn = gdbStep,
+            .getPcFn = gdbGetPc,
+        };
+
+        self.gdb = GdbStub.init(callbacks);
+        try self.gdb.?.listen(port);
+    }
+
+    /// Close GDB connection
+    pub fn disableGdb(self: *Self) void {
+        if (self.gdb) |*g| {
+            g.close();
+        }
+        self.gdb = null;
+    }
+
+    /// Check if GDB is enabled
+    pub fn isGdbEnabled(self: *const Self) bool {
+        return self.gdb != null;
+    }
+
+    /// Poll GDB stub for commands (non-blocking)
+    pub fn pollGdb(self: *Self) void {
+        if (self.gdb) |*g| {
+            // Accept new connections
+            if (!g.isConnected()) {
+                _ = g.acceptNonBlocking();
+            }
+
+            // Process incoming commands
+            g.poll();
+        }
+    }
+
+    /// Check if GDB is halted (waiting for commands)
+    pub fn isGdbHalted(self: *const Self) bool {
+        if (self.gdb) |*g| {
+            return g.isHalted();
+        }
+        return false;
+    }
+
+    /// GDB callback: read register
+    fn gdbReadReg(ctx: *anyopaque, reg: u8) u32 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (reg < 16) {
+            return self.cpu.getReg(@intCast(reg));
+        } else if (reg == 16) {
+            // CPSR
+            return self.cpu.getCpsr();
+        }
+        return 0;
+    }
+
+    /// GDB callback: write register
+    fn gdbWriteReg(ctx: *anyopaque, reg: u8, value: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (reg < 16) {
+            self.cpu.setReg(@intCast(reg), value);
+        } else if (reg == 16) {
+            // CPSR
+            self.cpu.setCpsr(value);
+        }
+    }
+
+    /// GDB callback: read memory byte
+    fn gdbReadMem(ctx: *anyopaque, addr: u32) u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.bus.read8(addr);
+    }
+
+    /// GDB callback: write memory byte
+    fn gdbWriteMem(ctx: *anyopaque, addr: u32, value: u8) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.bus.write8(addr, value);
+    }
+
+    /// GDB callback: single step
+    fn gdbStep(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = self.step();
+    }
+
+    /// GDB callback: get PC
+    fn gdbGetPc(ctx: *anyopaque) u32 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.cpu.getPc();
+    }
+
+    /// Run with GDB debugging support
+    /// Returns cycles executed, stops when GDB halts or max_cycles reached
+    pub fn runWithGdb(self: *Self, max_cycles: u64) u64 {
+        const start_cycles = self.total_cycles;
+        self.running = true;
+
+        while (self.running and (self.total_cycles - start_cycles) < max_cycles) {
+            // Poll GDB for commands
+            self.pollGdb();
+
+            // Check if GDB wants us halted
+            if (self.gdb) |*g| {
+                if (g.isHalted()) {
+                    // When halted, just poll GDB and don't execute
+                    continue;
+                }
+
+                // Execute one step
+                _ = self.step();
+
+                // Check for breakpoints
+                if (g.checkBreakpoint()) {
+                    g.setHalted(true);
+                    g.running = false;
+                    g.notifyBreakpoint();
+                }
+            } else {
+                // No GDB, just run
+                _ = self.step();
+            }
+        }
+
+        return self.total_cycles - start_cycles;
     }
 };
 

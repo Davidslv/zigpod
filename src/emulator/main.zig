@@ -101,6 +101,7 @@ fn printUsage() void {
         \\  --debug             Enable debug output
         \\  --trace <n>         Trace first n instructions
         \\  --cycles <n>        Run for n cycles then exit (headless only)
+        \\  --gdb-port <port>   Enable GDB debugging on specified port
         \\  --help              Show this help
         \\
         \\Keyboard controls (with SDL2):
@@ -137,6 +138,7 @@ pub fn main() !void {
     var debug = false;
     var trace_count: u64 = 0;
     var max_cycles: ?u64 = null;
+    var gdb_port: ?u16 = null;
 
     // Skip program name
     _ = args.next();
@@ -186,6 +188,12 @@ pub fn main() !void {
                 return error.InvalidArguments;
             };
             max_cycles = try std.fmt.parseInt(u64, cycles_str, 10);
+        } else if (std.mem.eql(u8, arg, "--gdb-port")) {
+            const port_str = args.next() orelse {
+                printErr("Error: --gdb-port requires a port number\n", .{});
+                return error.InvalidArguments;
+            };
+            gdb_port = try std.fmt.parseInt(u16, port_str, 10);
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             disk_path = arg;
         } else {
@@ -303,6 +311,18 @@ pub fn main() !void {
         return;
     }
 
+    // Enable GDB debugging if requested
+    if (gdb_port) |port| {
+        print("Enabling GDB debugging on port {d}...\n", .{port});
+        emu.enableGdb(port) catch |err| {
+            printErr("Failed to enable GDB: {}\n", .{err});
+            return error.GdbInitFailed;
+        };
+        print("GDB stub listening on port {d}\n", .{port});
+        print("Connect with: arm-none-eabi-gdb -ex 'target remote :{d}'\n", .{port});
+        print("Waiting for GDB connection...\n", .{});
+    }
+
     // Run emulator
     if (headless or !build_options.enable_sdl2) {
         // Headless mode
@@ -313,12 +333,23 @@ pub fn main() !void {
 
         if (max_cycles) |cycles| {
             print("Running for {d} cycles...\n", .{cycles});
-            const actual_cycles = emu.run(cycles);
+            const actual_cycles = if (emu.isGdbEnabled())
+                emu.runWithGdb(cycles)
+            else
+                emu.run(cycles);
             print("Executed {d} cycles\n", .{actual_cycles});
         } else {
-            print("Running in headless mode (Ctrl+C to stop)...\n", .{});
+            if (emu.isGdbEnabled()) {
+                print("Running with GDB debugging (Ctrl+C in GDB to stop)...\n", .{});
+            } else {
+                print("Running in headless mode (Ctrl+C to stop)...\n", .{});
+            }
             while (true) {
-                _ = emu.run(1_000_000);
+                if (emu.isGdbEnabled()) {
+                    _ = emu.runWithGdb(1_000_000);
+                } else {
+                    _ = emu.run(1_000_000);
+                }
 
                 if (debug) {
                     print("Cycles: {d}, PC: 0x{X:0>8}\n", .{
