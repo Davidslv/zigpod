@@ -101,6 +101,15 @@ pub const LcdController = struct {
     /// Display update callback
     display_callback: ?*const fn (*const [FRAMEBUFFER_SIZE]u8) void,
 
+    /// Debug: pixel write count
+    debug_pixel_writes: u32,
+
+    /// Debug: update count
+    debug_update_count: u32,
+
+    /// Debug: last unexpected offset written
+    debug_last_offset: u32,
+
     const Self = @This();
 
     /// Register offsets
@@ -121,6 +130,9 @@ pub const LcdController = struct {
             .y_pos = 0,
             .update_pending = false,
             .display_callback = null,
+            .debug_pixel_writes = 0,
+            .debug_update_count = 0,
+            .debug_last_offset = 0,
         };
 
         // Initialize framebuffer to black
@@ -150,6 +162,7 @@ pub const LcdController = struct {
         if (offset + 1 < FRAMEBUFFER_SIZE) {
             self.framebuffer[offset] = @truncate(color);
             self.framebuffer[offset + 1] = @truncate(color >> 8);
+            self.debug_pixel_writes += 1;
         }
 
         // Advance position
@@ -166,9 +179,19 @@ pub const LcdController = struct {
     /// Trigger display update
     pub fn update(self: *Self) void {
         self.update_pending = false;
+        self.debug_update_count += 1;
         if (self.display_callback) |callback| {
             callback(&self.framebuffer);
         }
+    }
+
+    /// Get debug statistics
+    pub fn getDebugStats(self: *const Self) struct { pixel_writes: u32, update_count: u32, last_offset: u32 } {
+        return .{
+            .pixel_writes = self.debug_pixel_writes,
+            .update_count = self.debug_update_count,
+            .last_offset = self.debug_last_offset,
+        };
     }
 
     /// Get pixel at coordinates
@@ -219,7 +242,10 @@ pub const LcdController = struct {
                     }
                 }
             },
-            else => {},
+            else => {
+                // Debug: track unexpected offsets
+                self.debug_last_offset = offset;
+            },
         }
     }
 

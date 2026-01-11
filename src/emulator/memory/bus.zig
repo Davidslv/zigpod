@@ -89,6 +89,9 @@ pub const MemoryBus = struct {
     last_access_addr: u32,
     last_access_region: Region,
 
+    /// Debug: count of LCD writes
+    lcd_write_count: u32,
+
     const Self = @This();
 
     /// Boot ROM range
@@ -175,6 +178,7 @@ pub const MemoryBus = struct {
             .stub_registers = [_]u32{0} ** 256,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
+            .lcd_write_count = 0,
         };
     }
 
@@ -199,6 +203,7 @@ pub const MemoryBus = struct {
             .stub_registers = [_]u32{0} ** 256,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
+            .lcd_write_count = 0,
         };
     }
 
@@ -328,6 +333,11 @@ pub const MemoryBus = struct {
         const region = getRegion(addr);
         self.last_access_addr = addr;
         self.last_access_region = region;
+
+        // Debug: track LCD writes
+        if (region == .lcd) {
+            self.lcd_write_count += 1;
+        }
 
         switch (region) {
             .boot_rom => {}, // ROM is read-only

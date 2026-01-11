@@ -274,6 +274,15 @@ pub fn main() !void {
         }
     }
 
+    // Print debug stats
+    const lcd_stats = emu.lcd_ctrl.getDebugStats();
+    print("LCD stats: {d} pixel writes, {d} updates, last_offset=0x{X:0>8}\n", .{
+        lcd_stats.pixel_writes,
+        lcd_stats.update_count,
+        lcd_stats.last_offset,
+    });
+    print("Bus LCD writes: {d}\n", .{emu.bus.lcd_write_count});
+
     if (debug) {
         print("Final state: PC=0x{X:0>8}, Cycles={d}\n", .{
             emu.getPc(),
