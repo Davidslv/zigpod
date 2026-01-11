@@ -5,18 +5,20 @@
 //! Reference: Rockbox firmware/export/pp5020.h
 //!
 //! Registers (base 0x60006000):
-//! - 0x00: DEV_RS - Device reset (write 1 to reset)
-//! - 0x04: DEV_RS2 - Device reset 2
-//! - 0x08: DEV_EN - Device enable (write 1 to enable)
-//! - 0x0C: DEV_EN2 - Device enable 2
-//! - 0x10: DEV_INIT1 - Device init 1
-//! - 0x14: DEV_INIT2 - Device init 2
+//! - 0x04: DEV_RS - Device reset (write 1 to reset)
+//! - 0x08: DEV_RS2 - Device reset 2
+//! - 0x0C: DEV_EN - Device enable (write 1 to enable)
+//! - 0x10: DEV_EN2 - Device enable 2
 //! - 0x20: CLOCK_SOURCE - Clock source selection
-//! - 0x24: PLL_CONTROL - PLL configuration
-//! - 0x28: PLL_DIV - PLL divider
-//! - 0x2C: PLL_MULT - PLL multiplier
-//! - 0x30: CLOCK_STATUS - Clock status (read-only)
-//! - 0x34: CACHE_CTL - Cache control
+//! - 0x34: PLL_CONTROL - PLL configuration
+//! - 0x38: PLL_DIV - PLL divider
+//! - 0x3C: PLL_STATUS - PLL lock status (read-only)
+//! - 0x40: DEV_INIT1 - Device init 1
+//! - 0x44: DEV_INIT2 - Device init 2
+//! - 0x80: CACHE_CTL - Cache control
+//!
+//! Additional registers for hardware identification:
+//! - 0x00: Chip ID / Revision
 
 const std = @import("std");
 const bus = @import("../memory/bus.zig");
@@ -73,22 +75,25 @@ pub const SystemController = struct {
 
     const Self = @This();
 
-    /// Register offsets
-    const REG_DEV_RS: u32 = 0x00;
-    const REG_DEV_RS2: u32 = 0x04;
-    const REG_DEV_EN: u32 = 0x08;
-    const REG_DEV_EN2: u32 = 0x0C;
-    const REG_DEV_INIT1: u32 = 0x10;
-    const REG_DEV_INIT2: u32 = 0x14;
+    /// Register offsets (PP5020/PP5021C)
+    const REG_CHIP_ID: u32 = 0x00;
+    const REG_DEV_RS: u32 = 0x04;
+    const REG_DEV_RS2: u32 = 0x08;
+    const REG_DEV_EN: u32 = 0x0C;
+    const REG_DEV_EN2: u32 = 0x10;
     const REG_CLOCK_SOURCE: u32 = 0x20;
-    const REG_PLL_CONTROL: u32 = 0x24;
-    const REG_PLL_DIV: u32 = 0x28;
-    const REG_PLL_MULT: u32 = 0x2C;
-    const REG_CLOCK_STATUS: u32 = 0x30;
-    const REG_CACHE_CTL: u32 = 0x34;
+    const REG_PLL_CONTROL: u32 = 0x34;
+    const REG_PLL_DIV: u32 = 0x38;
+    const REG_PLL_STATUS: u32 = 0x3C;
+    const REG_DEV_INIT1: u32 = 0x40;
+    const REG_DEV_INIT2: u32 = 0x44;
+    const REG_CACHE_CTL: u32 = 0x80;
 
-    /// Default clock status indicating PLL is locked
-    const DEFAULT_CLOCK_STATUS: u32 = 0x80000000; // PLL locked
+    /// PP5021C Chip ID (returned by hardware)
+    const CHIP_ID_PP5021C: u32 = 0x5021C;
+
+    /// Default PLL status indicating PLL is locked and stable
+    const DEFAULT_PLL_STATUS: u32 = 0x80000000; // Bit 31 = PLL locked
 
     pub fn init() Self {
         return .{
@@ -102,7 +107,7 @@ pub const SystemController = struct {
             .pll_control = 0,
             .pll_div = 1,
             .pll_mult = 1,
-            .clock_status = DEFAULT_CLOCK_STATUS,
+            .clock_status = DEFAULT_PLL_STATUS,
             .cache_ctl = 0,
             .reset_callback = null,
             .enable_callback = null,
@@ -170,17 +175,17 @@ pub const SystemController = struct {
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
         return switch (offset) {
+            REG_CHIP_ID => CHIP_ID_PP5021C,
             REG_DEV_RS => self.dev_rs,
             REG_DEV_RS2 => self.dev_rs2,
             REG_DEV_EN => self.dev_en,
             REG_DEV_EN2 => self.dev_en2,
-            REG_DEV_INIT1 => self.dev_init1,
-            REG_DEV_INIT2 => self.dev_init2,
             REG_CLOCK_SOURCE => self.clock_source,
             REG_PLL_CONTROL => self.pll_control,
             REG_PLL_DIV => self.pll_div,
-            REG_PLL_MULT => self.pll_mult,
-            REG_CLOCK_STATUS => self.clock_status,
+            REG_PLL_STATUS => self.clock_status, // PLL locked status
+            REG_DEV_INIT1 => self.dev_init1,
+            REG_DEV_INIT2 => self.dev_init2,
             REG_CACHE_CTL => self.cache_ctl,
             else => 0,
         };
@@ -225,11 +230,10 @@ pub const SystemController = struct {
             REG_PLL_CONTROL => {
                 self.pll_control = value;
                 // When PLL is configured, set lock status
-                self.clock_status = DEFAULT_CLOCK_STATUS;
+                self.clock_status = DEFAULT_PLL_STATUS;
             },
             REG_PLL_DIV => self.pll_div = value,
-            REG_PLL_MULT => self.pll_mult = value,
-            REG_CLOCK_STATUS => {}, // Read-only
+            REG_PLL_STATUS => {}, // Read-only
             REG_CACHE_CTL => self.cache_ctl = value,
             else => {},
         }
@@ -274,17 +278,20 @@ test "clock status" {
     const sys = SystemController.init();
 
     // PLL should report locked
-    const status = sys.read(SystemController.REG_CLOCK_STATUS);
+    const status = sys.read(SystemController.REG_PLL_STATUS);
     try std.testing.expect((status & 0x80000000) != 0);
 }
 
 test "CPU frequency calculation" {
     var sys = SystemController.init();
 
-    // Set PLL to multiply by 10, divide by 3
-    // 24 * 10 / 3 = 80 MHz
-    sys.write(SystemController.REG_PLL_MULT, 10);
-    sys.write(SystemController.REG_PLL_DIV, 3);
+    // Set PLL divider directly - pll_mult defaults to 1
+    // 24 * 1 / 1 = 24 MHz with defaults
+    try std.testing.expectEqual(@as(u32, 24), sys.getCpuFreqMhz());
 
+    // Manually set the internal mult/div for testing
+    sys.pll_mult = 10;
+    sys.pll_div = 3;
+    // 24 * 10 / 3 = 80 MHz
     try std.testing.expectEqual(@as(u32, 80), sys.getCpuFreqMhz());
 }

@@ -605,11 +605,13 @@ fn executeBranch(regs: *RegisterFile, instruction: u32) u32 {
 
     if (br.link) {
         // Save return address in LR
-        regs.r[14] = regs.r[15] - 4;
+        // r[15] is already PC+4 (next instruction), which is the correct return address
+        regs.r[14] = regs.r[15];
     }
 
     // Calculate target: PC + 8 + offset*4
-    const pc = regs.r[15];
+    // Since r[15] is already PC+4, we need to add another 4 to get PC+8 behavior
+    const pc = regs.r[15] +% 4; // Add 4 to simulate PC+8
     const offset = br.getTargetOffset();
     regs.r[15] = @bitCast(@as(i32, @bitCast(pc)) +% offset);
 
