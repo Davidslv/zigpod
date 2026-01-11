@@ -31,6 +31,7 @@ pub const Region = enum {
     interrupt_ctrl,
     timers,
     system_ctrl,
+    cache_ctrl,
     dma,
     gpio,
     device_init,
@@ -72,6 +73,7 @@ pub const MemoryBus = struct {
     interrupt_ctrl: ?PeripheralHandler,
     timers: ?PeripheralHandler,
     system_ctrl: ?PeripheralHandler,
+    cache_ctrl: ?PeripheralHandler,
     dma: ?PeripheralHandler,
     gpio: ?PeripheralHandler,
     device_init: ?PeripheralHandler,
@@ -124,6 +126,10 @@ pub const MemoryBus = struct {
     const SYS_CTRL_START: u32 = 0x60006000;
     const SYS_CTRL_END: u32 = 0x600063FF;
 
+    /// Cache Controller
+    const CACHE_CTRL_START: u32 = 0x6000C000;
+    const CACHE_CTRL_END: u32 = 0x6000C0FF;
+
     /// DMA
     const DMA_START: u32 = 0x6000A000;
     const DMA_END: u32 = 0x6000BFFF;
@@ -166,6 +172,7 @@ pub const MemoryBus = struct {
             .interrupt_ctrl = null,
             .timers = null,
             .system_ctrl = null,
+            .cache_ctrl = null,
             .dma = null,
             .gpio = null,
             .device_init = null,
@@ -191,6 +198,7 @@ pub const MemoryBus = struct {
             .interrupt_ctrl = null,
             .timers = null,
             .system_ctrl = null,
+            .cache_ctrl = null,
             .dma = null,
             .gpio = null,
             .device_init = null,
@@ -216,6 +224,7 @@ pub const MemoryBus = struct {
         if (addr >= INT_CTRL_START and addr <= INT_CTRL_END) return .interrupt_ctrl;
         if (addr >= TIMER_START and addr <= TIMER_END) return .timers;
         if (addr >= SYS_CTRL_START and addr <= SYS_CTRL_END) return .system_ctrl;
+        if (addr >= CACHE_CTRL_START and addr <= CACHE_CTRL_END) return .cache_ctrl;
         if (addr >= DMA_START and addr <= DMA_END) return .dma;
         if (addr >= GPIO_START and addr <= GPIO_END) return .gpio;
         if (addr >= DEV_INIT_START and addr <= DEV_INIT_END) return .device_init;
@@ -255,6 +264,7 @@ pub const MemoryBus = struct {
             .interrupt_ctrl => self.readPeripheral(self.interrupt_ctrl, addr, INT_CTRL_START),
             .timers => self.readPeripheral(self.timers, addr, TIMER_START),
             .system_ctrl => self.readPeripheral(self.system_ctrl, addr, SYS_CTRL_START),
+            .cache_ctrl => self.readPeripheral(self.cache_ctrl, addr, CACHE_CTRL_START),
             .dma => self.readPeripheral(self.dma, addr, DMA_START),
             .gpio => self.readPeripheral(self.gpio, addr, GPIO_START),
             .device_init => self.readPeripheral(self.device_init, addr, DEV_INIT_START),
@@ -347,6 +357,7 @@ pub const MemoryBus = struct {
             .interrupt_ctrl => self.writePeripheral(self.interrupt_ctrl, addr, INT_CTRL_START, value),
             .timers => self.writePeripheral(self.timers, addr, TIMER_START, value),
             .system_ctrl => self.writePeripheral(self.system_ctrl, addr, SYS_CTRL_START, value),
+            .cache_ctrl => self.writePeripheral(self.cache_ctrl, addr, CACHE_CTRL_START, value),
             .dma => self.writePeripheral(self.dma, addr, DMA_START, value),
             .gpio => self.writePeripheral(self.gpio, addr, GPIO_START, value),
             .device_init => self.writePeripheral(self.device_init, addr, DEV_INIT_START, value),
@@ -439,6 +450,7 @@ pub const MemoryBus = struct {
             .interrupt_ctrl => self.interrupt_ctrl = handler,
             .timers => self.timers = handler,
             .system_ctrl => self.system_ctrl = handler,
+            .cache_ctrl => self.cache_ctrl = handler,
             .dma => self.dma = handler,
             .gpio => self.gpio = handler,
             .device_init => self.device_init = handler,
@@ -482,6 +494,7 @@ pub const MemoryBus = struct {
             .interrupt_ctrl => "Interrupt Controller",
             .timers => "Timers",
             .system_ctrl => "System Controller",
+            .cache_ctrl => "Cache Controller",
             .dma => "DMA",
             .gpio => "GPIO",
             .device_init => "Device Init",

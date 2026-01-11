@@ -26,6 +26,7 @@ const ata = @import("peripherals/ata.zig");
 const i2s = @import("peripherals/i2s.zig");
 const clickwheel = @import("peripherals/clickwheel.zig");
 const lcd = @import("peripherals/lcd.zig");
+const cache_ctrl = @import("peripherals/cache_ctrl.zig");
 
 pub const Arm7tdmi = arm7tdmi.Arm7tdmi;
 pub const MemoryBus = bus_module.MemoryBus;
@@ -38,6 +39,7 @@ pub const AtaController = ata.AtaController;
 pub const I2sController = i2s.I2sController;
 pub const ClickWheel = clickwheel.ClickWheel;
 pub const LcdController = lcd.LcdController;
+pub const CacheController = cache_ctrl.CacheController;
 
 /// Emulator configuration
 pub const EmulatorConfig = struct {
@@ -92,6 +94,9 @@ pub const Emulator = struct {
     /// I2S audio controller
     i2s_ctrl: I2sController,
 
+    /// Cache controller
+    cache: CacheController,
+
     /// Click wheel
     wheel: ClickWheel,
 
@@ -141,6 +146,7 @@ pub const Emulator = struct {
         const sys_ctrl_instance = SystemController.init();
         const ata_ctrl_instance = AtaController.init();
         const i2s_ctrl_instance = I2sController.init();
+        const cache_instance = CacheController.init();
         const wheel_instance = ClickWheel.init();
         const lcd_ctrl_instance = LcdController.init();
 
@@ -159,6 +165,7 @@ pub const Emulator = struct {
             .sys_ctrl = sys_ctrl_instance,
             .ata_ctrl = ata_ctrl_instance,
             .i2s_ctrl = i2s_ctrl_instance,
+            .cache = cache_instance,
             .wheel = wheel_instance,
             .lcd_ctrl = lcd_ctrl_instance,
             .boot_rom = boot_rom,
@@ -187,6 +194,7 @@ pub const Emulator = struct {
         self.bus.registerPeripheral(.timers, self.timer.createHandler());
         self.bus.registerPeripheral(.gpio, self.gpio_ctrl.createHandler());
         self.bus.registerPeripheral(.system_ctrl, self.sys_ctrl.createHandler());
+        self.bus.registerPeripheral(.cache_ctrl, self.cache.createHandler());
         self.bus.registerPeripheral(.ata, self.ata_ctrl.createHandler());
         self.bus.registerPeripheral(.i2s, self.i2s_ctrl.createHandler());
         self.bus.registerPeripheral(.clickwheel, self.wheel.createHandler());
