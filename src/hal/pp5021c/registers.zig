@@ -301,21 +301,23 @@ pub const IDE1_STAT: usize = 0xC300001C;
 
 // ATA Task File Registers (memory-mapped)
 // Based on Rockbox firmware/target/arm/pp/ata-target.h
-pub const ATA_IOBASE: usize = 0xC30001E0;
-pub const ATA_CONTROL: usize = 0xC30003F6;
+// IMPORTANT: PP5020/PP5022 uses 4-byte aligned registers, NOT 1-byte offsets!
+pub const IDE_BASE: usize = 0xC3000000;
+pub const ATA_DATA: usize = IDE_BASE + 0x1E0;     // 16-bit data register
+pub const ATA_ERROR: usize = IDE_BASE + 0x1E4;    // Error register (read)
+pub const ATA_FEATURES: usize = IDE_BASE + 0x1E4; // Features register (write)
+pub const ATA_NSECTOR: usize = IDE_BASE + 0x1E8;  // Sector count
+pub const ATA_SECTOR: usize = IDE_BASE + 0x1EC;   // Sector number / LBA[0:7]
+pub const ATA_LCYL: usize = IDE_BASE + 0x1F0;     // Cylinder low / LBA[8:15]
+pub const ATA_HCYL: usize = IDE_BASE + 0x1F4;     // Cylinder high / LBA[16:23]
+pub const ATA_SELECT: usize = IDE_BASE + 0x1F8;   // Device/head / LBA[24:27]
+pub const ATA_COMMAND: usize = IDE_BASE + 0x1FC;  // Command register (write)
+pub const ATA_STATUS: usize = IDE_BASE + 0x1FC;   // Status register (read)
+pub const ATA_CONTROL: usize = IDE_BASE + 0x3F8;  // Control/Alt status
+pub const ATA_ALTSTATUS: usize = ATA_CONTROL;     // Alternate status (read)
 
-// Task file register offsets from ATA_IOBASE
-pub const ATA_DATA: usize = ATA_IOBASE + 0x00; // 16-bit data register
-pub const ATA_ERROR: usize = ATA_IOBASE + 0x01; // Error register (read)
-pub const ATA_FEATURES: usize = ATA_IOBASE + 0x01; // Features register (write)
-pub const ATA_NSECTOR: usize = ATA_IOBASE + 0x02; // Sector count
-pub const ATA_SECTOR: usize = ATA_IOBASE + 0x03; // Sector number / LBA[0:7]
-pub const ATA_LCYL: usize = ATA_IOBASE + 0x04; // Cylinder low / LBA[8:15]
-pub const ATA_HCYL: usize = ATA_IOBASE + 0x05; // Cylinder high / LBA[16:23]
-pub const ATA_SELECT: usize = ATA_IOBASE + 0x06; // Device/head / LBA[24:27]
-pub const ATA_COMMAND: usize = ATA_IOBASE + 0x07; // Command register (write)
-pub const ATA_STATUS: usize = ATA_IOBASE + 0x07; // Status register (read)
-pub const ATA_ALTSTATUS: usize = ATA_CONTROL; // Alternate status (read)
+// Legacy alias for compatibility
+pub const ATA_IOBASE: usize = IDE_BASE + 0x1E0;
 
 // ATA Commands
 pub const ATA_CMD_IDENTIFY: u8 = 0xEC;

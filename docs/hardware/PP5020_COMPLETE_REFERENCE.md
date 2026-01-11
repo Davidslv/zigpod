@@ -687,20 +687,23 @@ fn setupAudioDma(buffer: []const i16) void {
 | `IDE0_CFG` | `0xC3000028` | Configuration |
 | `IDE0_CNTRLR_STAT` | `0xC30001E0` | Controller status |
 
-### ATA Task File (Standard)
+### ATA Task File (Rockbox ata-target.h verified)
 
-Base: `0xC3000000 + 0x1E0` (approximate, varies)
+**IMPORTANT**: PP5020/PP5022 uses 4-byte aligned registers!
 
-| Offset | Register |
-|--------|----------|
-| 0 | Data |
-| 1 | Error/Features |
-| 2 | Sector Count |
-| 3 | LBA Low |
-| 4 | LBA Mid |
-| 5 | LBA High |
-| 6 | Device/Head |
-| 7 | Status/Command |
+Base: `IDE_BASE = 0xC3000000`
+
+| Register | Address | Description |
+|----------|---------|-------------|
+| `ATA_DATA` | `0xC30001E0` | 16-bit data register |
+| `ATA_ERROR` | `0xC30001E4` | Error (read) / Features (write) |
+| `ATA_NSECTOR` | `0xC30001E8` | Sector count |
+| `ATA_SECTOR` | `0xC30001EC` | LBA[0:7] |
+| `ATA_LCYL` | `0xC30001F0` | LBA[8:15] |
+| `ATA_HCYL` | `0xC30001F4` | LBA[16:23] |
+| `ATA_SELECT` | `0xC30001F8` | Device/Head / LBA[24:27] |
+| `ATA_COMMAND` | `0xC30001FC` | Command (write) / Status (read) |
+| `ATA_CONTROL` | `0xC30003F8` | Control / Alt Status |
 
 ### PIO Timing Values (80MHz)
 
