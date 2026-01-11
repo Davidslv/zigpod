@@ -217,7 +217,8 @@ pub const LcdController = struct {
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
         return switch (offset) {
-            REG_CONTROL => self.control,
+            // Control register: bit 1 = ready, always indicate ready for now
+            REG_CONTROL => self.control | 0x02,
             REG_WR_ADDR32 => self.write_addr,
             else => 0,
         };

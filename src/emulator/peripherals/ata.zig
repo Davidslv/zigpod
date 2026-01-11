@@ -187,16 +187,22 @@ pub const AtaController = struct {
         self.head = (self.head & 0xF0) | @as(u8, @truncate((lba >> 24) & 0x0F));
     }
 
+    // Debug: track commands
+    pub var debug_last_cmd: u8 = 0;
+    pub var debug_cmd_count: u32 = 0;
+
     /// Execute a command
     fn executeCommand(self: *Self, cmd: u8) void {
         self.command = cmd;
+        debug_last_cmd = cmd;
+        debug_cmd_count += 1;
         self.status = Status.BSY;
         self.err = 0;
 
         switch (cmd) {
             Command.IDENTIFY => self.doIdentify(),
-            Command.READ_SECTORS => self.doReadSectors(),
-            Command.WRITE_SECTORS => self.doWriteSectors(),
+            Command.READ_SECTORS, Command.READ_MULTIPLE => self.doReadSectors(),
+            Command.WRITE_SECTORS, Command.WRITE_MULTIPLE => self.doWriteSectors(),
             Command.FLUSH_CACHE, Command.FLUSH_CACHE_EXT => {
                 // Flush is a no-op for our emulated disk
                 self.status = Status.DRDY | Status.DSC;
@@ -423,7 +429,7 @@ pub const AtaController = struct {
             REG_HCYL => self.cylinder_high,
             REG_SELECT => self.head,
             REG_COMMAND => self.status, // Reading command register returns status
-            REG_CONTROL => self.control,
+            REG_CONTROL => self.status, // Reading control register returns alternate status (no interrupt clear)
             REG_ALT_STATUS => self.status, // Alt status doesn't clear interrupt
             else => 0,
         };

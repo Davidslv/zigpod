@@ -426,6 +426,10 @@ pub fn main() !void {
         ata_mod.AtaController.debug_disk_null,
         ata_mod.AtaController.debug_mbr_sig,
     });
+    print("ATA commands: count={d}, last_cmd=0x{X:0>2}\n", .{
+        ata_mod.AtaController.debug_cmd_count,
+        ata_mod.AtaController.debug_last_cmd,
+    });
 
     // I2S debug
     const i2s_mod = @import("peripherals/i2s.zig");

@@ -30,10 +30,10 @@ const I2C_DATA2: u32 = 0x14;
 const I2C_DATA3: u32 = 0x18;
 const I2C_STATUS: u32 = 0x1C;
 
-/// I2C status bits
-const STATUS_BUSY: u32 = 0x01;
-const STATUS_ACK: u32 = 0x02;
-const STATUS_DONE: u32 = 0x04;
+/// I2C status bits (from Rockbox i2c-pp.c)
+const STATUS_BUSY: u32 = 0x40; // Bit 6: Transfer in progress
+const STATUS_ACK: u32 = 0x01; // Bit 0: ACK received
+const STATUS_DONE: u32 = 0x00; // Transfer complete (not busy)
 
 /// I2C Controller
 pub const I2cController = struct {
@@ -66,7 +66,7 @@ pub const I2cController = struct {
             .ctrl = 0,
             .addr = 0,
             .data = [_]u32{0} ** 4,
-            .status = STATUS_DONE, // Idle, ready
+            .status = STATUS_ACK, // Idle, ready with ACK
             .pcf_regs = [_]u8{0} ** 256,
             .wm_regs = [_]u16{0} ** 256,
             .current_reg = 0,
@@ -116,6 +116,15 @@ pub const I2cController = struct {
 
         // DCDCTIM (various regulator timing)
         self.pcf_regs[0x20] = 0x00;
+
+        // LEDC registers (0x36-0x37) - LED driver for backlight
+        // LEDC1: LED control 1 - bits control PWM mode
+        self.pcf_regs[0x36] = 0x00; // Off initially
+        // LEDC2: LED control 2 - brightness level
+        self.pcf_regs[0x37] = 0x00; // Zero brightness initially
+
+        // BVMC register (battery voltage monitor)
+        self.pcf_regs[0x32] = 0x00;
     }
 
     /// Initialize WM8758 audio codec defaults
@@ -252,8 +261,8 @@ pub const I2cController = struct {
             }
         }
 
-        // Transfer complete with ACK
-        self.status = STATUS_DONE | STATUS_ACK;
+        // Transfer complete with ACK (not busy, ACK received)
+        self.status = STATUS_ACK;
     }
 
     /// Get WM8758 left DAC volume (0-255)
@@ -298,7 +307,7 @@ pub const I2cController = struct {
 // Tests
 test "I2C controller initialization" {
     const i2c = I2cController.init();
-    try std.testing.expectEqual(@as(u32, STATUS_DONE), i2c.status);
+    try std.testing.expectEqual(@as(u32, STATUS_ACK), i2c.status);
 }
 
 test "I2C read PCF50605 ID" {
@@ -314,7 +323,7 @@ test "I2C read PCF50605 ID" {
 
     // Check result
     try std.testing.expectEqual(@as(u32, 0x35), i2c.data[0]);
-    try std.testing.expectEqual(@as(u32, STATUS_DONE | STATUS_ACK), i2c.status);
+    try std.testing.expectEqual(@as(u32, STATUS_ACK), i2c.status);
 }
 
 test "I2C write PCF50605 register" {
