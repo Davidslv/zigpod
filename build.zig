@@ -440,6 +440,22 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(disk_inspect);
 
+    // Rockbox-like PP5020 Test Firmware Generator
+    const gen_rockbox_test = b.addExecutable(.{
+        .name = "gen-rockbox-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_rockbox_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_rockbox_test);
+
+    const run_gen_rockbox_test = b.addRunArtifact(gen_rockbox_test);
+    run_gen_rockbox_test.step.dependOn(b.getInstallStep());
+    const gen_rockbox_test_step = b.step("gen-rockbox-test", "Generate PP5020 test firmware");
+    gen_rockbox_test_step.dependOn(&run_gen_rockbox_test.step);
+
     // ============================================================
     // UI Demo (Native with SDL2)
     // ============================================================

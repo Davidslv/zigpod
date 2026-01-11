@@ -436,14 +436,24 @@ pub fn main() !void {
     });
 
     // Memory dump for test verification at RESULT_BASE = 0x40000100 (IRAM)
+    print("\n=== Test Results at 0x40000100 ===\n", .{});
+    var offset: u32 = 0;
+    while (offset < 120) : (offset += 4) {
+        const val = emu.bus.read32(0x40000100 + offset);
+        // Try to interpret as ASCII if looks like a marker
+        if ((val >> 24) >= 0x40 and (val >> 24) <= 0x7A) {
+            const bytes: [4]u8 = @bitCast(@byteSwap(val));
+            print("  +{d:>3}: 0x{X:0>8} \"{s}\"\n", .{ offset, val, bytes });
+        } else {
+            print("  +{d:>3}: 0x{X:0>8}\n", .{ offset, val });
+        }
+    }
+    print("=================================\n", .{});
+
     const result_marker = emu.bus.read32(0x40000100);
     const result_4 = emu.bus.read32(0x40000104);
     const result_8 = emu.bus.read32(0x40000108);
     const result_12 = emu.bus.read32(0x4000010C);
-
-    // ATA test: stores 0xCAFEBABE at +0 on success, 0xDEADDEAD on failure
-    // Audio test: stores 0xA0D10001 at +0, 0xA0D10002 at +4, 0xA0D100CE at +8
-    print("Test results: [0x{X:0>8}, 0x{X:0>8}, 0x{X:0>8}, 0x{X:0>8}]\n", .{ result_marker, result_4, result_8, result_12 });
 
     if (result_marker == 0xCAFEBABE) {
         print("ATA TEST PASSED: MBR signature 0xAA55 found!\n", .{});
