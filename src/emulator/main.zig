@@ -94,6 +94,7 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --firmware <file>   Load firmware from file (at boot ROM address 0)
+        \\  --load-iram <file>  Load firmware at IRAM (0x40000000)
         \\  --load-sdram <file> Load firmware at SDRAM (0x10000000)
         \\  --sdram <size>      SDRAM size in MB (32 or 64, default: 32)
         \\  --headless          Run without display
@@ -128,6 +129,7 @@ pub fn main() !void {
     defer args.deinit();
 
     var firmware_path: ?[]const u8 = null;
+    var iram_firmware_path: ?[]const u8 = null;
     var sdram_firmware_path: ?[]const u8 = null;
     var disk_path: ?[]const u8 = null;
     var sdram_mb: usize = 32;
@@ -146,6 +148,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--firmware")) {
             firmware_path = args.next() orelse {
                 printErr("Error: --firmware requires a file path\n", .{});
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.eql(u8, arg, "--load-iram")) {
+            iram_firmware_path = args.next() orelse {
+                printErr("Error: --load-iram requires a file path\n", .{});
                 return error.InvalidArguments;
             };
         } else if (std.mem.eql(u8, arg, "--load-sdram")) {
@@ -234,11 +241,24 @@ pub fn main() !void {
     }
     defer if (sdram_firmware) |fw| allocator.free(fw);
 
+    // Load IRAM firmware if provided
+    var iram_firmware: ?[]u8 = null;
+    if (iram_firmware_path) |path| {
+        print("Loading IRAM firmware: {s}\n", .{path});
+        iram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 96 * 1024); // IRAM is 96KB
+        print("Loaded {d} bytes at IRAM (0x40000000)\n", .{iram_firmware.?.len});
+        emu.loadIram(iram_firmware.?);
+    }
+    defer if (iram_firmware) |fw| allocator.free(fw);
+
     // Reset and start
     emu.reset();
 
-    // If loading at SDRAM, set PC there
-    if (sdram_firmware_path != null) {
+    // Set PC based on where firmware was loaded
+    if (iram_firmware_path != null) {
+        emu.cpu.setPc(0x40000000);
+        print("PC set to 0x40000000 (IRAM)\n", .{});
+    } else if (sdram_firmware_path != null) {
         emu.cpu.setPc(0x10000000);
         print("PC set to 0x10000000 (SDRAM)\n", .{});
     }
