@@ -28,6 +28,7 @@ pub const Region = enum {
     sdram,
     iram,
     lcd,
+    lcd_bridge, // LCD2 bridge at 0x70008a00 (what Rockbox uses)
     interrupt_ctrl,
     timers,
     system_ctrl,
@@ -83,6 +84,7 @@ pub const MemoryBus = struct {
     clickwheel: ?PeripheralHandler,
     ata: ?PeripheralHandler,
     lcd: ?PeripheralHandler,
+    lcd_bridge: ?PeripheralHandler,
 
     /// Stub registers for unimplemented peripherals
     stub_registers: [256]u32,
@@ -93,6 +95,9 @@ pub const MemoryBus = struct {
 
     /// Debug: count of LCD writes
     lcd_write_count: u32,
+
+    /// Debug: count of LCD bridge writes
+    lcd_bridge_write_count: u32,
 
     const Self = @This();
 
@@ -158,6 +163,10 @@ pub const MemoryBus = struct {
     const CLICKWHEEL_START: u32 = 0x7000C100;
     const CLICKWHEEL_END: u32 = 0x7000C1FF;
 
+    /// LCD2 Bridge (Color LCD interface used by Rockbox)
+    const LCD_BRIDGE_START: u32 = 0x70008A00;
+    const LCD_BRIDGE_END: u32 = 0x70008BFF;
+
     /// ATA/IDE (4-byte aligned registers!)
     const ATA_START: u32 = 0xC3000000;
     const ATA_END: u32 = 0xC30003FF;
@@ -182,10 +191,12 @@ pub const MemoryBus = struct {
             .clickwheel = null,
             .ata = null,
             .lcd = null,
+            .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
+            .lcd_bridge_write_count = 0,
         };
     }
 
@@ -208,10 +219,12 @@ pub const MemoryBus = struct {
             .clickwheel = null,
             .ata = null,
             .lcd = null,
+            .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
+            .lcd_bridge_write_count = 0,
         };
     }
 
@@ -230,6 +243,7 @@ pub const MemoryBus = struct {
         if (addr >= DEV_INIT_START and addr <= DEV_INIT_END) return .device_init;
         if (addr >= GPO32_START and addr <= GPO32_END) return .gpo32;
         if (addr >= I2S_START and addr <= I2S_END) return .i2s;
+        if (addr >= LCD_BRIDGE_START and addr <= LCD_BRIDGE_END) return .lcd_bridge;
         if (addr >= I2C_START and addr <= I2C_END) return .i2c;
         if (addr >= CLICKWHEEL_START and addr <= CLICKWHEEL_END) return .clickwheel;
         if (addr >= ATA_START and addr <= ATA_END) return .ata;
@@ -272,6 +286,7 @@ pub const MemoryBus = struct {
             .i2s => self.readPeripheral(self.i2s, addr, I2S_START),
             .i2c => self.readPeripheral(self.i2c, addr, I2C_START),
             .clickwheel => self.readPeripheral(self.clickwheel, addr, CLICKWHEEL_START),
+            .lcd_bridge => self.readPeripheral(self.lcd_bridge, addr, LCD_BRIDGE_START),
             .ata => self.readPeripheral(self.ata, addr, ATA_START),
             .unmapped => 0, // Return 0 for unmapped addresses
         };
@@ -348,6 +363,9 @@ pub const MemoryBus = struct {
         if (region == .lcd) {
             self.lcd_write_count += 1;
         }
+        if (region == .lcd_bridge) {
+            self.lcd_bridge_write_count += 1;
+        }
 
         switch (region) {
             .boot_rom => {}, // ROM is read-only
@@ -365,6 +383,7 @@ pub const MemoryBus = struct {
             .i2s => self.writePeripheral(self.i2s, addr, I2S_START, value),
             .i2c => self.writePeripheral(self.i2c, addr, I2C_START, value),
             .clickwheel => self.writePeripheral(self.clickwheel, addr, CLICKWHEEL_START, value),
+            .lcd_bridge => self.writePeripheral(self.lcd_bridge, addr, LCD_BRIDGE_START, value),
             .ata => self.writePeripheral(self.ata, addr, ATA_START, value),
             .unmapped => {}, // Ignore writes to unmapped addresses
         }
@@ -460,6 +479,7 @@ pub const MemoryBus = struct {
             .clickwheel => self.clickwheel = handler,
             .ata => self.ata = handler,
             .lcd => self.lcd = handler,
+            .lcd_bridge => self.lcd_bridge = handler,
             else => {},
         }
     }
@@ -491,6 +511,7 @@ pub const MemoryBus = struct {
             .sdram => "SDRAM",
             .iram => "IRAM",
             .lcd => "LCD",
+            .lcd_bridge => "LCD Bridge",
             .interrupt_ctrl => "Interrupt Controller",
             .timers => "Timers",
             .system_ctrl => "System Controller",

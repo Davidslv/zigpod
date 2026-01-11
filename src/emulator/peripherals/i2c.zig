@@ -256,6 +256,25 @@ pub const I2cController = struct {
         self.status = STATUS_DONE | STATUS_ACK;
     }
 
+    /// Get WM8758 left DAC volume (0-255)
+    pub fn getWm8758VolumeLeft(self: *const Self) u8 {
+        return @truncate(self.wm_regs[0x0A] & 0xFF);
+    }
+
+    /// Get WM8758 right DAC volume (0-255)
+    pub fn getWm8758VolumeRight(self: *const Self) u8 {
+        return @truncate(self.wm_regs[0x0B] & 0xFF);
+    }
+
+    /// Get WM8758 master volume as a fraction (0.0 to 1.0)
+    pub fn getWm8758VolumeFraction(self: *const Self) f32 {
+        const left = self.getWm8758VolumeLeft();
+        const right = self.getWm8758VolumeRight();
+        // Average the two channels, normalize to 0.0-1.0
+        const avg: f32 = @as(f32, @floatFromInt(left)) + @as(f32, @floatFromInt(right));
+        return avg / 510.0; // 255 * 2 = 510
+    }
+
     /// Create peripheral handler for memory bus
     pub fn createHandler(self: *Self) bus.PeripheralHandler {
         return .{

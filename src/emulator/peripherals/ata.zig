@@ -293,6 +293,7 @@ pub const AtaController = struct {
 
         const lba = self.getLba();
 
+        debug_disk_reads += 1;
         if (self.disk) |disk| {
             if (!disk.read(lba, &self.data_buffer)) {
                 // Read error
@@ -301,8 +302,15 @@ pub const AtaController = struct {
                 self.assertInterrupt();
                 return;
             }
+            debug_disk_read_success += 1;
+            // Capture MBR signature if sector 0
+            if (lba == 0) {
+                debug_mbr_sig = @as(u16, self.data_buffer[510]) |
+                    (@as(u16, self.data_buffer[511]) << 8);
+            }
         } else {
             // No disk attached - return zeros
+            debug_disk_null += 1;
             @memset(&self.data_buffer, 0);
         }
 
@@ -364,6 +372,15 @@ pub const AtaController = struct {
         }
     }
 
+    /// Debug counters
+    pub var debug_data_reads: u32 = 0;
+    pub var debug_data_reads_not_ready: u32 = 0;
+    pub var debug_last_buffer_byte: u8 = 0;
+    pub var debug_disk_reads: u32 = 0;
+    pub var debug_disk_read_success: u32 = 0;
+    pub var debug_disk_null: u32 = 0;
+    pub var debug_mbr_sig: u16 = 0;
+
     /// Read register
     pub fn read(self: *Self, offset: u32) u32 {
         return switch (offset) {
@@ -371,9 +388,12 @@ pub const AtaController = struct {
             REG_TIMING1 => self.timing1,
             REG_CFG => self.config,
             REG_DATA => blk: {
+                debug_data_reads += 1;
                 if (!self.is_read or self.buffer_pos >= self.buffer_len) {
+                    debug_data_reads_not_ready += 1;
                     break :blk 0;
                 }
+                debug_last_buffer_byte = self.data_buffer[0];
                 const lo = self.data_buffer[self.buffer_pos];
                 const hi = if (self.buffer_pos + 1 < self.buffer_len)
                     self.data_buffer[self.buffer_pos + 1]

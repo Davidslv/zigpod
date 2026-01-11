@@ -85,6 +85,11 @@ pub const I2sController = struct {
     /// Sample buffer for callback
     sample_buffer: [FIFO_SIZE]AudioSample,
 
+    /// Debug counters
+    pub var debug_samples_written: u64 = 0;
+    pub var debug_callbacks_triggered: u64 = 0;
+    pub var debug_samples_sent: u64 = 0;
+
     const Self = @This();
 
     /// Register offsets
@@ -155,6 +160,8 @@ pub const I2sController = struct {
 
     /// Write sample to FIFO
     pub fn writeSample(self: *Self, sample: u32) void {
+        debug_samples_written += 1;
+
         if (self.isFifoFull()) {
             // FIFO overflow - discard oldest sample
             self.fifo_read_pos = (self.fifo_read_pos + 1) % FIFO_SIZE;
@@ -177,6 +184,8 @@ pub const I2sController = struct {
             return;
         }
 
+        debug_callbacks_triggered += 1;
+
         // Convert FIFO contents to samples
         var sample_count: usize = 0;
         while (sample_count < self.fifo_count) : (sample_count += 1) {
@@ -190,6 +199,7 @@ pub const I2sController = struct {
             };
         }
 
+        debug_samples_sent += sample_count;
         self.fifo_count = 0;
 
         // Call audio callback

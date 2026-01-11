@@ -323,6 +323,106 @@ pub fn build(b: *std.Build) void {
     ipod_detect_step.dependOn(&run_ipod_detect.step);
 
     // ============================================================
+    // Firmware Generator Tools (Host)
+    // ============================================================
+
+    // Boot Stub Generator
+    const gen_boot_stub = b.addExecutable(.{
+        .name = "gen-boot-stub",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_boot_stub.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_boot_stub);
+
+    const run_gen_boot_stub = b.addRunArtifact(gen_boot_stub);
+    run_gen_boot_stub.step.dependOn(b.getInstallStep());
+    const gen_boot_stub_step = b.step("gen-boot-stub", "Generate boot stub firmware");
+    gen_boot_stub_step.dependOn(&run_gen_boot_stub.step);
+
+    // Test Firmware Generator
+    const gen_test_firmware = b.addExecutable(.{
+        .name = "gen-test-firmware",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_test_firmware.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_test_firmware);
+
+    const run_gen_test_firmware = b.addRunArtifact(gen_test_firmware);
+    run_gen_test_firmware.step.dependOn(b.getInstallStep());
+    const gen_test_firmware_step = b.step("gen-test-firmware", "Generate test firmware");
+    gen_test_firmware_step.dependOn(&run_gen_test_firmware.step);
+
+    // IRQ Test Firmware Generator
+    const gen_irq_test = b.addExecutable(.{
+        .name = "gen-irq-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_irq_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_irq_test);
+
+    const run_gen_irq_test = b.addRunArtifact(gen_irq_test);
+    run_gen_irq_test.step.dependOn(b.getInstallStep());
+    const gen_irq_test_step = b.step("gen-irq-test", "Generate IRQ test firmware");
+    gen_irq_test_step.dependOn(&run_gen_irq_test.step);
+
+    // LCD Test Firmware Generator
+    const gen_lcd_test = b.addExecutable(.{
+        .name = "gen-lcd-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_lcd_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_lcd_test);
+
+    const run_gen_lcd_test = b.addRunArtifact(gen_lcd_test);
+    run_gen_lcd_test.step.dependOn(b.getInstallStep());
+    const gen_lcd_test_step = b.step("gen-lcd-test", "Generate LCD test firmware");
+    gen_lcd_test_step.dependOn(&run_gen_lcd_test.step);
+
+    // ATA Test Firmware Generator
+    const gen_ata_test = b.addExecutable(.{
+        .name = "gen-ata-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_ata_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_ata_test);
+
+    const run_gen_ata_test = b.addRunArtifact(gen_ata_test);
+    run_gen_ata_test.step.dependOn(b.getInstallStep());
+    const gen_ata_test_step = b.step("gen-ata-test", "Generate ATA test firmware");
+    gen_ata_test_step.dependOn(&run_gen_ata_test.step);
+
+    // Audio Test Firmware Generator
+    const gen_audio_test = b.addExecutable(.{
+        .name = "gen-audio-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_audio_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_audio_test);
+
+    const run_gen_audio_test = b.addRunArtifact(gen_audio_test);
+    run_gen_audio_test.step.dependOn(b.getInstallStep());
+    const gen_audio_test_step = b.step("gen-audio-test", "Generate audio test firmware");
+    gen_audio_test_step.dependOn(&run_gen_audio_test.step);
+
+    // ============================================================
     // UI Demo (Native with SDL2)
     // ============================================================
 

@@ -213,6 +213,8 @@ pub fn main() !void {
     });
     defer emu.deinit();
 
+    // Setup LCD bridge pointer now that emulator is in final memory location
+    emu.setupLcdBridge();
     emu.registerPeripherals();
 
     // Open disk image if provided
@@ -363,6 +365,70 @@ pub fn main() !void {
         lcd_stats.last_offset,
     });
     print("Bus LCD writes: {d}\n", .{emu.bus.lcd_write_count});
+    print("Bus LCD bridge writes: {d}\n", .{emu.bus.lcd_bridge_write_count});
+
+    // LCD2 bridge debug
+    const lcd_mod = @import("peripherals/lcd.zig");
+    print("LCD2 bridge: total={d}, data={d}, ctrl={d}, starts={d}, last_ctrl=0x{X:0>8}\n", .{
+        lcd_mod.Lcd2Bridge.debug_total_writes,
+        lcd_mod.Lcd2Bridge.debug_block_data_writes,
+        lcd_mod.Lcd2Bridge.debug_block_ctrl_writes,
+        lcd_mod.Lcd2Bridge.debug_block_start_count,
+        lcd_mod.Lcd2Bridge.debug_last_ctrl_value,
+    });
+    print("LCD2 pixels: written={d}, active_false={d}, remaining_zero={d}\n", .{
+        lcd_mod.Lcd2Bridge.debug_pixels_written,
+        lcd_mod.Lcd2Bridge.debug_block_active_false,
+        lcd_mod.Lcd2Bridge.debug_pixels_remaining_zero,
+    });
+
+    // ATA debug
+    const ata_mod = @import("peripherals/ata.zig");
+    print("ATA: data_reads={d}, not_ready={d}, first_byte=0x{X:0>2}\n", .{
+        ata_mod.AtaController.debug_data_reads,
+        ata_mod.AtaController.debug_data_reads_not_ready,
+        ata_mod.AtaController.debug_last_buffer_byte,
+    });
+    print("ATA disk: reads={d}, success={d}, null={d}, mbr_sig=0x{X:0>4}\n", .{
+        ata_mod.AtaController.debug_disk_reads,
+        ata_mod.AtaController.debug_disk_read_success,
+        ata_mod.AtaController.debug_disk_null,
+        ata_mod.AtaController.debug_mbr_sig,
+    });
+
+    // I2S debug
+    const i2s_mod = @import("peripherals/i2s.zig");
+    print("I2S: samples_written={d}, callbacks={d}, samples_sent={d}\n", .{
+        i2s_mod.I2sController.debug_samples_written,
+        i2s_mod.I2sController.debug_callbacks_triggered,
+        i2s_mod.I2sController.debug_samples_sent,
+    });
+
+    // Memory dump for test verification at RESULT_BASE = 0x40000100 (IRAM)
+    const result_marker = emu.bus.read32(0x40000100);
+    const result_4 = emu.bus.read32(0x40000104);
+    const result_8 = emu.bus.read32(0x40000108);
+    const result_12 = emu.bus.read32(0x4000010C);
+
+    // ATA test: stores 0xCAFEBABE at +0 on success, 0xDEADDEAD on failure
+    // Audio test: stores 0xA0D10001 at +0, 0xA0D10002 at +4, 0xA0D100CE at +8
+    print("Test results: [0x{X:0>8}, 0x{X:0>8}, 0x{X:0>8}, 0x{X:0>8}]\n", .{ result_marker, result_4, result_8, result_12 });
+
+    if (result_marker == 0xCAFEBABE) {
+        print("ATA TEST PASSED: MBR signature 0xAA55 found!\n", .{});
+    } else if (result_marker == 0xDEADDEAD) {
+        print("ATA TEST FAILED: MBR signature mismatch (got 0x{X:0>4})\n", .{result_4 & 0xFFFF});
+    } else if (result_marker == 0xA0D10001) {
+        print("AUDIO TEST: started\n", .{});
+        if (result_4 == 0xA0D10002) {
+            print("AUDIO TEST: I2S enabled\n", .{});
+        }
+        if (result_8 == 0xA0D100CE) {
+            print("AUDIO TEST PASSED: {d} samples written\n", .{result_12});
+        } else {
+            print("AUDIO TEST: still running (or incomplete)\n", .{});
+        }
+    }
 
     if (debug) {
         print("Final state: PC=0x{X:0>8}, Cycles={d}\n", .{

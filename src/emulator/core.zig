@@ -28,6 +28,7 @@ const i2c = @import("peripherals/i2c.zig");
 const clickwheel = @import("peripherals/clickwheel.zig");
 const lcd = @import("peripherals/lcd.zig");
 const cache_ctrl = @import("peripherals/cache_ctrl.zig");
+const dma = @import("peripherals/dma.zig");
 
 pub const Arm7tdmi = arm7tdmi.Arm7tdmi;
 pub const MemoryBus = bus_module.MemoryBus;
@@ -41,7 +42,9 @@ pub const I2sController = i2s.I2sController;
 pub const I2cController = i2c.I2cController;
 pub const ClickWheel = clickwheel.ClickWheel;
 pub const LcdController = lcd.LcdController;
+pub const Lcd2Bridge = lcd.Lcd2Bridge;
 pub const CacheController = cache_ctrl.CacheController;
+pub const DmaController = dma.DmaController;
 
 /// Emulator configuration
 pub const EmulatorConfig = struct {
@@ -102,11 +105,17 @@ pub const Emulator = struct {
     /// Cache controller
     cache: CacheController,
 
+    /// DMA controller
+    dma_ctrl: DmaController,
+
     /// Click wheel
     wheel: ClickWheel,
 
     /// LCD controller
     lcd_ctrl: LcdController,
+
+    /// LCD2 Bridge (used by Rockbox)
+    lcd_bridge: Lcd2Bridge,
 
     /// Boot ROM (may be empty)
     boot_rom: []const u8,
@@ -153,13 +162,16 @@ pub const Emulator = struct {
         const i2s_ctrl_instance = I2sController.init();
         const i2c_ctrl_instance = I2cController.init();
         const cache_instance = CacheController.init();
+        const dma_ctrl_instance = DmaController.init();
         const wheel_instance = ClickWheel.init();
         const lcd_ctrl_instance = LcdController.init();
+        // Note: lcd_bridge is initialized after struct creation
+        // because it needs a pointer to the lcd_ctrl in the struct
 
         // Calculate cycles per frame (assuming 60fps)
         const cycles_per_frame = @as(u64, config.cpu_freq_mhz) * 1_000_000 / 60;
 
-        return Self{
+        var self = Self{
             .allocator = allocator,
             .cpu = cpu,
             .cop = cop,
@@ -173,8 +185,10 @@ pub const Emulator = struct {
             .i2s_ctrl = i2s_ctrl_instance,
             .i2c_ctrl = i2c_ctrl_instance,
             .cache = cache_instance,
+            .dma_ctrl = dma_ctrl_instance,
             .wheel = wheel_instance,
             .lcd_ctrl = lcd_ctrl_instance,
+            .lcd_bridge = undefined, // Will be initialized below
             .boot_rom = boot_rom,
             .config = config,
             .running = false,
@@ -182,6 +196,18 @@ pub const Emulator = struct {
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
+
+        // Note: lcd_bridge.lcd_ctrl pointer is set up by setupLcdBridge()
+        // after the Emulator is in its final memory location
+        self.lcd_bridge = Lcd2Bridge.init(undefined);
+
+        return self;
+    }
+
+    /// Setup LCD bridge pointer after emulator is in final location
+    /// Must be called after init() before running the emulator
+    pub fn setupLcdBridge(self: *Self) void {
+        self.lcd_bridge.lcd_ctrl = &self.lcd_ctrl;
     }
 
     /// Deinitialize the emulator
@@ -195,6 +221,7 @@ pub const Emulator = struct {
         self.timer.setInterruptController(&self.int_ctrl);
         self.ata_ctrl.setInterruptController(&self.int_ctrl);
         self.i2s_ctrl.setInterruptController(&self.int_ctrl);
+        self.dma_ctrl.setInterruptController(&self.int_ctrl);
 
         // Register with memory bus
         self.bus.registerPeripheral(.interrupt_ctrl, self.int_ctrl.createHandler());
@@ -202,11 +229,13 @@ pub const Emulator = struct {
         self.bus.registerPeripheral(.gpio, self.gpio_ctrl.createHandler());
         self.bus.registerPeripheral(.system_ctrl, self.sys_ctrl.createHandler());
         self.bus.registerPeripheral(.cache_ctrl, self.cache.createHandler());
+        self.bus.registerPeripheral(.dma, self.dma_ctrl.createHandler());
         self.bus.registerPeripheral(.ata, self.ata_ctrl.createHandler());
         self.bus.registerPeripheral(.i2s, self.i2s_ctrl.createHandler());
         self.bus.registerPeripheral(.i2c, self.i2c_ctrl.createHandler());
         self.bus.registerPeripheral(.clickwheel, self.wheel.createHandler());
         self.bus.registerPeripheral(.lcd, self.lcd_ctrl.createHandler());
+        self.bus.registerPeripheral(.lcd_bridge, self.lcd_bridge.createHandler());
     }
 
     /// Reset the emulator

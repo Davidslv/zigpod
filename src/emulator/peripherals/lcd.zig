@@ -1,14 +1,23 @@
-//! BCM2722 LCD Controller
+//! BCM2722 LCD Controller and LCD2 Bridge
 //!
 //! Implements the LCD controller for iPod 5th/5.5th Gen.
 //! The BCM2722 is the display controller IC used in these iPods.
 //!
-//! Reference: Rockbox firmware/target/arm/ipod/lcd-video.c
+//! This module provides two interfaces:
 //!
-//! Registers (base 0x30000000):
-//! - 0x00000: BCM_DATA32 - 32-bit data write
-//! - 0x10000: BCM_WR_ADDR32 - Write address
-//! - 0x30000: BCM_CONTROL - Control register
+//! 1. BCM2722 Direct (base 0x30000000):
+//!    - 0x00000: BCM_DATA32 - 32-bit data write
+//!    - 0x10000: BCM_WR_ADDR32 - Write address
+//!    - 0x30000: BCM_CONTROL - Control register
+//!
+//! 2. LCD2 Bridge (base 0x70008a00) - Used by Rockbox:
+//!    - 0x0C: LCD2_PORT - Command/data port
+//!    - 0x20: LCD2_BLOCK_CTRL - Block transfer control
+//!    - 0x24: LCD2_BLOCK_CONFIG - Block transfer config
+//!    - 0x100: LCD2_BLOCK_DATA - Block data FIFO
+//!
+//! Reference: Rockbox firmware/target/arm/ipod/lcd-color_nano.c
+//!            Rockbox firmware/export/pp5020.h
 //!
 //! Display specifications:
 //! - Resolution: 320x240 pixels
@@ -282,6 +291,197 @@ pub const LcdController = struct {
             }
         }
         self.update_pending = true;
+    }
+
+    /// Create a peripheral handler for the memory bus
+    pub fn createHandler(self: *Self) bus.PeripheralHandler {
+        return .{
+            .context = @ptrCast(self),
+            .readFn = readWrapper,
+            .writeFn = writeWrapper,
+        };
+    }
+
+    fn readWrapper(ctx: *anyopaque, offset: u32) u32 {
+        const self: *const Self = @ptrCast(@alignCast(ctx));
+        return self.read(offset);
+    }
+
+    fn writeWrapper(ctx: *anyopaque, offset: u32, value: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.write(offset, value);
+    }
+};
+
+/// LCD2 Bridge Controller
+///
+/// Implements the PP5021C's LCD bridge interface used by Rockbox.
+/// This bridge provides block transfer support for efficient pixel writes.
+///
+/// Register offsets (from 0x70008a00):
+///   0x0C: LCD2_PORT - Command/data port
+///   0x20: LCD2_BLOCK_CTRL - Block transfer control
+///   0x24: LCD2_BLOCK_CONFIG - Block transfer configuration
+///   0x100: LCD2_BLOCK_DATA - Block data FIFO
+pub const Lcd2Bridge = struct {
+    /// Reference to the LCD controller (for pixel writes)
+    lcd_ctrl: *LcdController,
+
+    /// LCD2_PORT register
+    port: u32,
+
+    /// Block transfer control
+    block_ctrl: u32,
+
+    /// Block transfer configuration
+    block_config: u32,
+
+    /// Pixels remaining in current block transfer
+    pixels_remaining: u32,
+
+    /// Block transfer active flag
+    block_active: bool,
+
+    const Self = @This();
+
+    /// Register offsets (relative to 0x70008a00)
+    const REG_PORT: u32 = 0x0C;
+    const REG_BLOCK_CTRL: u32 = 0x20;
+    const REG_BLOCK_CONFIG: u32 = 0x24;
+    const REG_BLOCK_DATA: u32 = 0x100; // 0x70008b00 - 0x70008a00
+
+    /// Block control bits
+    const BLOCK_READY: u32 = 0x04000000;
+    const BLOCK_TXOK: u32 = 0x01000000;
+
+    /// Block control commands
+    const BLOCK_CMD_INIT: u32 = 0x10000080;
+    const BLOCK_CMD_START: u32 = 0x34000000;
+
+    pub fn init(lcd_ctrl: ?*LcdController) Self {
+        return .{
+            .lcd_ctrl = lcd_ctrl orelse undefined,
+            .port = 0,
+            .block_ctrl = BLOCK_READY | BLOCK_TXOK, // Ready for transfers
+            .block_config = 0,
+            .pixels_remaining = 0,
+            .block_active = false,
+        };
+    }
+
+    /// Read register
+    pub fn read(self: *const Self, offset: u32) u32 {
+        return switch (offset) {
+            REG_PORT => self.port,
+            REG_BLOCK_CTRL => self.block_ctrl,
+            REG_BLOCK_CONFIG => self.block_config,
+            else => 0,
+        };
+    }
+
+    /// Debug write count
+    pub var debug_total_writes: u32 = 0;
+    pub var debug_block_data_writes: u32 = 0;
+    pub var debug_block_ctrl_writes: u32 = 0;
+    pub var debug_block_start_count: u32 = 0;
+    pub var debug_last_ctrl_value: u32 = 0;
+    pub var debug_pixels_written: u32 = 0;
+    pub var debug_block_active_false: u32 = 0;
+    pub var debug_pixels_remaining_zero: u32 = 0;
+
+    /// Write register
+    pub fn write(self: *Self, offset: u32, value: u32) void {
+        debug_total_writes += 1;
+
+        switch (offset) {
+            REG_PORT => {
+                self.port = value;
+                // LCD2_PORT handles LCD controller commands
+                // Bit 31 = command/data flag
+                // We don't need to fully emulate the LCD controller protocol
+                // since we're directly managing the framebuffer
+            },
+            REG_BLOCK_CTRL => {
+                debug_block_ctrl_writes += 1;
+                debug_last_ctrl_value = value;
+                self.block_ctrl = value;
+
+                // Check for block transfer commands
+                if (value == BLOCK_CMD_INIT) {
+                    // Initialize block transfer
+                    self.block_active = false;
+                    self.pixels_remaining = 0;
+                    // Set ready flags
+                    self.block_ctrl = BLOCK_READY | BLOCK_TXOK;
+                } else if (value == BLOCK_CMD_START) {
+                    debug_block_start_count += 1;
+                    // Start block transfer
+                    self.block_active = true;
+                    // pixels_remaining is set from block_config
+                    // Config format: 0xC001XXXX where XXXX is byte count - 1
+                    // Use 20 bits to handle counts up to 1MB
+                    self.pixels_remaining = (self.block_config & 0xFFFFF) + 1;
+                    // Convert from bytes to pixels (2 bytes per pixel)
+                    self.pixels_remaining /= 2;
+                    // Indicate transfer in progress
+                    self.block_ctrl = BLOCK_TXOK;
+                }
+            },
+            REG_BLOCK_CONFIG => {
+                self.block_config = value;
+            },
+            REG_BLOCK_DATA, REG_BLOCK_DATA + 4, REG_BLOCK_DATA + 8, REG_BLOCK_DATA + 12 => {
+                debug_block_data_writes += 1;
+                // Block data write - each 32-bit write contains 2 RGB565 pixels
+                if (!self.block_active) {
+                    debug_block_active_false += 1;
+                } else if (self.pixels_remaining == 0) {
+                    debug_pixels_remaining_zero += 1;
+                } else {
+                    // Write first pixel (lower 16 bits)
+                    self.lcd_ctrl.writePixel(@truncate(value));
+                    debug_pixels_written += 1;
+                    self.pixels_remaining -= 1;
+
+                    // Write second pixel (upper 16 bits)
+                    if (self.pixels_remaining > 0) {
+                        self.lcd_ctrl.writePixel(@truncate(value >> 16));
+                        debug_pixels_written += 1;
+                        self.pixels_remaining -= 1;
+                    }
+
+                    // Check if transfer complete
+                    if (self.pixels_remaining == 0) {
+                        self.block_active = false;
+                        // Signal transfer complete
+                        self.block_ctrl = BLOCK_READY | BLOCK_TXOK;
+                        // Trigger display update
+                        self.lcd_ctrl.update();
+                    }
+                }
+            },
+            else => {
+                // Handle any offset in the block data range (0x100-0x1FF)
+                if (offset >= REG_BLOCK_DATA and offset < REG_BLOCK_DATA + 0x100) {
+                    // Same handling as above
+                    if (self.block_active and self.pixels_remaining > 0) {
+                        self.lcd_ctrl.writePixel(@truncate(value));
+                        if (self.pixels_remaining > 0) {
+                            self.pixels_remaining -= 1;
+                        }
+                        if (self.pixels_remaining > 0) {
+                            self.lcd_ctrl.writePixel(@truncate(value >> 16));
+                            self.pixels_remaining -= 1;
+                        }
+                        if (self.pixels_remaining == 0) {
+                            self.block_active = false;
+                            self.block_ctrl = BLOCK_READY | BLOCK_TXOK;
+                            self.lcd_ctrl.update();
+                        }
+                    }
+                }
+            },
+        }
     }
 
     /// Create a peripheral handler for the memory bus
