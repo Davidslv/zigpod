@@ -93,10 +93,12 @@ fn printUsage() void {
         \\Usage: zigpod-emulator [options] [disk-image]
         \\
         \\Options:
-        \\  --firmware <file>   Load firmware from file into IRAM
+        \\  --firmware <file>   Load firmware from file (at boot ROM address 0)
+        \\  --load-sdram <file> Load firmware at SDRAM (0x10000000)
         \\  --sdram <size>      SDRAM size in MB (32 or 64, default: 32)
         \\  --headless          Run without display
         \\  --debug             Enable debug output
+        \\  --trace <n>         Trace first n instructions
         \\  --cycles <n>        Run for n cycles then exit (headless only)
         \\  --help              Show this help
         \\
@@ -126,10 +128,12 @@ pub fn main() !void {
     defer args.deinit();
 
     var firmware_path: ?[]const u8 = null;
+    var sdram_firmware_path: ?[]const u8 = null;
     var disk_path: ?[]const u8 = null;
     var sdram_mb: usize = 32;
     var headless = false;
     var debug = false;
+    var trace_count: u64 = 0;
     var max_cycles: ?u64 = null;
 
     // Skip program name
@@ -144,6 +148,17 @@ pub fn main() !void {
                 printErr("Error: --firmware requires a file path\n", .{});
                 return error.InvalidArguments;
             };
+        } else if (std.mem.eql(u8, arg, "--load-sdram")) {
+            sdram_firmware_path = args.next() orelse {
+                printErr("Error: --load-sdram requires a file path\n", .{});
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            const trace_str = args.next() orelse {
+                printErr("Error: --trace requires a number\n", .{});
+                return error.InvalidArguments;
+            };
+            trace_count = try std.fmt.parseInt(u64, trace_str, 10);
         } else if (std.mem.eql(u8, arg, "--sdram")) {
             const size_str = args.next() orelse {
                 printErr("Error: --sdram requires a size\n", .{});
@@ -209,8 +224,24 @@ pub fn main() !void {
     }
     defer if (disk) |*d| d.deinit();
 
+    // Load SDRAM firmware if provided
+    var sdram_firmware: ?[]u8 = null;
+    if (sdram_firmware_path) |path| {
+        print("Loading SDRAM firmware: {s}\n", .{path});
+        sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+        print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{sdram_firmware.?.len});
+        emu.loadSdram(0, sdram_firmware.?);
+    }
+    defer if (sdram_firmware) |fw| allocator.free(fw);
+
     // Reset and start
     emu.reset();
+
+    // If loading at SDRAM, set PC there
+    if (sdram_firmware_path != null) {
+        emu.cpu.setPc(0x10000000);
+        print("PC set to 0x10000000 (SDRAM)\n", .{});
+    }
 
     if (debug) {
         print("CPU: PC=0x{X:0>8}, Mode={s}, Thumb={}\n", .{
@@ -218,6 +249,36 @@ pub fn main() !void {
             if (emu.cpu.getMode()) |m| @tagName(m) else "unknown",
             emu.isThumb(),
         });
+    }
+
+    // Trace mode - run n instructions with detailed output
+    if (trace_count > 0) {
+        print("Tracing first {d} instructions:\n", .{trace_count});
+        var i: u64 = 0;
+        while (i < trace_count) : (i += 1) {
+            const pc_before = emu.getPc();
+            const is_thumb = emu.isThumb();
+            const instr = if (is_thumb)
+                @as(u32, emu.bus.read16(pc_before))
+            else
+                emu.bus.read32(pc_before);
+
+            const cycles = emu.step();
+
+            print("[{d:>4}] PC=0x{X:0>8} {s} instr=0x{X:0>8} R0-3: {X:0>8} {X:0>8} {X:0>8} {X:0>8} cy={d}\n", .{
+                i,
+                pc_before,
+                if (is_thumb) "T" else "A",
+                instr,
+                emu.getReg(0),
+                emu.getReg(1),
+                emu.getReg(2),
+                emu.getReg(3),
+                cycles,
+            });
+        }
+        print("Trace complete. PC now at 0x{X:0>8}\n", .{emu.getPc()});
+        return;
     }
 
     // Run emulator
