@@ -24,3 +24,4 @@ audio-samples/*.aiff
 audio-samples/*.flac
 audio-samples/*.mp3
 audio-samples/.DS_Store
+test_disk.img
