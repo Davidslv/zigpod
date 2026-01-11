@@ -223,6 +223,9 @@ pub const Emulator = struct {
         self.i2s_ctrl.setInterruptController(&self.int_ctrl);
         self.dma_ctrl.setInterruptController(&self.int_ctrl);
 
+        // Connect I2S to I2C codec for volume control
+        self.i2s_ctrl.setCodec(&self.i2c_ctrl);
+
         // Register with memory bus
         self.bus.registerPeripheral(.interrupt_ctrl, self.int_ctrl.createHandler());
         self.bus.registerPeripheral(.timers, self.timer.createHandler());

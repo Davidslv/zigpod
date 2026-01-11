@@ -25,6 +25,7 @@
 const std = @import("std");
 const bus = @import("../memory/bus.zig");
 const interrupt_ctrl = @import("interrupt_ctrl.zig");
+const i2c = @import("i2c.zig");
 
 /// I2S sample rate (derived from clock configuration)
 pub const SampleRate = enum(u32) {
@@ -82,6 +83,9 @@ pub const I2sController = struct {
     /// Interrupt controller
     int_ctrl: ?*interrupt_ctrl.InterruptController,
 
+    /// I2C controller (for WM8758 codec volume)
+    codec: ?*const i2c.I2cController,
+
     /// Sample buffer for callback
     sample_buffer: [FIFO_SIZE]AudioSample,
 
@@ -124,6 +128,7 @@ pub const I2sController = struct {
             .fifo_count = 0,
             .audio_callback = null,
             .int_ctrl = null,
+            .codec = null,
             .sample_buffer = undefined,
         };
     }
@@ -136,6 +141,11 @@ pub const I2sController = struct {
     /// Set interrupt controller
     pub fn setInterruptController(self: *Self, ctrl: *interrupt_ctrl.InterruptController) void {
         self.int_ctrl = ctrl;
+    }
+
+    /// Set codec (for volume control)
+    pub fn setCodec(self: *Self, codec_ctrl: *const i2c.I2cController) void {
+        self.codec = codec_ctrl;
     }
 
     /// Check if I2S is enabled
@@ -186,16 +196,31 @@ pub const I2sController = struct {
 
         debug_callbacks_triggered += 1;
 
-        // Convert FIFO contents to samples
+        // Get codec volume (0-255, 255 = max)
+        var vol_left: u8 = 255;
+        var vol_right: u8 = 255;
+        if (self.codec) |codec| {
+            vol_left = codec.getWm8758VolumeLeft();
+            vol_right = codec.getWm8758VolumeRight();
+        }
+
+        // Convert FIFO contents to samples with volume applied
         var sample_count: usize = 0;
         while (sample_count < self.fifo_count) : (sample_count += 1) {
             const raw = self.fifo[self.fifo_read_pos];
             self.fifo_read_pos = (self.fifo_read_pos + 1) % FIFO_SIZE;
 
-            // Assume 16-bit stereo (left in lower 16 bits, right in upper 16 bits)
+            // Extract 16-bit samples (left in lower 16 bits, right in upper 16 bits)
+            const raw_left: i16 = @bitCast(@as(u16, @truncate(raw)));
+            const raw_right: i16 = @bitCast(@as(u16, @truncate(raw >> 16)));
+
+            // Apply volume (scale by vol/255)
+            const left: i16 = @intCast(@divTrunc(@as(i32, raw_left) * vol_left, 255));
+            const right: i16 = @intCast(@divTrunc(@as(i32, raw_right) * vol_right, 255));
+
             self.sample_buffer[sample_count] = .{
-                .left = @bitCast(@as(u16, @truncate(raw))),
-                .right = @bitCast(@as(u16, @truncate(raw >> 16))),
+                .left = left,
+                .right = right,
             };
         }
 
