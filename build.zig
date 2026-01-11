@@ -247,6 +247,31 @@ pub fn build(b: *std.Build) void {
     emulator_step.dependOn(&run_emulator.step);
 
     // ============================================================
+    // Emulator LCD Test Firmware (ARM)
+    // ============================================================
+
+    const lcd_test = b.addExecutable(.{
+        .name = "lcd-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emulator/test_firmware/lcd_test.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+
+    lcd_test.setLinkerScript(b.path("linker/emulator_test.ld"));
+
+    const lcd_test_bin = lcd_test.addObjCopy(.{
+        .basename = "lcd-test.bin",
+        .format = .bin,
+    });
+
+    const install_lcd_test = b.addInstallFile(lcd_test_bin.getOutput(), "bin/lcd-test.bin");
+
+    const lcd_test_step = b.step("lcd-test", "Build LCD test firmware for emulator");
+    lcd_test_step.dependOn(&install_lcd_test.step);
+
+    // ============================================================
     // iPod Detection Tool (Host)
     // ============================================================
 

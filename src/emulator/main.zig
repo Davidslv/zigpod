@@ -175,22 +175,23 @@ pub fn main() !void {
     // Initialize emulator
     print("ZigPod Emulator starting...\n", .{});
 
+    // Load firmware if provided (loaded as boot ROM at address 0)
+    var firmware: ?[]u8 = null;
+    if (firmware_path) |path| {
+        print("Loading firmware: {s}\n", .{path});
+        firmware = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+        print("Loaded {d} bytes\n", .{firmware.?.len});
+    }
+    defer if (firmware) |fw| allocator.free(fw);
+
     var emu = try Emulator.init(allocator, .{
         .sdram_size = sdram_mb * 1024 * 1024,
         .cpu_freq_mhz = 80,
+        .boot_rom = firmware,
     });
     defer emu.deinit();
 
     emu.registerPeripherals();
-
-    // Load firmware if provided
-    if (firmware_path) |path| {
-        print("Loading firmware: {s}\n", .{path});
-        const firmware = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-        defer allocator.free(firmware);
-        emu.loadIram(firmware);
-        print("Loaded {d} bytes\n", .{firmware.len});
-    }
 
     // Open disk image if provided
     var disk: ?FileDisk = null;
