@@ -422,6 +422,24 @@ pub fn build(b: *std.Build) void {
     const gen_audio_test_step = b.step("gen-audio-test", "Generate audio test firmware");
     gen_audio_test_step.dependOn(&run_gen_audio_test.step);
 
+    // Disk Inspection Tool
+    const disk_inspect = b.addExecutable(.{
+        .name = "disk-inspect",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/disk_inspect.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fat32", .module = b.createModule(.{
+                    .root_source_file = b.path("src/emulator/storage/fat32.zig"),
+                    .target = default_target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+    b.installArtifact(disk_inspect);
+
     // ============================================================
     // UI Demo (Native with SDL2)
     // ============================================================
