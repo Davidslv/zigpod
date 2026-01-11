@@ -208,6 +208,45 @@ pub fn build(b: *std.Build) void {
     sim_step.dependOn(&run_sim.step);
 
     // ============================================================
+    // PP5021C Emulator (Accurate ARM7TDMI + Peripherals)
+    // ============================================================
+
+    const emulator_module = b.createModule(.{
+        .root_source_file = b.path("src/emulator/main.zig"),
+        .target = default_target,
+        .optimize = optimize,
+    });
+
+    // Add SDL2 build option for emulator
+    const emulator_build_options = b.addOptions();
+    emulator_build_options.addOption(bool, "enable_sdl2", enable_sdl2);
+    emulator_module.addOptions("build_options", emulator_build_options);
+
+    const emulator_exe = b.addExecutable(.{
+        .name = "zigpod-emulator",
+        .root_module = emulator_module,
+    });
+
+    // Link SDL2 if enabled
+    if (enable_sdl2) {
+        emulator_exe.linkSystemLibrary("SDL2");
+        emulator_exe.linkLibC();
+    }
+
+    b.installArtifact(emulator_exe);
+
+    const run_emulator = b.addRunArtifact(emulator_exe);
+    run_emulator.step.dependOn(b.getInstallStep());
+
+    // Pass command line args to emulator
+    if (b.args) |args| {
+        run_emulator.addArgs(args);
+    }
+
+    const emulator_step = b.step("emulator", "Run the PP5021C emulator");
+    emulator_step.dependOn(&run_emulator.step);
+
+    // ============================================================
     // iPod Detection Tool (Host)
     // ============================================================
 
@@ -278,8 +317,24 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    // Emulator unit tests
+    const emulator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emulator/core.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_emulator_tests = b.addRunArtifact(emulator_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_emulator_tests.step);
+
+    // Dedicated emulator test step
+    const emulator_test_step = b.step("test-emulator", "Run emulator unit tests");
+    emulator_test_step.dependOn(&run_emulator_tests.step);
 
     // ============================================================
     // Integration Tests
