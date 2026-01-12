@@ -1,0 +1,244 @@
+# RTOS Scheduler Investigation
+
+## Problem Statement
+
+Apple firmware (osos.bin) is stuck in RTOS scheduler loop, never reaching peripheral initialization (LCD, timers, I2C).
+
+**Stuck PC**: 0x10229BB4 (file offset 0x229BB4)
+**Peripheral accesses**: All zero (timers, GPIO, I2C, LCD)
+
+## Investigation Log
+
+### Session 1: Initial Analysis
+
+**Date**: 2025-01-12
+
+#### Disassembly of Stuck Region
+
+```
+File offset: 0x229B68 - 0x229C10
+SDRAM address: 0x10229B68 - 0x10229C10
+```
+
+```asm
+0x229B68: push {r4, r5, lr}
+0x229B6C: movs r4, r1
+0x229B70: mov  r5, r0
+0x229B74: moveq r0, #2
+0x229B78: popeq {r4, r5, pc}      ; Return if r1 was 0
+0x229B7C: mov  r1, r4
+0x229B80: mov  r0, r5
+0x229B84: bl   0x229C10           ; Call subroutine
+0x229B88: cmp  r0, #0
+0x229B8C: popne {r4, r5, pc}      ; Return if r0 != 0
+0x229B90: ldr  r1, [0x229C0C]     ; r1 = 0x60003000 (hw_accel)
+0x229B94: ldr  ip, [r1]           ; Read [0x60003000]
+0x229B98: ldrb r2, [r5]           ; Read byte from input
+0x229B9C: ldrb lr, [r4]           ; Read byte from input
+0x229BA0: lsl  r3, r2, #1
+0x229BA4: mov  r2, #3
+0x229BA8: bic  ip, ip, r2, lsl r3
+0x229BAC: orr  r3, ip, lr, lsl r3
+0x229BB0: str  r3, [r1]           ; Write to [0x60003000]
+0x229BB4: ldr  ip, [r1, #4]       ; <-- STUCK HERE: Read [0x60003004]
+...continues manipulating 0x60003000 region...
+```
+
+#### Key Observation
+
+The code at 0x229B90 loads address `0x60003000` from a literal pool. This is the **hw_accel** region - used by Apple's RTOS for task queue management.
+
+The function:
+1. Calls a subroutine at 0x229C10
+2. If it returns 0, manipulates data at 0x60003000-0x6000303F
+3. This appears to be task state manipulation
+
+#### Questions to Answer
+
+1. What does the subroutine at 0x229C10 do?
+2. What values in 0x60003000 region indicate "task ready"?
+3. Is this the scheduler main loop or a helper function?
+4. What triggers tasks to become ready?
+
+---
+
+### Session 2: hw_accel Region Tracing
+
+**Date**: 2025-01-12
+
+#### Objective
+
+Add tracing to emulator to log all accesses to 0x60003000 region.
+
+#### Implementation
+
+TODO: Add hw_accel access logging
+
+#### Findings
+
+**hw_accel Access Pattern:**
+
+```
+Initialization sequence:
+  [0x00] 0x00 -> 0x01 -> 0x09 -> 0x19 -> 0x59 (stabilizes)
+  [0x04] 0x00 -> 0x02 -> 0x06 -> 0x26 -> 0xA6 (stabilizes)
+  [0x08] 0x00 -> 0x03 -> 0x0F -> 0x3F -> 0xFF (stabilizes)
+  [0x0C] 0x00 (never changes)
+
+Stable loop pattern:
+  READ  [0x60003000] = 0x59, WRITE 0x59
+  READ  [0x60003004] = 0xA6, WRITE 0xA6
+  READ  [0x60003008] = 0xFF, WRITE 0xFF
+  READ  [0x6000300C] = 0x00, WRITE 0x00
+  (repeats infinitely)
+```
+
+**Interpretation:**
+- Task states use 2 bits per task (4 states per task)
+- 4 words x 32 bits / 2 bits = 64 task slots
+- The scheduler is waiting for task states to CHANGE
+- No interrupts/events are triggering state changes
+
+**Stable values decoded:**
+```
+0x59 = 0b01011001 = tasks 0,3,4,6 in state 01
+0xA6 = 0b10100110 = tasks 1,2,5,7 in state 10
+0xFF = 0b11111111 = all tasks in state 11
+0x00 = 0b00000000 = all tasks in state 00
+```
+
+**Hypothesis:** State bits meaning:
+- 00 = inactive/not created
+- 01 = sleeping/blocked
+- 10 = waiting
+- 11 = ready to run
+
+The scheduler loops because no tasks reach "ready" (11) state in words 0-1
+
+---
+
+## hw_accel Region Analysis
+
+### Memory Layout (0x60003000)
+
+Based on Rockbox and observed access patterns:
+
+| Offset | Purpose (Hypothesis) |
+|--------|---------------------|
+| 0x00 | Task 0 state/priority? |
+| 0x04 | Task 1 state/priority? |
+| 0x08 | Task 2 state/priority? |
+| ... | ... |
+| 0x3C | Task 15 state/priority? |
+
+### Access Pattern from Firmware
+
+The firmware performs bit manipulation:
+```c
+// Pseudocode from disassembly
+uint32_t* hw_accel = (uint32_t*)0x60003000;
+for (int i = 0; i < 16; i++) {
+    uint32_t val = hw_accel[i];
+    // Clear 2 bits at position (index * 2)
+    val &= ~(3 << (index * 2));
+    // Set new value
+    val |= (new_state << (index * 2));
+    hw_accel[i] = val;
+}
+```
+
+This suggests each 32-bit word holds state for multiple tasks (2 bits each = 16 tasks per word).
+
+---
+
+## Hypotheses
+
+### Hypothesis 1: Timer Interrupt Needed
+
+The RTOS scheduler relies on timer interrupts to:
+1. Wake sleeping tasks
+2. Trigger task switches
+3. Update tick counter
+
+**Test**: Pre-fire timer interrupt after N cycles
+
+### Hypothesis 2: I2C Device Response Needed
+
+Early boot may require PMU (PCF50605) to respond before proceeding:
+1. Power rail status
+2. Battery level
+3. Button state
+
+**Test**: Implement basic I2C device responses
+
+### Hypothesis 3: hw_accel Pre-initialization
+
+The hw_accel region may need specific initial values for scheduler to find ready tasks.
+
+**Test**: Pre-populate 0x60003000 with "task ready" pattern
+
+---
+
+## Implementation: hw_accel Kickstart
+
+### Approach
+
+Added `kickstart_enabled` flag to MemoryBus. After 1M cycles, reads to
+hw_accel offset 0 return modified value 0x5B instead of 0x59:
+
+```zig
+// In readHwAccel():
+if (self.kickstart_enabled and offset == 0) {
+    // Change bits 0-1 from 01 to 11 (task 0 ready)
+    value = (value & ~@as(u32, 0x3)) | 0x3;
+}
+```
+
+- Original: 0x59 = 0b01011001 (task 0 state = 01 = sleeping)
+- Modified: 0x5B = 0b01011011 (task 0 state = 11 = ready)
+
+### Results
+
+```
+RTOS KICKSTART: Enabled at cycle 1000001
+HW_ACCEL READ [0x60003000] = 0x0000005B [KICKSTART #1]
+...continues reading 0x5B...
+```
+
+| Cycles | Final PC | Notes |
+|--------|----------|-------|
+| 5M | 0x10001688 | Progress! Left scheduler |
+| 50M | 0x10229BB4 | Returned to scheduler |
+
+### Analysis
+
+The kickstart successfully breaks the scheduler loop temporarily:
+1. Task 0 is marked ready (state 11)
+2. Scheduler dispatches task 0
+3. Task 0 runs briefly (reaches 0x10001688 - delay loop)
+4. Task 0 blocks/completes, returns to sleeping (state 01)
+5. Scheduler loop resumes waiting for tasks
+
+### Conclusion
+
+The task state modification works, but task 0 immediately blocks on something
+(likely I2C response, timer, or external event). Need to investigate what
+task 0 does when it runs and why it immediately blocks.
+
+---
+
+## Next Steps
+
+1. [x] Add hw_accel access tracing to emulator
+2. [ ] Disassemble subroutine at 0x229C10
+3. [x] Test hw_accel kickstart (partial success)
+4. [ ] Investigate task 0 blocking reason
+5. [ ] Implement I2C device responses (PMU/codec)
+
+---
+
+## References
+
+- [APPLE_FIRMWARE_ANALYSIS.md](APPLE_FIRMWARE_ANALYSIS.md) - Initial analysis
+- Rockbox source: `firmware/target/arm/pp/` - PP5020 drivers
+- ARM7TDMI TRM - Instruction set reference

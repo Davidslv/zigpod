@@ -115,6 +115,14 @@ pub const MemoryBus = struct {
     /// Debug: count of LCD writes
     lcd_write_count: u32,
 
+    /// Debug: hw_accel access counters
+    hw_accel_read_count: u32,
+    hw_accel_write_count: u32,
+
+    /// RTOS kickstart mode - modifies hw_accel reads to indicate task ready
+    kickstart_enabled: bool,
+    kickstart_read_count: u32,
+
     /// Debug: count of LCD bridge writes
     lcd_bridge_write_count: u32,
 
@@ -333,6 +341,10 @@ pub const MemoryBus = struct {
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
+            .hw_accel_read_count = 0,
+            .hw_accel_write_count = 0,
+            .kickstart_enabled = false,
+            .kickstart_read_count = 0,
             .lcd_bridge_write_count = 0,
             .sdram_write_count = 0,
             .iram_write_count = 0,
@@ -388,6 +400,10 @@ pub const MemoryBus = struct {
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
+            .hw_accel_read_count = 0,
+            .hw_accel_write_count = 0,
+            .kickstart_enabled = false,
+            .kickstart_read_count = 0,
             .lcd_bridge_write_count = 0,
             .sdram_write_count = 0,
             .iram_write_count = 0,
@@ -882,11 +898,30 @@ pub const MemoryBus = struct {
     }
 
     // Hardware accelerator buffer at 0x60003000
-    // Apple firmware uses this for checksum/copy operations
-    fn readHwAccel(self: *const Self, addr: u32) u32 {
+    // Apple firmware uses this for RTOS task queue management
+    // First 64 bytes (0x00-0x3F) are task state words
+    fn readHwAccel(self: *Self, addr: u32) u32 {
         const offset = (addr - HW_ACCEL_START) >> 2;
         if (offset < 1024) {
-            return self.hw_accel_regs[offset];
+            self.hw_accel_read_count += 1;
+            var value = self.hw_accel_regs[offset];
+
+            // RTOS kickstart: modify task state to indicate ready
+            // When enabled, change task 0 state from 01 (sleeping) to 11 (ready)
+            // This tricks the scheduler into thinking a task is ready to run
+            if (self.kickstart_enabled and offset == 0) {
+                self.kickstart_read_count += 1;
+                // Change bits 0-1 from 01 to 11 (task 0 ready)
+                value = (value & ~@as(u32, 0x3)) | 0x3;
+                // Log first 20 kickstart reads
+                if (self.kickstart_read_count <= 20) {
+                    std.debug.print("HW_ACCEL READ  [0x{X:0>8}] = 0x{X:0>8} [KICKSTART #{d}]\n", .{ addr, value, self.kickstart_read_count });
+                }
+            } else if (offset < 16 and self.hw_accel_read_count <= 100) {
+                // Log first 100 normal reads
+                std.debug.print("HW_ACCEL READ  [0x{X:0>8}] offset=0x{X:0>2} = 0x{X:0>8}\n", .{ addr, offset * 4, value });
+            }
+            return value;
         }
         return 0;
     }
@@ -894,8 +929,29 @@ pub const MemoryBus = struct {
     fn writeHwAccel(self: *Self, addr: u32, value: u32) void {
         const offset = (addr - HW_ACCEL_START) >> 2;
         if (offset < 1024) {
+            self.hw_accel_write_count += 1;
+            // Log first 16 task slots (offsets 0x00-0x3C)
+            if (offset < 16 and self.hw_accel_write_count <= 100) {
+                std.debug.print("HW_ACCEL WRITE [0x{X:0>8}] offset=0x{X:0>2} = 0x{X:0>8}\n", .{ addr, offset * 4, value });
+            }
             self.hw_accel_regs[offset] = value;
         }
+    }
+
+    pub fn getHwAccelStats(self: *const Self) struct { reads: u32, writes: u32 } {
+        return .{ .reads = self.hw_accel_read_count, .writes = self.hw_accel_write_count };
+    }
+
+    /// Enable RTOS kickstart mode - modifies hw_accel reads
+    pub fn enableKickstart(self: *Self) void {
+        self.kickstart_enabled = true;
+    }
+
+    /// Direct write to hw_accel region (used for RTOS kickstart)
+    pub fn writeKickstart(self: *Self, addr: u32, value: u32) void {
+        _ = addr;
+        _ = value;
+        self.kickstart_enabled = true;
     }
 
     // Mailbox registers for CPU/COP synchronization

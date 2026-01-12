@@ -153,6 +153,12 @@ pub const InterruptController = struct {
         self.updateLines();
     }
 
+    /// Force-enable a CPU interrupt (used for RTOS kickstart)
+    pub fn forceEnableCpuInterrupt(self: *Self, irq: Interrupt) void {
+        self.cpu_enable |= irq.mask();
+        self.updateLines();
+    }
+
     /// Clear an interrupt (usually called by peripheral when acknowledged)
     pub fn clearInterrupt(self: *Self, irq: Interrupt) void {
         self.raw_status &= ~irq.mask();

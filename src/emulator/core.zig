@@ -37,6 +37,7 @@ pub const Arm7tdmi = arm7tdmi.Arm7tdmi;
 pub const MemoryBus = bus_module.MemoryBus;
 pub const Ram = ram_module.Ram;
 pub const InterruptController = interrupt_ctrl.InterruptController;
+pub const Interrupt = interrupt_ctrl.Interrupt;
 pub const Timers = timers.Timers;
 pub const GpioController = gpio.GpioController;
 pub const SystemController = system_ctrl.SystemController;
@@ -137,6 +138,10 @@ pub const Emulator = struct {
     /// Total cycles executed
     total_cycles: u64,
 
+    /// Flag to track if we've fired the RTOS kickstart interrupt
+    /// This is a workaround to break out of the scheduler loop
+    rtos_kickstart_fired: bool,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -202,6 +207,7 @@ pub const Emulator = struct {
             .config = config,
             .running = false,
             .total_cycles = 0,
+            .rtos_kickstart_fired = false,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -348,6 +354,20 @@ pub const Emulator = struct {
 
         // Tick peripherals
         self.timer.tick(cycles);
+
+        // RTOS Kickstart: Modify hw_accel to indicate a task is ready
+        // The Apple firmware RTOS scheduler waits for tasks to become ready,
+        // but tasks need timer interrupts to wake up. This breaks the chicken-egg.
+        // After 1M cycles when values stabilize at (0x59, 0xA6, 0xFF, 0x00):
+        // - 0x59 = tasks in states: 01 01 10 01 (sleeping/blocked)
+        // - Set slot 0 to 0x5B (task 0 = 11 = ready) to kickstart scheduler
+        if (!self.rtos_kickstart_fired and self.total_cycles >= 1_000_000) {
+            self.rtos_kickstart_fired = true;
+            // Enable kickstart mode - hw_accel reads will return modified values
+            // to indicate task 0 is ready, breaking the scheduler loop
+            self.bus.enableKickstart();
+            std.debug.print("RTOS KICKSTART: Enabled at cycle {} - hw_accel[0] will report task ready\n", .{self.total_cycles});
+        }
 
         return cycles;
     }
