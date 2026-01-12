@@ -96,18 +96,6 @@ pub fn enterException(regs: *RegisterFile, exception: Exception) u32 {
     // 1. Save current CPSR to target mode's SPSR
     const old_cpsr = @as(u32, @bitCast(regs.cpsr));
 
-    // Debug: trace exception entry
-    if (exception == .irq or exception == .swi) {
-        const old_mode = regs.cpsr.getMode();
-        std.debug.print("{s} ENTRY: PC=0x{X:0>8}, old_cpsr=0x{X:0>8}, old_mode={any}, target={s}\n", .{
-            if (exception == .irq) "IRQ" else "SWI",
-            regs.r[15],
-            old_cpsr,
-            old_mode,
-            @tagName(target_mode),
-        });
-    }
-
     // 2. Calculate return address and save to LR
     //    For most exceptions, LR = PC at time of exception
     //    The actual return address depends on exception type
@@ -146,25 +134,16 @@ pub fn enterException(regs: *RegisterFile, exception: Exception) u32 {
 /// - SUBS PC, LR, #offset
 /// - LDM with PC and S bit
 pub fn returnFromException(regs: *RegisterFile) void {
-    // Get current mode for debug
-    const cur_mode = regs.cpsr.getMode();
-
     // Get SPSR
     if (regs.getSpsr()) |spsr| {
         // Get return address from current LR
         const return_addr = regs.r[14];
 
-        // Debug: trace exception return
-        const new_psr: PSR = @bitCast(spsr);
-        const new_mode = new_psr.getMode();
-        std.debug.print("EXC RETURN: cur_mode={any}, spsr=0x{X:0>8}, new_mode={any}, return_addr=0x{X:0>8}\n", .{ cur_mode, spsr, new_mode, return_addr });
-
         // Restore CPSR from SPSR (this also changes mode)
-        if (new_mode) |mode| {
+        const new_psr: PSR = @bitCast(spsr);
+        if (new_psr.getMode()) |new_mode| {
             // Switch mode with banking
-            regs.switchMode(mode);
-        } else {
-            std.debug.print("ERROR: SPSR has invalid mode bits! spsr=0x{X:0>8}\n", .{spsr});
+            regs.switchMode(new_mode);
         }
 
         // Fully restore CPSR
@@ -172,8 +151,6 @@ pub fn returnFromException(regs: *RegisterFile) void {
 
         // Set PC to return address
         regs.set(15, return_addr);
-    } else {
-        std.debug.print("EXC RETURN: No SPSR for current mode {any}\n", .{cur_mode});
     }
 }
 
