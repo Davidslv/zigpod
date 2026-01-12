@@ -363,10 +363,17 @@ pub const Emulator = struct {
         // - Set slot 0 to 0x5B (task 0 = 11 = ready) to kickstart scheduler
         if (!self.rtos_kickstart_fired and self.total_cycles >= 1_000_000) {
             self.rtos_kickstart_fired = true;
+            // Simulate Boot ROM initialization: enable interrupts in CPSR
+            // Real Boot ROM would do this before jumping to firmware
+            self.cpu.enableIrq();
+            self.cpu.enableFiq();
             // Enable kickstart mode - hw_accel reads will return modified values
             // to indicate task 0 is ready, breaking the scheduler loop
             self.bus.enableKickstart();
-            std.debug.print("RTOS KICKSTART: Enabled at cycle {} - hw_accel[0] will report task ready\n", .{self.total_cycles});
+            // Also fire timer1 interrupt to kick the RTOS
+            self.int_ctrl.forceEnableCpuInterrupt(Interrupt.timer1);
+            self.int_ctrl.assertInterrupt(Interrupt.timer1);
+            std.debug.print("RTOS KICKSTART: Enabled IRQ/FIQ + timer1 + hw_accel[0] at cycle {}\n", .{self.total_cycles});
         }
 
         return cycles;

@@ -227,6 +227,42 @@ task 0 does when it runs and why it immediately blocks.
 
 ---
 
+## Implementation: IRQ Enable Fix
+
+### Root Cause Discovery
+
+Parallel agent investigation revealed:
+- **CPU starts with IRQ disabled** (CPSR I-bit = 1, ARM standard)
+- **Boot ROM would enable IRQ** before jumping to firmware
+- **Emulator skips Boot ROM** → IRQ never enabled → all interrupts ignored
+
+### Fix Applied
+
+Added to kickstart sequence in core.zig:
+```zig
+self.cpu.enableIrq();    // Clear CPSR I-bit
+self.cpu.enableFiq();    // Clear CPSR F-bit
+self.int_ctrl.forceEnableCpuInterrupt(Interrupt.timer1);
+self.int_ctrl.assertInterrupt(Interrupt.timer1);
+```
+
+### Results After Fix
+
+| Cycles | Final PC | Notes |
+|--------|----------|-------|
+| 10M | 0x10001A68 | New location! |
+| 100M | 0x1000166C | Different stuck point |
+
+Still 0 peripheral accesses - likely waiting for I2C device responses.
+
+### Next Steps
+
+Implement I2C device responses for:
+- PCF50605 PMU: Battery voltage, power rails, RTC
+- WM8758 codec: Initialization responses
+
+---
+
 ## Next Steps
 
 1. [x] Add hw_accel access tracing to emulator

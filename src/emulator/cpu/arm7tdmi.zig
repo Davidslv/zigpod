@@ -159,6 +159,16 @@ pub const Arm7tdmi = struct {
         self.fiq_line = active;
     }
 
+    /// Enable IRQ in CPSR (clear I bit) - used to simulate Boot ROM initialization
+    pub fn enableIrq(self: *Self) void {
+        self.regs.cpsr.irq_disable = false;
+    }
+
+    /// Enable FIQ in CPSR (clear F bit)
+    pub fn enableFiq(self: *Self) void {
+        self.regs.cpsr.fiq_disable = false;
+    }
+
     /// Force an exception (e.g., for SWI, undefined instruction)
     pub fn raiseException(self: *Self, exception: Exception) u32 {
         const cycles = exceptions.enterException(&self.regs, exception);
