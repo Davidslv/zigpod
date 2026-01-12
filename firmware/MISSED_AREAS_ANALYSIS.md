@@ -273,4 +273,84 @@ The **blocking issue** for Rockbox is the FAT32 buffer management bug in the boo
 
 ---
 
+## 14. Additional Missing Peripherals
+
+### 14.1 USB Controller (0xC5000000)
+
+**Status: NOT IMPLEMENTED**
+
+The PP5020 has a USB OTG controller at 0xC5000000. Apple firmware uses:
+- USBAudioTask
+- USB Secondary Interrupt Task
+- Hub Driver
+
+Not needed for basic Rockbox boot but required for USB functionality.
+
+### 14.2 LCD1 Monochrome Controller (0x70003000)
+
+**Status: NOT IMPLEMENTED**
+
+| Register | Address | Description |
+|----------|---------|-------------|
+| LCD1_CONTROL | 0x70003000 | LCD control |
+| LCD1_CMD | 0x70003008 | LCD command |
+| LCD1_DATA | 0x70003010 | LCD data |
+
+This is for older iPod models with monochrome displays. May not be needed for 5G/5.5G.
+
+### 14.3 Serial/UART (0x70006000)
+
+**Status: NOT IMPLEMENTED**
+
+| Register | Address | Description |
+|----------|---------|-------------|
+| SER0_RBR | 0x70006000 | Receive buffer |
+| SER0_THR | 0x70006000 | Transmit holding |
+
+Used for debug output and accessory communication. Not blocking for basic boot.
+
+### 14.4 Device Init Extended Registers
+
+**Status: PARTIAL**
+
+Current device_init stub covers 0x70000000-0x7000007F but needs proper values:
+
+| Register | Address | Suggested Value |
+|----------|---------|-----------------|
+| PP_VER1 | 0x70000000 | 0x00005021 (PP5021) |
+| PP_VER2 | 0x70000004 | 0x000000C1 (revision) |
+| STRAP_OPT_A | 0x70000008 | Hardware config |
+| STRAP_OPT_B | 0x7000000C | Hardware config |
+| DEV_INIT1 | 0x70000010 | Device init flags |
+| DEV_INIT2 | 0x70000020 | Device init flags |
+
+---
+
+## 15. Watchdog Timer
+
+**Status: SOFTWARE ONLY**
+
+The Apple firmware has a software WatchdogTask that monitors using Timer1/Timer2. There is no dedicated hardware watchdog register in PP5020. The emulator's timer implementation should support this.
+
+Firmware references:
+- "WatchdogTask" at 0x25df44
+- "t_watchdog: No registered handlers for COP event!" at 0x285fbd
+
+---
+
+## 16. Updated Priority List
+
+### For Apple Firmware Boot (in order)
+
+1. **Mailbox registers** (0x60001010, 0x60001020) - CRITICAL
+2. **Entry point** at 0x10000800 - CRITICAL
+3. **PP_VER1/PP_VER2** values - Important
+4. **USB controller** stub at 0xC5000000 - May be needed
+
+### For Rockbox Boot
+
+All hardware is implemented. The blocking issue is the FAT32 buffer bug in Rockbox's FAT driver.
+
+---
+
 *Analysis based on Rockbox pp5020.h, firmware string analysis, and ARM disassembly*
