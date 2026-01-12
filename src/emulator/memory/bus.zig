@@ -205,6 +205,15 @@ pub const MemoryBus = struct {
     debug_dev_init_offset_counts: [32]u32, // Histogram of accesses to offsets 0x00-0x7C (32 dwords)
     debug_int_ctrl_offset_counts: [64]u32, // Histogram of interrupt controller offsets
 
+    /// Debug: SDRAM data read tracing for finding task state array
+    /// Tracks unique SDRAM read addresses (excluding code region 0x10000000-0x10300000)
+    debug_sdram_data_read_enabled: bool,
+    debug_sdram_data_read_count: u32,
+    debug_sdram_data_read_addrs: [64]u32,
+    debug_sdram_data_read_vals: [64]u32,
+    /// Count reads per 4KB page for heat map
+    debug_sdram_page_reads: [256]u32, // Pages 0x10000-0x100FF (1MB coverage starting at 0x10000000)
+
     const Self = @This();
 
     /// Boot ROM range
@@ -462,6 +471,11 @@ pub const MemoryBus = struct {
             .debug_dev_init_accesses = 0,
             .debug_dev_init_offset_counts = [_]u32{0} ** 32,
             .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
+            .debug_sdram_data_read_enabled = false,
+            .debug_sdram_data_read_count = 0,
+            .debug_sdram_data_read_addrs = [_]u32{0} ** 64,
+            .debug_sdram_data_read_vals = [_]u32{0} ** 64,
+            .debug_sdram_page_reads = [_]u32{0} ** 256,
         };
     }
 
@@ -973,6 +987,39 @@ pub const MemoryBus = struct {
         self.kickstart_enabled = true;
     }
 
+    /// Enable SDRAM data read tracing to find task state array
+    /// Traces reads from non-code SDRAM regions (0x10300000+)
+    pub fn enableSdramDataReadTracing(self: *Self) void {
+        self.debug_sdram_data_read_enabled = true;
+        std.debug.print("SDRAM DATA READ TRACING: Enabled\n", .{});
+    }
+
+    /// Print SDRAM data read trace summary
+    pub fn printSdramReadTraceSummary(self: *const Self) void {
+        std.debug.print("\n=== SDRAM DATA READ TRACE SUMMARY ===\n", .{});
+        std.debug.print("Total unique addresses traced: {}\n", .{self.debug_sdram_data_read_count});
+
+        // Print unique addresses
+        if (self.debug_sdram_data_read_count > 0) {
+            std.debug.print("\nUnique SDRAM data reads:\n", .{});
+            var i: usize = 0;
+            while (i < @min(self.debug_sdram_data_read_count, 64)) : (i += 1) {
+                std.debug.print("  0x{X:0>8} = 0x{X:0>8}\n", .{ self.debug_sdram_data_read_addrs[i], self.debug_sdram_data_read_vals[i] });
+            }
+        }
+
+        // Print page heat map (only pages with reads)
+        std.debug.print("\nSDRAM page heat map (4KB pages with data reads):\n", .{});
+        var page: usize = 0;
+        while (page < 256) : (page += 1) {
+            if (self.debug_sdram_page_reads[page] > 0) {
+                const page_addr = SDRAM_START + (page * 0x1000);
+                std.debug.print("  Page 0x{X:0>8}: {} reads\n", .{ page_addr, self.debug_sdram_page_reads[page] });
+            }
+        }
+        std.debug.print("=== END TRACE SUMMARY ===\n\n", .{});
+    }
+
     // Mailbox registers for CPU/COP synchronization
     // CPU_QUEUE at 0x60001010: CPU writes set bits, COP reads clear them
     // COP_QUEUE at 0x60001020: COP writes set bits, CPU reads clear them
@@ -1148,7 +1195,7 @@ pub const MemoryBus = struct {
         };
     }
 
-    fn readSdram(self: *const Self, addr: u32) u32 {
+    fn readSdram(self: *Self, addr: u32) u32 {
         const offset = addr - SDRAM_START;
 
         // Patch: SWI vector literal pool at 0x100008EC
@@ -1159,17 +1206,59 @@ pub const MemoryBus = struct {
             return 0x1000095C; // SWI handler in SDRAM
         }
 
+        var value: u32 = 0xE12FFF1E; // Default: "BX LR" for unmapped
+
         if (offset + 3 < self.sdram.len) {
-            return @as(u32, self.sdram[offset]) |
+            value = @as(u32, self.sdram[offset]) |
                 (@as(u32, self.sdram[offset + 1]) << 8) |
                 (@as(u32, self.sdram[offset + 2]) << 16) |
                 (@as(u32, self.sdram[offset + 3]) << 24);
         }
 
-        // Return "BX LR" (0xE12FFF1E) for unmapped SDRAM reads
-        // This allows graceful handling of uninitialized function pointers
-        // by returning immediately when jumped to
-        return 0xE12FFF1E;
+        // SDRAM data read tracing - focus on likely data values, not code
+        // ARM instructions typically have condition code 0xE (always) in bits 28-31
+        // Data values are typically: 0, small numbers, or pointers (0x10xxxxxx, 0x40xxxxxx, 0x60xxxxxx)
+        if (self.debug_sdram_data_read_enabled) {
+            // Skip obvious instruction fetches:
+            // - Values with 0xE in top nibble are likely ARM conditional instructions
+            // - Focus on addresses in data regions (0x10800000+ is typically BSS/heap)
+            const top_nibble = (value >> 28) & 0xF;
+            const is_likely_code = (top_nibble == 0xE) or (top_nibble == 0x0 and value >= 0x0A000000); // B/BL
+            const is_data_region = addr >= 0x10800000; // BSS/heap region
+
+            // Log if it's in data region OR value looks like data (not code)
+            if (is_data_region or (!is_likely_code and value <= 0x20000000)) {
+                // Update page heat map (pages 0x100-0x1FF = 0x10100000-0x101FFFFF)
+                const page = (offset >> 12) & 0xFF;
+                if (page < 256) {
+                    self.debug_sdram_page_reads[page] += 1;
+                }
+
+                // Log first 64 unique addresses
+                if (self.debug_sdram_data_read_count < 64) {
+                    // Check if this address is already logged
+                    var found = false;
+                    var i: usize = 0;
+                    while (i < self.debug_sdram_data_read_count) : (i += 1) {
+                        if (self.debug_sdram_data_read_addrs[i] == addr) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        self.debug_sdram_data_read_addrs[self.debug_sdram_data_read_count] = addr;
+                        self.debug_sdram_data_read_vals[self.debug_sdram_data_read_count] = value;
+                        self.debug_sdram_data_read_count += 1;
+
+                        // Print real-time trace with annotation
+                        const region_type: []const u8 = if (is_data_region) "DATA" else "GLOB";
+                        std.debug.print("SDRAM {s} READ: 0x{X:0>8} = 0x{X:0>8}\n", .{ region_type, addr, value });
+                    }
+                }
+            }
+        }
+
+        return value;
     }
 
     fn writeSdram(self: *Self, addr: u32, value: u32) void {

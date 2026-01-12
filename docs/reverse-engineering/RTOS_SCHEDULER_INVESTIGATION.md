@@ -346,6 +346,83 @@ Tried enabling IRQ at 200k and 500k cycles:
 
 ---
 
+## Session 4: SDRAM Data Read Tracing (2026-01-12)
+
+### Objective
+
+Add targeted SDRAM data read tracing to identify where task state arrays live in RAM, since hw_accel is only used during initialization.
+
+### Implementation
+
+Added SDRAM read tracing in `bus.zig`:
+- Filters out obvious code (ARM instructions with 0xE condition code)
+- Focuses on data regions (0x10800000+ = BSS/heap)
+- Logs first 64 unique addresses with values
+- Tracks page-level heat map
+
+### Discovered Task Control Block Addresses
+
+SDRAM reads during initialization reveal task control block (TCB) structures:
+
+**Primary TCB Region: 0x1087xxxx**
+```
+0x108701B0 = 0x00000000  (field at offset 0x00?)
+0x108701B4 = 0x00000000  (field at offset 0x04?)
+0x108701C4 = 0x1086C154  (pointer - next TCB?)
+0x108701C8 = 0x00004000  (stack size or flags?)
+0x108701CC = 0x00000001  (STATE FIELD? value=1)
+0x108701D0 = 0x00000000
+0x108701D4 = 0x00000000
+0x10870138 = 0x00000014  (priority or tick count? value=20)
+0x1087014C = 0x00000000
+0x10870154 = 0x00000000
+0x10870158 = 0x00000000
+0x1087015C = 0x00000000
+```
+
+**Secondary TCB Region: 0x1086xxxx**
+```
+0x1086C154 = ???        (pointed to by 0x108701C4)
+0x1086C158 = 0x00003FF4 (stack pointer or size?)
+0x1086C15C = 0x00000000
+0x1086C160 = 0x108701D0 (pointer - forms linked list)
+```
+
+**Other Data Structures:**
+```
+0x1081DA98 = 0x00000000 (global variable)
+0x1081D85C = 0x1084BE48 (pointer to another structure)
+0x1084BE4C = 0x00000000
+```
+
+### Key Finding: Linked List of TCBs
+
+The TCB structures form a linked list:
+```
+TCB at 0x108701B0:
+  - pointer at +0x14 (0x108701C4) -> 0x1086C154
+  - state at +0x1C (0x108701CC) = 0x00000001
+
+Secondary structure at 0x1086C154:
+  - pointer at +0x0C (0x1086C160) -> 0x108701D0
+```
+
+### Task State Hypothesis
+
+Based on the values observed:
+- **0x00000000** = inactive/not created
+- **0x00000001** = sleeping/waiting (seen at 0x108701CC)
+- **0x00000002** = ???
+- **0x00000003** = ready to run (target for kickstart)
+
+### Next Approach: Direct TCB Modification
+
+Try modifying the task state field at 0x108701CC:
+- Change from 0x00000001 (sleeping) to 0x00000003 (ready)
+- This might wake up task 0 and break the scheduler loop
+
+---
+
 ## Next Steps
 
 1. [x] Add hw_accel access tracing to emulator
@@ -353,8 +430,9 @@ Tried enabling IRQ at 200k and 500k cycles:
 3. [x] Test hw_accel kickstart (partial success)
 4. [x] Investigate task 0 blocking reason (blocked on unknown RAM state)
 5. [ ] Implement I2C device responses (PMU/codec)
-6. [ ] Find task state RAM address
+6. [x] Find task state RAM address (found: 0x108701CC and related TCB fields)
 7. [ ] Find and initialize IRQ dispatch tables
+8. [ ] Try direct TCB modification at 0x108701CC
 
 ---
 
