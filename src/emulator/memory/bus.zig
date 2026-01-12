@@ -1049,8 +1049,8 @@ pub const MemoryBus = struct {
         if (base == DEV_INIT_START) {
             const offset = addr - base;
             return switch (offset) {
-                0x00 => 0x00005021, // PP_VER1: PP5021
-                0x04 => 0x000000C1, // PP_VER2: Revision C1
+                0x00 => 0x32314300, // PP_VER1: "21C\0" (chars 5-8 of "PP5021C" in little-endian)
+                0x04 => 0x50503530, // PP_VER2: "PP50" (chars 1-4 of "PP5021C" in little-endian)
                 0x08 => 0x00000000, // STRAP_OPT_A
                 0x0C => 0x00000000, // STRAP_OPT_B
                 0x10 => 0xFFFFFFFF, // DEV_INIT1: All devices enabled
