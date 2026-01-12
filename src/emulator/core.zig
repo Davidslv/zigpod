@@ -248,6 +248,11 @@ pub const Emulator = struct {
         self.bus.registerPeripheral(.clickwheel, self.wheel.createHandler());
         self.bus.registerPeripheral(.lcd, self.lcd_ctrl.createHandler());
         self.bus.registerPeripheral(.lcd_bridge, self.lcd_bridge.createHandler());
+
+        // Initialize GPIO defaults for iPod hardware:
+        // GPIO A bit 5 = hold switch (1 = not held, 0 = held)
+        // Set high so button_hold() returns false (switch OFF)
+        self.gpio_ctrl.setPin(.a, 5, true);
     }
 
     /// Reset the emulator

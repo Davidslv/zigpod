@@ -330,6 +330,9 @@ pub const AtaController = struct {
 
         const lba = self.getLba();
 
+        // Debug: trace which sectors are being read
+        std.debug.print("ATA: READ LBA={} (remaining={})\n", .{ lba, self.sectors_remaining });
+
         debug_disk_reads += 1;
         if (self.disk) |disk| {
             if (!disk.read(lba, &self.data_buffer)) {

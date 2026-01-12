@@ -156,7 +156,7 @@ pub const GpioController = struct {
         if (port_idx >= 12) return 0;
         const port = &self.ports[port_idx];
 
-        return switch (reg_offset) {
+        const value = switch (reg_offset) {
             REG_ENABLE => port.enable,
             REG_INT_EN => port.int_en,
             REG_INT_LEV => port.int_lev,
@@ -167,6 +167,13 @@ pub const GpioController = struct {
             REG_INT_STAT => port.int_stat,
             else => 0,
         };
+
+        // Debug: trace GPIO A input reads (hold switch check)
+        if (port_idx == 0 and reg_offset == REG_INPUT_VAL) {
+            std.debug.print("GPIO A INPUT_VAL read: 0x{X:0>8} (ext={X:0>8}, out_en={X:0>8})\n", .{ value, port.external_input, port.output_en });
+        }
+
+        return value;
     }
 
     /// Write register
