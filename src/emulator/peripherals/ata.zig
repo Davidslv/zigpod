@@ -377,11 +377,64 @@ pub const AtaController = struct {
                             }
                         }
                         std.debug.print(" attr=0x{X:0>2} cluster={}", .{ attr, cluster_lo });
-                        // For LFN entries, show checksum and full hex
+                        // For LFN entries, show checksum and decoded characters
                         if (attr == 0x0F) {
-                            const checksum = self.data_buffer[offset + 13];
-                            std.debug.print(" (LFN checksum=0x{X:0>2})\n    Hex: ", .{checksum});
-                            for (self.data_buffer[offset .. offset + 32]) |b| {
+                            const entry_data = self.data_buffer[offset .. offset + 32];
+                            const checksum = entry_data[13];
+                            const ord = entry_data[0];
+                            std.debug.print(" (LFN ord=0x{X:0>2} checksum=0x{X:0>2})", .{ ord, checksum });
+
+                            // Decode name1 (bytes 1-10, 5 UTF-16LE chars)
+                            std.debug.print("\n    name1 (1-10): ", .{});
+                            var i: usize = 1;
+                            while (i <= 9) : (i += 2) {
+                                const ch = @as(u16, entry_data[i]) | (@as(u16, entry_data[i + 1]) << 8);
+                                if (ch == 0 or ch == 0xFFFF) {
+                                    std.debug.print("\\0 ", .{});
+                                } else if (ch < 128) {
+                                    std.debug.print("'{c}'(0x{X:0>4}) ", .{ @as(u8, @truncate(ch)), ch });
+                                } else {
+                                    std.debug.print("U+{X:0>4} ", .{ch});
+                                }
+                            }
+
+                            // Decode name2 (bytes 14-25, 6 UTF-16LE chars) - CRITICAL FOR 11+ CHAR NAMES
+                            std.debug.print("\n    name2 (14-25): ", .{});
+                            i = 14;
+                            while (i <= 24) : (i += 2) {
+                                const ch = @as(u16, entry_data[i]) | (@as(u16, entry_data[i + 1]) << 8);
+                                const mark: []const u8 = if (i == 24) "**CHAR11**" else "";
+                                if (ch == 0 or ch == 0xFFFF) {
+                                    std.debug.print("{s}\\0 ", .{mark});
+                                } else if (ch < 128) {
+                                    std.debug.print("{s}'{c}'(0x{X:0>4}) ", .{ mark, @as(u8, @truncate(ch)), ch });
+                                } else {
+                                    std.debug.print("{s}U+{X:0>4} ", .{ mark, ch });
+                                }
+                            }
+                            // Explicitly log bytes 24-25
+                            std.debug.print("\n    CRITICAL bytes 24-25: 0x{X:0>2} 0x{X:0>2}", .{ entry_data[24], entry_data[25] });
+
+                            // Decode name3 (bytes 28-31, 2 UTF-16LE chars) - CRITICAL FOR 12+ CHAR NAMES
+                            std.debug.print("\n    name3 (28-31): ", .{});
+                            i = 28;
+                            while (i <= 30) : (i += 2) {
+                                const ch = @as(u16, entry_data[i]) | (@as(u16, entry_data[i + 1]) << 8);
+                                const mark: []const u8 = if (i == 28) "**CHAR12**" else "";
+                                if (ch == 0 or ch == 0xFFFF) {
+                                    std.debug.print("{s}\\0 ", .{mark});
+                                } else if (ch < 128) {
+                                    std.debug.print("{s}'{c}'(0x{X:0>4}) ", .{ mark, @as(u8, @truncate(ch)), ch });
+                                } else {
+                                    std.debug.print("{s}U+{X:0>4} ", .{ mark, ch });
+                                }
+                            }
+                            // Explicitly log bytes 28-31
+                            std.debug.print("\n    CRITICAL bytes 28-31: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2}", .{ entry_data[28], entry_data[29], entry_data[30], entry_data[31] });
+
+                            // Full hex dump
+                            std.debug.print("\n    Full hex: ", .{});
+                            for (entry_data) |b| {
                                 std.debug.print("{X:0>2} ", .{b});
                             }
                         }
