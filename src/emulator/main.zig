@@ -225,7 +225,7 @@ pub fn main() !void {
     var firmware: ?[]u8 = null;
     if (firmware_path) |path| {
         print("Loading firmware: {s}\n", .{path});
-        firmware = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+        firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
         print("Loaded {d} bytes\n", .{firmware.?.len});
     }
     defer if (firmware) |fw| allocator.free(fw);
@@ -269,6 +269,11 @@ pub fn main() !void {
         sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024); // 16MB max for large firmware
         print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{sdram_firmware.?.len});
         emu.loadSdram(0, sdram_firmware.?);
+
+        // For Apple firmware (osos.bin), emulate Boot ROM initialization:
+        // Copy SWI handler and other code from firmware to IRAM
+        // This is what real Boot ROM does before jumping to firmware entry point
+        emu.bus.initAppleFirmwareIram();
     }
     defer if (sdram_firmware) |fw| allocator.free(fw);
 
@@ -299,12 +304,25 @@ pub fn main() !void {
         emu.cpu.setPc(0x40000000);
         print("PC set to 0x40000000 (IRAM)\n", .{});
     } else if (sdram_firmware_path != null) {
-        emu.cpu.setPc(0x10000000);
-        print("PC set to 0x10000000 (SDRAM)\n", .{});
-        // Initialize COP at same entry point for dual-core firmware
-        if (enable_cop) {
-            emu.initCop(0x10000000);
-            print("COP PC set to 0x10000000 (same entry point)\n", .{});
+        // Apple firmware has a 0x800 byte header; entry point is at 0x10000800
+        // Check for "portalplayer" signature in header to detect Apple firmware
+        const is_apple_firmware = sdram_firmware != null and sdram_firmware.?.len > 0x830 and
+            std.mem.eql(u8, sdram_firmware.?[0x820..0x82C], "portalplayer");
+
+        if (is_apple_firmware) {
+            emu.cpu.setPc(0x10000800);
+            print("PC set to 0x10000800 (Apple firmware entry)\n", .{});
+            if (enable_cop) {
+                emu.initCop(0x10000800);
+                print("COP PC set to 0x10000800 (Apple firmware entry)\n", .{});
+            }
+        } else {
+            emu.cpu.setPc(0x10000000);
+            print("PC set to 0x10000000 (SDRAM)\n", .{});
+            if (enable_cop) {
+                emu.initCop(0x10000000);
+                print("COP PC set to 0x10000000 (same entry point)\n", .{});
+            }
         }
     }
 

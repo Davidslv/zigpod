@@ -102,6 +102,12 @@ pub const MemoryBus = struct {
     /// Apple firmware uses this for checksum/copy operations
     hw_accel_regs: [1024]u32,
 
+    /// Low memory RAM (0x00000000-0x000003FF) - for exception vectors
+    /// Apple firmware writes exception handler data here after boot
+    /// The ROM provides default stub values that can be overwritten
+    low_mem_ram: [1024]u8,
+    low_mem_written: [256]bool, // Track which 4-byte words have been written
+
     /// Mailbox registers for CPU/COP synchronization
     /// cpu_queue: bit 29 set by CPU writes, cleared by COP reads
     /// cop_queue: bit 29 set by COP writes, cleared by CPU reads
@@ -336,6 +342,8 @@ pub const MemoryBus = struct {
             .stub_registers = [_]u32{0} ** 256,
             .flash_ctrl_regs = [_]u32{0} ** 64,
             .hw_accel_regs = [_]u32{0} ** 1024,
+            .low_mem_ram = [_]u8{0} ** 1024,
+            .low_mem_written = [_]bool{false} ** 256,
             .cpu_queue = 0,
             .cop_queue = 0,
             .last_access_addr = 0,
@@ -395,6 +403,8 @@ pub const MemoryBus = struct {
             .stub_registers = [_]u32{0} ** 256,
             .flash_ctrl_regs = [_]u32{0} ** 64,
             .hw_accel_regs = [_]u32{0} ** 1024,
+            .low_mem_ram = [_]u8{0} ** 1024,
+            .low_mem_written = [_]bool{false} ** 256,
             .cpu_queue = 0,
             .cop_queue = 0,
             .last_access_addr = 0,
@@ -841,7 +851,7 @@ pub const MemoryBus = struct {
         }
 
         switch (region) {
-            .boot_rom => {}, // ROM is read-only
+            .boot_rom => self.writeLowMem(translated_addr, value), // Low memory is writable
             .proc_id => {}, // PROC_ID is read-only
             .mailbox => self.writeMailbox(translated_addr, value),
             .sdram => self.writeSdram(translated_addr, value),
@@ -1003,8 +1013,43 @@ pub const MemoryBus = struct {
 
     // Internal read/write helpers
 
+    // Low memory write - allows firmware to write data after exception vectors
+    // Exception vectors at 0x00-0x6F are protected (ROM stubs for trampoline + Boot ROM code)
+    fn writeLowMem(self: *Self, addr: u32, value: u32) void {
+        const offset = addr - ROM_START;
+        // Protect exception vectors and Boot ROM stub area (0x00-0x26F)
+        // This includes vectors 0x00-0x3C, literal pool 0x20-0x3C, and Boot ROM stub at 0x23C-0x26C
+        if (offset < 0x270) {
+            // Don't write to protected area - silently ignore
+            return;
+        }
+        if (offset + 3 < 1024) {
+            // Mark this word as written
+            const word_idx = offset >> 2;
+            if (word_idx < 256) {
+                self.low_mem_written[word_idx] = true;
+            }
+            // Write the value
+            self.low_mem_ram[offset] = @truncate(value);
+            self.low_mem_ram[offset + 1] = @truncate(value >> 8);
+            self.low_mem_ram[offset + 2] = @truncate(value >> 16);
+            self.low_mem_ram[offset + 3] = @truncate(value >> 24);
+        }
+    }
+
     fn readRom(self: *const Self, addr: u32) u32 {
         const offset = addr - ROM_START;
+
+        // Check if this word was written by firmware (low memory RAM overlay)
+        if (offset + 3 < 1024) {
+            const word_idx = offset >> 2;
+            if (word_idx < 256 and self.low_mem_written[word_idx]) {
+                return @as(u32, self.low_mem_ram[offset]) |
+                    (@as(u32, self.low_mem_ram[offset + 1]) << 8) |
+                    (@as(u32, self.low_mem_ram[offset + 2]) << 16) |
+                    (@as(u32, self.low_mem_ram[offset + 3]) << 24);
+            }
+        }
 
         // If actual boot ROM is loaded, use it
         if (offset + 3 < self.boot_rom.len) {
@@ -1014,42 +1059,97 @@ pub const MemoryBus = struct {
                 (@as(u32, self.boot_rom[offset + 3]) << 24);
         }
 
-        // Boot ROM stub for Apple firmware - calls function at 0xF000F00C and continues
-        // Apple firmware writes callback address to 0xF000F00C before jumping to ROM
-        // ROM should call that function with R0 = flash_ctrl base (0xF000F000)
-        // The callback uses R0 as a pointer to write back data at various offsets
-        // After callback, ROM should return to firmware (MOV PC, #0x10000A3C or next instr)
-        // Firmware jumped to ROM from 0x10000A38, so return to 0x10000A3C
+        // Exception vector stubs - trampoline to firmware vectors at 0x10000800
+        // ARM B instruction can't reach 256MB, so use LDR PC, [PC, #offset]
+        // Each vector: LDR PC, [PC, #0x18] loads from literal pool at vector + 0x20
         // Layout:
-        //   0x23C: LDR R1, [PC, #0x14] ; R1 = 0xF000F00C (addr of callback ptr) from 0x258
-        //   0x240: LDR R0, [PC, #0x14] ; R0 = 0xF000F000 (flash ctrl base) from 0x25C
-        //   0x244: LDR R1, [R1]        ; R1 = callback address (dereference)
-        //   0x248: MOV LR, PC          ; LR = 0x250 (return point after BX)
-        //   0x24C: BX R1               ; Call callback with R0=flash_ctrl_base
-        //   0x250: LDR PC, [PC, #0xC]  ; Return to firmware at 0x10000A3C (from 0x264)
-        //   0x254: NOP                 ; Padding
-        //   0x258: 0xF000F00C          ; Literal: address of callback pointer
-        //   0x25C: 0xF000F000          ; Literal: flash_ctrl base address
-        //   0x260: NOP                 ; Padding
-        //   0x264: 0x10000A3C          ; Literal: firmware return address
+        //   0x00: LDR PC, [PC, #0x18] -> loads from 0x20 (Reset vector = 0x10000800)
+        //   0x04: LDR PC, [PC, #0x18] -> loads from 0x24 (Undefined = 0x10000804)
+        //   0x08: LDR PC, [PC, #0x18] -> loads from 0x28 (SWI = 0x10000808)
+        //   0x0C: LDR PC, [PC, #0x18] -> loads from 0x2C (Prefetch = 0x1000080C)
+        //   0x10: LDR PC, [PC, #0x18] -> loads from 0x30 (Data = 0x10000810)
+        //   0x14: LDR PC, [PC, #0x18] -> loads from 0x34 (Reserved = 0x10000814)
+        //   0x18: LDR PC, [PC, #0x18] -> loads from 0x38 (IRQ = 0x10000818)
+        //   0x1C: LDR PC, [PC, #0x18] -> loads from 0x3C (FIQ = 0x1000081C)
+        //   0x20-0x3C: Literal pool with firmware vector addresses
         return switch (addr) {
-            0x0000023C => 0xE59F1014, // LDR R1, [PC, #0x14] ; R1 = 0xF000F00C (from 0x258)
-            0x00000240 => 0xE59F0014, // LDR R0, [PC, #0x14] ; R0 = 0xF000F000 (from 0x25C)
-            0x00000244 => 0xE5911000, // LDR R1, [R1]        ; R1 = callback address
-            0x00000248 => 0xE1A0E00F, // MOV LR, PC          ; LR = 0x250
-            0x0000024C => 0xE12FFF11, // BX R1               ; Call callback
-            0x00000250 => 0xE59FF00C, // LDR PC, [PC, #0xC]  ; Jump to 0x10000A3C (from 0x264)
-            0x00000254 => 0xE1A00000, // NOP
-            0x00000258 => 0xF000F00C, // Literal: &flash_ctrl_regs[3]
-            0x0000025C => 0xF000F000, // Literal: flash_ctrl base
-            0x00000260 => 0xE1A00000, // NOP
-            0x00000264 => 0x10000A3C, // Literal: firmware return address
+            // Exception vector trampolines
+            0x00000000 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Reset -> 0x10000800
+            0x00000004 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Undefined -> 0x10000804
+            0x00000008 => 0xE59FF018, // LDR PC, [PC, #0x18] ; SWI -> 0x10000808
+            0x0000000C => 0xE59FF018, // LDR PC, [PC, #0x18] ; Prefetch Abort -> 0x1000080C
+            0x00000010 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Data Abort -> 0x10000810
+            0x00000014 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Reserved -> 0x10000814
+            0x00000018 => 0xE59FF018, // LDR PC, [PC, #0x18] ; IRQ -> 0x10000818
+            0x0000001C => 0xE59FF018, // LDR PC, [PC, #0x18] ; FIQ -> 0x1000081C
+
+            // Literal pool for exception vectors (firmware at 0x10000800 + vector offset)
+            0x00000020 => 0x10000800, // Reset handler
+            0x00000024 => 0x10000804, // Undefined handler
+            0x00000028 => 0x10000808, // SWI handler
+            0x0000002C => 0x1000080C, // Prefetch Abort handler
+            0x00000030 => 0x10000810, // Data Abort handler
+            0x00000034 => 0x10000814, // Reserved handler
+            0x00000038 => 0x10000818, // IRQ handler
+            0x0000003C => 0x1000081C, // FIQ handler
+
+            // Boot ROM stub for Apple firmware - calls function at 0xF000F00C and continues
+            // Apple firmware writes callback address to 0xF000F00C before jumping to ROM
+            // ROM should call that function with:
+            //   R0 = flash_ctrl base (0xF000F000) - where callback writes data
+            //   R1 = Boot ROM config pointer (0x280) - contains hardware info for callback to read
+            // After callback, ROM should return to firmware at 0x10000A3C
+            //
+            // Layout:
+            //   0x23C: LDR R4, [PC, #0x1C] ; R4 = 0xF000F00C (callback ptr addr) from 0x260
+            //   0x240: LDR R4, [R4]        ; R4 = callback address (dereference)
+            //   0x244: LDR R0, [PC, #0x18] ; R0 = 0xF000F000 (flash ctrl base) from 0x264
+            //   0x248: LDR R1, [PC, #0x18] ; R1 = 0x00000280 (config block addr) from 0x268
+            //   0x24C: MOV LR, PC          ; LR = 0x254 (return point after BX)
+            //   0x250: BX R4               ; Call callback with R0, R1
+            //   0x254: LDR PC, [PC, #0x10] ; Return to firmware at 0x10000A3C (from 0x26C)
+            //   0x258-0x25C: NOP           ; Padding
+            //   0x260: 0xF000F00C          ; Literal: address of callback pointer
+            //   0x264: 0xF000F000          ; Literal: flash_ctrl base address
+            //   0x268: 0x00000280          ; Literal: config block address
+            //   0x26C: 0x10000A3C          ; Literal: firmware return address
+            0x0000023C => 0xE59F401C, // LDR R4, [PC, #0x1C] ; R4 = 0xF000F00C (from 0x260)
+            0x00000240 => 0xE5944000, // LDR R4, [R4]        ; R4 = callback address
+            0x00000244 => 0xE59F0018, // LDR R0, [PC, #0x18] ; R0 = 0xF000F000 (from 0x264)
+            0x00000248 => 0xE59F1018, // LDR R1, [PC, #0x18] ; R1 = 0x00000280 (from 0x268)
+            0x0000024C => 0xE1A0E00F, // MOV LR, PC          ; LR = 0x254
+            0x00000250 => 0xE12FFF14, // BX R4               ; Call callback
+            0x00000254 => 0xE59FF010, // LDR PC, [PC, #0x10] ; Jump to 0x10000A3C (from 0x26C)
+            0x00000258 => 0xE1A00000, // NOP
+            0x0000025C => 0xE1A00000, // NOP
+            0x00000260 => 0xF000F00C, // Literal: &flash_ctrl_regs[3]
+            0x00000264 => 0xF000F000, // Literal: flash_ctrl base
+            0x00000268 => 0x00000280, // Literal: config block address
+            0x0000026C => 0x10000A3C, // Literal: firmware return address
+
+            // Config block at 0x280 - fake hardware info for callback
+            // Callback reads: [R1+0x20], [R1+0x34], [R1+0x48], [R1+0xC4]
+            // These are copied to FLASH_CTRL at offsets 0x30, 0x34, 0x38, 0x3C
+            0x000002A0 => 0x00000000, // [0x280+0x20] = config value 1 (-> FLASH_CTRL+0x30)
+            0x000002B4 => 0x00000000, // [0x280+0x34] = config value 2 (-> FLASH_CTRL+0x34)
+            0x000002C8 => 0x60003000, // [0x280+0x48] = hw_accel base (-> FLASH_CTRL+0x38)
+            0x00000344 => 0x00000000, // [0x280+0xC4] = config value 4 (-> FLASH_CTRL+0x3C)
+
             else => 0, // Return 0 for other unmapped ROM addresses
         };
     }
 
     fn readSdram(self: *const Self, addr: u32) u32 {
         const offset = addr - SDRAM_START;
+
+        // Patch: SWI vector literal pool at 0x100008EC
+        // The firmware contains 0x40000008 (IRAM) but the SWI handler has PC-relative
+        // branches that only work from SDRAM. Return the SDRAM address instead.
+        // SWI handler is at firmware offset 0x8F0 + 0x6C = 0x95C = SDRAM 0x1000095C
+        if (addr == 0x100008EC) {
+            return 0x1000095C; // SWI handler in SDRAM
+        }
+
         if (offset + 3 < self.sdram.len) {
             return @as(u32, self.sdram[offset]) |
                 (@as(u32, self.sdram[offset + 1]) << 8) |
@@ -1167,6 +1267,56 @@ pub const MemoryBus = struct {
         if (len > 0) {
             @memcpy(self.iram[start..end], data[0..len]);
         }
+    }
+
+    /// Emulate Boot ROM initialization for Apple firmware
+    /// Copies SWI handler and other code from firmware image to IRAM
+    /// Based on analysis of osos.bin header structure
+    pub fn initAppleFirmwareIram(self: *Self) void {
+        // Apple firmware structure at 0x10000800 (offset 0x800 in file = offset 0 in SDRAM):
+        // - 0x800-0x81F: Exception vectors (branches)
+        // - 0x8E0-0x8EF: Metadata including IRAM address (0x40000008)
+        // - 0x8F0+: Code block to copy to IRAM
+        //
+        // The code block at 0x8F0 contains:
+        //   - 0x00-0x6B: Helper functions (memcpy, etc.)
+        //   - 0x6C+: SWI handler and other exception handlers
+        //
+        // The firmware's SWI vector literal at 0x8EC points to 0x40000008.
+        // So we need the SWI handler to be at IRAM 0x40000008.
+        //
+        // Solution: Copy the SWI handler (starting at offset 0x6C) to IRAM 0x08,
+        // and copy the helpers to IRAM 0x00 separately for COP support.
+
+        // First copy helper functions to IRAM offset 0x00 (for COP which jumps to 0x40000000)
+        const helpers_sdram_offset: u32 = 0x8F0; // memcpy and other helpers
+        const helpers_iram_offset: u32 = 0x00; // IRAM 0x40000000
+        const helpers_size: u32 = 0x6C; // Up to SWI handler
+
+        var i: u32 = 0;
+        while (i < helpers_size) : (i += 1) {
+            const src = helpers_sdram_offset + i;
+            const dst = helpers_iram_offset + i;
+            if (src < self.sdram.len and dst < IRAM_SIZE) {
+                self.iram[dst] = self.sdram[src];
+            }
+        }
+
+        // Then copy SWI handler to IRAM offset 0x08 (where firmware expects it at 0x40000008)
+        const swi_sdram_offset: u32 = 0x8F0 + 0x6C; // SWI handler in firmware
+        const swi_iram_offset: u32 = 0x08; // IRAM 0x40000008
+        const swi_size: u32 = 0x200; // Enough for all exception handlers
+
+        i = 0;
+        while (i < swi_size) : (i += 1) {
+            const src = swi_sdram_offset + i;
+            const dst = swi_iram_offset + i;
+            if (src < self.sdram.len and dst < IRAM_SIZE) {
+                self.iram[dst] = self.sdram[src];
+            }
+        }
+
+        std.debug.print("BOOT ROM EMULATION: Copied {} bytes (helpers) to IRAM+0x{X}, {} bytes (SWI) to IRAM+0x{X}\n", .{ helpers_size, helpers_iram_offset, swi_size, swi_iram_offset });
     }
 
     /// Load data into SDRAM
