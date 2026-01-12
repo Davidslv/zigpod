@@ -377,10 +377,13 @@ pub const AtaController = struct {
                             }
                         }
                         std.debug.print(" attr=0x{X:0>2} cluster={}", .{ attr, cluster_lo });
-                        // For LFN entries, show checksum
+                        // For LFN entries, show checksum and full hex
                         if (attr == 0x0F) {
                             const checksum = self.data_buffer[offset + 13];
-                            std.debug.print(" (LFN checksum=0x{X:0>2})", .{checksum});
+                            std.debug.print(" (LFN checksum=0x{X:0>2})\n    Hex: ", .{checksum});
+                            for (self.data_buffer[offset .. offset + 32]) |b| {
+                                std.debug.print("{X:0>2} ", .{b});
+                            }
                         }
                         std.debug.print("\n", .{});
                     }

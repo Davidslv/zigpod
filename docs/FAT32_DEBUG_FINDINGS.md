@@ -83,18 +83,75 @@ The FAT driver:
 - Parses directory entries including LFN entries
 - But does NOT find rockbox.ipod in either location
 
-## Potential Root Causes (Not Yet Verified)
+### Key Evidence: LFN Works for Directories
 
-1. **LFN Parsing Issue**: Something in the LFN assembly/checksum verification
-   that causes silent failure
+The bootloader DOES find .rockbox directory via LFN parsing:
+1. Reads root directory (sector 2055)
+2. Parses LFN entry with ".rockbox" and checksum 0xBD
+3. Correctly navigates to cluster 3 (sector 2056)
 
-2. **Filename Encoding**: UTF-8 vs UTF-16LE conversion issue
+This proves LFN parsing is functional. The issue is specific to file lookup.
 
-3. **Case Sensitivity**: Unexpected case handling in comparison
+### LFN Hex Dumps (Verified Correct)
 
-4. **Hidden Rockbox Quirk**: Some undocumented requirement in the FAT driver
+Root directory - ".rockbox" LFN entry:
+```
+41 2E 00 72 00 6F 00 63 00 6B 00 0F 00 BD 62 00
+6F 00 78 00 00 00 FF FF FF FF 00 00 FF FF FF FF
+```
+- Sequence: 0x41 (last | 1)
+- Checksum: 0xBD (matches "ROCKBO~1   ")
+- Name: ".rockbox\0"
 
-5. **Bootloader Configuration**: Different FAT driver settings for bootloader
+.rockbox directory - "rockbox.ipod" LFN entry:
+```
+41 72 00 6F 00 63 00 6B 00 62 00 0F 00 4E 6F 00
+78 00 2E 00 69 00 70 00 6F 00 00 00 64 00 00 00
+```
+- Sequence: 0x41 (last | 1)
+- Checksum: 0x4E (matches "ROCKBO~1IPO")
+- Name: "rockbox.ipod\0"
+
+### Checksum Verification (Python)
+
+```python
+def checksum(name):
+    s = 0
+    for b in name.encode('ascii'):
+        s = ((s << 7) + (s >> 1) + b) & 0xFF
+    return s
+
+checksum("ROCKBO~1   ")  # 0xBD for .rockbox dir
+checksum("ROCKBO~1IPO")  # 0x4E for rockbox.ipod in .rockbox
+checksum("ROCKBO~2IPO")  # 0xEE for rockbox.ipod in root
+```
+
+## Analysis: Likely Emulator Issue
+
+Since:
+1. FAT32 structure is 100% correct (verified against spec)
+2. LFN checksums match exactly
+3. ATA returns correct data (hex dumps verified)
+4. LFN works for directory lookup (.rockbox found)
+5. Same structure fails for file lookup (rockbox.ipod not found)
+
+The issue is likely in the emulator's ARM CPU execution, not the FAT32 structure.
+Possible causes:
+- Bug in string comparison during file lookup
+- Incorrect ARM instruction emulation affecting loop iteration
+- Memory access issue when processing file entries
+- Difference in code path between directory vs file matching
+
+## Potential Root Causes (Narrowed Down)
+
+1. **Emulator CPU Bug**: ARM instruction emulation issue affecting
+   string comparison or loop iteration in FAT driver
+
+2. **Memory/Cache Issue**: Emulated memory not behaving correctly
+   during file entry processing
+
+3. **Code Path Difference**: Rockbox may use different code paths
+   for matching directories vs files
 
 ## Failed Attempts
 
@@ -103,13 +160,17 @@ The FAT driver:
 
 2. LFN entries with correct checksums: Still not found
 
+3. Multiple test disks (test64mb.img, test_minimal.img): Same behavior
+
+4. Verified ATA returns complete sectors (256 words each)
+
 ## Next Steps to Try
 
-1. Create test firmware that prints FAT driver debug messages
-2. Compare with a real Rockbox installation (mount actual iPod)
-3. Check if bootloader has LFN support disabled
-4. Add tracing to Rockbox FAT driver and rebuild bootloader
-5. Use GDB to step through the FAT driver code
+1. Add CPU instruction tracing during file lookup
+2. Compare ARM register state between directory and file lookup
+3. Use GDB to step through the FAT driver code in emulator
+4. Test with simpler ARM firmware to validate string operations
+5. Compare real iPod behavior with emulator using same disk image
 
 ## Test Files
 
