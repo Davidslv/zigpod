@@ -931,6 +931,116 @@ pub fn main() !void {
         }
     }
 
+    // Debug: Search for rockbox.ipod LFN entry in memory
+    print("\n=== Searching for rockbox.ipod LFN entry in SDRAM ===\n", .{});
+    // LFN entry pattern: ordinal 0x41, attr 0x0F at +11, checksum 0x4E at +13
+    var lfn_found: u32 = 0;
+    var search_addr: u32 = 0x11000000;
+    while (search_addr < 0x11100000) : (search_addr += 1) {
+        // Check for LFN entry with checksum 0x4E (rockbox.ipod in .rockbox)
+        const ord = emu.bus.read8(search_addr);
+        if (ord == 0x41) { // First/only LFN entry
+            const attr = emu.bus.read8(search_addr + 11);
+            const chksum = emu.bus.read8(search_addr + 13);
+            if (attr == 0x0F and (chksum == 0x4E or chksum == 0xEE)) {
+                lfn_found += 1;
+                print("  LFN entry at 0x{X:0>8} (chksum=0x{X:0>2}):\n", .{ search_addr, chksum });
+                // Dump entire 32-byte entry
+                print("    Hex: ", .{});
+                var j: u32 = 0;
+                while (j < 32) : (j += 1) {
+                    print("{X:0>2} ", .{emu.bus.read8(search_addr + j)});
+                }
+                print("\n", .{});
+                // Decode characters
+                print("    name1 (bytes 1-10): ", .{});
+                var k: u32 = 1;
+                while (k <= 9) : (k += 2) {
+                    const lo = emu.bus.read8(search_addr + k);
+                    const hi = emu.bus.read8(search_addr + k + 1);
+                    const ch = @as(u16, lo) | (@as(u16, hi) << 8);
+                    if (ch != 0 and ch != 0xFFFF and ch < 128) {
+                        print("'{c}'({X:0>4}) ", .{ @as(u8, @truncate(ch)), ch });
+                    } else if (ch == 0 or ch == 0xFFFF) {
+                        print("\\0 ", .{});
+                    }
+                }
+                print("\n    name2 (bytes 14-25): ", .{});
+                k = 14;
+                while (k <= 24) : (k += 2) {
+                    const lo = emu.bus.read8(search_addr + k);
+                    const hi = emu.bus.read8(search_addr + k + 1);
+                    const ch = @as(u16, lo) | (@as(u16, hi) << 8);
+                    const marker = if (k == 24) "**" else "";
+                    if (ch != 0 and ch != 0xFFFF and ch < 128) {
+                        print("{s}'{c}'({X:0>4}) ", .{ marker, @as(u8, @truncate(ch)), ch });
+                    } else if (ch == 0 or ch == 0xFFFF) {
+                        print("{s}\\0 ", .{marker});
+                    }
+                }
+                print("\n    name3 (bytes 28-31): ", .{});
+                k = 28;
+                while (k <= 30) : (k += 2) {
+                    const lo = emu.bus.read8(search_addr + k);
+                    const hi = emu.bus.read8(search_addr + k + 1);
+                    const ch = @as(u16, lo) | (@as(u16, hi) << 8);
+                    const marker = if (k == 28) "**" else "";
+                    if (ch != 0 and ch != 0xFFFF and ch < 128) {
+                        print("{s}'{c}'({X:0>4}) ", .{ marker, @as(u8, @truncate(ch)), ch });
+                    } else if (ch == 0 or ch == 0xFFFF) {
+                        print("{s}\\0 ", .{marker});
+                    }
+                }
+                print("\n", .{});
+                // Show critical bytes
+                print("    CRITICAL bytes 24-25: 0x{X:0>2} 0x{X:0>2}\n", .{
+                    emu.bus.read8(search_addr + 24),
+                    emu.bus.read8(search_addr + 25),
+                });
+                print("    CRITICAL bytes 28-31: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2}\n", .{
+                    emu.bus.read8(search_addr + 28),
+                    emu.bus.read8(search_addr + 29),
+                    emu.bus.read8(search_addr + 30),
+                    emu.bus.read8(search_addr + 31),
+                });
+                // Also show the SHORT name entry that follows (at +32)
+                const short_addr = search_addr + 32;
+                print("    Following SHORT entry at 0x{X:0>8}:\n", .{short_addr});
+                print("      Raw: ", .{});
+                var s: u32 = 0;
+                while (s < 32) : (s += 1) {
+                    print("{X:0>2} ", .{emu.bus.read8(short_addr + s)});
+                }
+                print("\n", .{});
+                // Extract 11-byte short name
+                print("      Short name (bytes 0-10): ", .{});
+                s = 0;
+                while (s < 11) : (s += 1) {
+                    const byte = emu.bus.read8(short_addr + s);
+                    if (byte >= 0x20 and byte < 0x7F) {
+                        print("{c}", .{byte});
+                    } else {
+                        print(".", .{});
+                    }
+                }
+                print("\n", .{});
+                // Compute expected checksum
+                var computed_chksum: u32 = 0;
+                s = 0;
+                while (s < 11) : (s += 1) {
+                    const byte = emu.bus.read8(short_addr + s);
+                    // Rotate right by 1 and add byte
+                    computed_chksum = (((computed_chksum >> 1) | ((computed_chksum & 1) << 7)) + byte) & 0xFF;
+                }
+                print("      Computed checksum: 0x{X:0>2} (expected 0x{X:0>2})\n", .{
+                    @as(u8, @truncate(computed_chksum)),
+                    chksum,
+                });
+            }
+        }
+    }
+    print("  Total LFN entries for rockbox.ipod found: {d}\n", .{lfn_found});
+
     print("Emulator stopped.\n", .{});
 }
 
