@@ -101,14 +101,19 @@ pub const I2cController = struct {
         self.pcf_regs[0x01] = 0x00; // All inputs inactive
 
         // INT1-INT3 registers (0x02-0x04) - Interrupt status (read-to-clear)
-        self.pcf_regs[0x02] = 0x00; // INT1: No pending interrupts
-        self.pcf_regs[0x03] = 0x00; // INT2: No pending interrupts
+        // Set some bits to indicate power is ready during boot
+        // INT1 bits: 0=ONKEY1S, 1=ONKEYR, 2=ONKEYF, 3=ONKEY30S, 4=HIGHTMP, 5=LOWBAT, 6=reserved, 7=SECOND
+        // INT2 bits: 0=ALARM, 1=PSSC, 2=reserved, 3=reserved, 4=reserved, 5=CHGINS, 6=CHGREM, 7=CHGOV
+        // INT3 bits: 0=APTS, 1=reserved, 2=ONKEY30S, 3=reserved, 4=BGMODE, 5=reserved, 6=reserved, 7=THLDA
+        self.pcf_regs[0x02] = 0x02; // INT1: ONKEYR (key released = boot complete)
+        self.pcf_regs[0x03] = 0x02; // INT2: PSSC (power supply status change = power ready)
         self.pcf_regs[0x04] = 0x00; // INT3: No pending interrupts
 
         // INT1M-INT3M registers (0x05-0x07) - Interrupt masks
         // 1 = masked (disabled), 0 = unmasked (enabled)
-        self.pcf_regs[0x05] = 0xFF; // INT1M: All masked
-        self.pcf_regs[0x06] = 0xFF; // INT2M: All masked
+        // Unmask power-related interrupts to allow firmware to see events
+        self.pcf_regs[0x05] = 0xFD; // INT1M: Unmask ONKEYR (bit 1)
+        self.pcf_regs[0x06] = 0xFD; // INT2M: Unmask PSSC (bit 1)
         self.pcf_regs[0x07] = 0xFF; // INT3M: All masked
 
         // OOCC1-OOCC2 (0x08-0x09) - On/Off control config
@@ -125,7 +130,9 @@ pub const I2cController = struct {
         self.pcf_regs[0x10] = 24; // RTCYR: year (2024 - 2000)
 
         // PSSC register (0x14) - Power supply status control
-        self.pcf_regs[0x14] = 0x00;
+        // Set bits to indicate all power rails are good
+        // Bits indicate which regulators are supplying power
+        self.pcf_regs[0x14] = 0xFF; // All power rails OK
 
         // PWROKM register (0x15) - PWROK mask
         self.pcf_regs[0x15] = 0x00;

@@ -379,7 +379,16 @@ pub const Emulator = struct {
             std.debug.print("RTOS KICKSTART: Enabled at cycle {} (tracing + kickstart)\n", .{self.total_cycles});
         }
 
-        // TCB Kickstart: Try modifying task state directly in RAM at 5000 cycles
+        // Scheduler Kickstart: Clear the scheduler skip flag at 0x1081D858
+        // The scheduler at 0x102778C0 checks bit 0 of [0x1081D858].
+        // If set, it skips task selection and returns immediately.
+        // The firmware writes 1 here during init, causing the scheduler to loop.
+        // Clear this bit to allow task selection to proceed.
+        if (self.total_cycles >= 3_000 and self.total_cycles < 100_000) {
+            self.bus.schedulerKickstart();
+        }
+
+        // TCB Kickstart: Try modifying task state directly in RAM
         // The task state at 0x108701CC should be initialized by then
         if (self.total_cycles >= 5_000 and self.total_cycles < 5_100) {
             self.bus.tcbKickstart();
