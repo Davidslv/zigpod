@@ -365,15 +365,19 @@ pub const Emulator = struct {
             self.rtos_kickstart_fired = true;
             // Simulate Boot ROM initialization: enable interrupts in CPSR
             // Real Boot ROM would do this before jumping to firmware
+            // With BX LR returned for unmapped reads, uninitialized IRQ handlers
+            // will safely return instead of crashing
             self.cpu.enableIrq();
             self.cpu.enableFiq();
             // Enable kickstart mode - hw_accel reads will return modified values
             // to indicate task 0 is ready, breaking the scheduler loop
             self.bus.enableKickstart();
-            // Also fire timer1 interrupt to kick the RTOS
+            // Enable I2C tracing to see what the firmware is requesting
+            self.i2c_ctrl.enableTracing();
+            // Fire timer interrupt to wake RTOS scheduler
             self.int_ctrl.forceEnableCpuInterrupt(Interrupt.timer1);
             self.int_ctrl.assertInterrupt(Interrupt.timer1);
-            std.debug.print("RTOS KICKSTART: Enabled IRQ/FIQ + timer1 + hw_accel[0] at cycle {}\n", .{self.total_cycles});
+            std.debug.print("RTOS KICKSTART: Enabled hw_accel[0] + IRQ + timer1 at cycle {}\n", .{self.total_cycles});
         }
 
         return cycles;

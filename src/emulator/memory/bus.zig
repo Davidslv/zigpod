@@ -586,7 +586,7 @@ pub const MemoryBus = struct {
             .lcd_bridge => self.readPeripheral(self.lcd_bridge, translated_addr, LCD_BRIDGE_START),
             .ata => self.readPeripheral(self.ata, translated_addr, ATA_START),
             .flash_ctrl => self.readFlashCtrl(translated_addr),
-            .unmapped => 0, // Return 0 for unmapped addresses
+            .unmapped => 0xE12FFF1E, // Return "BX LR" for graceful handling of uninitialized pointers
         };
 
         // Complete tracking for partition struct area reads
@@ -1156,7 +1156,11 @@ pub const MemoryBus = struct {
                 (@as(u32, self.sdram[offset + 2]) << 16) |
                 (@as(u32, self.sdram[offset + 3]) << 24);
         }
-        return 0;
+
+        // Return "BX LR" (0xE12FFF1E) for unmapped SDRAM reads
+        // This allows graceful handling of uninitialized function pointers
+        // by returning immediately when jumped to
+        return 0xE12FFF1E;
     }
 
     fn writeSdram(self: *Self, addr: u32, value: u32) void {

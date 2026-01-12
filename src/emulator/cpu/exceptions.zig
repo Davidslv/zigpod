@@ -67,11 +67,19 @@ pub const Exception = enum(u3) {
 
     /// Calculate the return address offset
     /// This is subtracted from PC to get the actual return address
+    ///
+    /// NOTE: Our emulator increments PC by 4 (ARM) or 2 (Thumb) BEFORE executing
+    /// the instruction. So when we enter exception, PC already points to the
+    /// next instruction. For SWI, we want LR = next instruction, so offset = 0.
+    /// For other exceptions, the offset accounts for whether we want to re-execute
+    /// the faulting instruction (Data Abort) or continue after it.
     pub fn returnOffset(self: Exception, is_thumb: bool) u32 {
         return switch (self) {
             .reset => 0,
             .undefined => if (is_thumb) 2 else 4,
-            .swi => if (is_thumb) 2 else 4,
+            // SWI: PC is already at next instruction, so no offset needed
+            // LR should point to instruction after SWI
+            .swi => 0,
             .prefetch_abort => 4,
             .data_abort => 8,
             .irq => 4,
@@ -87,6 +95,18 @@ pub fn enterException(regs: *RegisterFile, exception: Exception) u32 {
 
     // 1. Save current CPSR to target mode's SPSR
     const old_cpsr = @as(u32, @bitCast(regs.cpsr));
+
+    // Debug: trace exception entry
+    if (exception == .irq or exception == .swi) {
+        const old_mode = regs.cpsr.getMode();
+        std.debug.print("{s} ENTRY: PC=0x{X:0>8}, old_cpsr=0x{X:0>8}, old_mode={any}, target={s}\n", .{
+            if (exception == .irq) "IRQ" else "SWI",
+            regs.r[15],
+            old_cpsr,
+            old_mode,
+            @tagName(target_mode),
+        });
+    }
 
     // 2. Calculate return address and save to LR
     //    For most exceptions, LR = PC at time of exception
@@ -126,16 +146,25 @@ pub fn enterException(regs: *RegisterFile, exception: Exception) u32 {
 /// - SUBS PC, LR, #offset
 /// - LDM with PC and S bit
 pub fn returnFromException(regs: *RegisterFile) void {
+    // Get current mode for debug
+    const cur_mode = regs.cpsr.getMode();
+
     // Get SPSR
     if (regs.getSpsr()) |spsr| {
         // Get return address from current LR
         const return_addr = regs.r[14];
 
-        // Restore CPSR from SPSR (this also changes mode)
+        // Debug: trace exception return
         const new_psr: PSR = @bitCast(spsr);
-        if (new_psr.getMode()) |new_mode| {
+        const new_mode = new_psr.getMode();
+        std.debug.print("EXC RETURN: cur_mode={any}, spsr=0x{X:0>8}, new_mode={any}, return_addr=0x{X:0>8}\n", .{ cur_mode, spsr, new_mode, return_addr });
+
+        // Restore CPSR from SPSR (this also changes mode)
+        if (new_mode) |mode| {
             // Switch mode with banking
-            regs.switchMode(new_mode);
+            regs.switchMode(mode);
+        } else {
+            std.debug.print("ERROR: SPSR has invalid mode bits! spsr=0x{X:0>8}\n", .{spsr});
         }
 
         // Fully restore CPSR
@@ -143,6 +172,8 @@ pub fn returnFromException(regs: *RegisterFile) void {
 
         // Set PC to return address
         regs.set(15, return_addr);
+    } else {
+        std.debug.print("EXC RETURN: No SPSR for current mode {any}\n", .{cur_mode});
     }
 }
 

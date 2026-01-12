@@ -725,10 +725,18 @@ fn executeMsr(regs: *RegisterFile, instruction: u32) u32 {
         const new_psr: PSR = @bitCast(new_cpsr);
 
         // Mode change requires register banking
-        if (new_psr.getMode()) |new_mode| {
+        const new_mode_opt = new_psr.getMode();
+        if (new_mode_opt) |new_mode| {
             if (current_mode != new_mode) {
+                std.debug.print("MSR: mode change {any} -> {s}, old_cpsr=0x{X:0>8}, new_cpsr=0x{X:0>8}, value=0x{X:0>8}\n", .{
+                    current_mode, @tagName(new_mode), old_cpsr, new_cpsr, value,
+                });
                 regs.switchMode(new_mode);
             }
+        } else {
+            std.debug.print("MSR: INVALID mode bits! old_cpsr=0x{X:0>8}, new_cpsr=0x{X:0>8}, value=0x{X:0>8}\n", .{
+                old_cpsr, new_cpsr, value,
+            });
         }
 
         regs.cpsr = @bitCast(new_cpsr);

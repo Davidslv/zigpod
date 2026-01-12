@@ -160,13 +160,25 @@ pub const Arm7tdmi = struct {
     }
 
     /// Enable IRQ in CPSR (clear I bit) - used to simulate Boot ROM initialization
+    /// Also clears I bit in current mode's SPSR so it stays enabled after exception return
     pub fn enableIrq(self: *Self) void {
         self.regs.cpsr.irq_disable = false;
+        // Also update SPSR so IRQ stays enabled when exception returns
+        if (self.regs.getSpsr()) |spsr| {
+            const new_spsr = spsr & ~@as(u32, 0x80); // Clear I bit
+            self.regs.setSpsr(new_spsr);
+        }
     }
 
     /// Enable FIQ in CPSR (clear F bit)
+    /// Also clears F bit in current mode's SPSR so it stays enabled after exception return
     pub fn enableFiq(self: *Self) void {
         self.regs.cpsr.fiq_disable = false;
+        // Also update SPSR so FIQ stays enabled when exception returns
+        if (self.regs.getSpsr()) |spsr| {
+            const new_spsr = spsr & ~@as(u32, 0x40); // Clear F bit
+            self.regs.setSpsr(new_spsr);
+        }
     }
 
     /// Force an exception (e.g., for SWI, undefined instruction)
