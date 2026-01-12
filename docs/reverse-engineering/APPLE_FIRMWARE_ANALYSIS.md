@@ -133,11 +133,103 @@ To make further progress, we need to:
 0x30: Status     - Bit 31 = ready flag
 ```
 
+## Deep Dive: Why Timer Interrupts Alone Won't Help
+
+### The Chicken-and-Egg Problem
+
+Analysis of peripheral access patterns reveals a fundamental issue:
+
+1. **0 timer accesses** - Firmware hasn't configured TIMER1_CFG or TIMER2_CFG
+2. **0 I2C accesses** - Firmware hasn't initialized PMU/codec
+3. **Interrupts actively disabled** - 61K writes to CPU_INT_DIS and COP_INT_DIS
+
+The RTOS scheduler is running but **no tasks are ready**. Timer configuration happens in tasks that need the scheduler to already be working.
+
+### Access Pattern Analysis
+
+The access counts show a clear pattern:
+- Device Init Status (0x30): **244,052** accesses
+- PP_VER1 (0x00): **122,026** accesses
+- DEV_INIT2+4 (0x24): **122,026** accesses
+- INT_FORCED_CLR: **61,013** accesses
+- CPU_INT_DIS: **61,013** accesses
+- COP_INT_DIS: **61,013** accesses
+
+The ratios suggest: 244K = 4 × 61K, 122K = 2 × 61K
+
+This indicates a tight loop:
+```c
+for (iterations) {
+    read PP_VER1;           // 122K
+    read DEV_INIT2+4;       // 122K
+    read Status;            // 122K
+    read Status;            // 122K (second check)
+
+    clear_int_forced();     // 61K
+    disable_cpu_int();      // 61K
+    disable_cop_int();      // 61K
+}
+```
+
+### Entry Point Analysis (0x10000800)
+
+Disassembly of the entry point shows:
+```asm
+0x10000800: b 0x100009f0           ; Jump to main init
+
+; At 0x100009f0 (initialization):
+0x10000a40: mov r0, #0x60000000    ; Load PROC_ID address
+0x10000a44: ldrb r2, [r0]          ; Read processor ID
+0x10000a48: cmp r2, #0x55          ; Is it CPU?
+0x10000a4c: beq cpu_init           ; CPU path
+
+; COP path (if r2 != 0x55):
+0x10000a50: ldr sp, [0x40005ff8]   ; COP stack
+0x10000a54: bl cop_sleep           ; COP goes to sleep
+
+; CPU path:
+0x10000a5c: ldr sp, [0x40003ff8]   ; CPU stack
+0x10000a60: bl early_init          ; Start initialization...
+```
+
+### The Status Register Mystery
+
+The firmware heavily polls **0x70000030** (244K times) - an **undocumented** register not in Rockbox headers. The emulator returns `0x80000000` (bit 31 = ready), but this may not be what Apple firmware expects.
+
+### Recommended Fix Approach
+
+#### Option 1: Fix Status Register Value (Quick Test)
+```zig
+// In bus.zig, try different values:
+0x30 => 0xFFFFFFFF,  // All bits set
+// or
+0x30 => 0x00000000,  // All bits clear
+```
+
+#### Option 2: Pre-fire Timer Interrupt (Force Scheduler)
+```zig
+// In core.zig step():
+if (self.total_cycles == 1_000_000) {
+    self.int_ctrl.setTimerInterrupt(true);
+}
+```
+
+#### Option 3: Pre-initialize Timers (More Realistic)
+```zig
+// In timers.zig init():
+// Auto-configure TIMER1 for 10ms tick
+self.timer1_cfg = 0xC000_2710;  // Enable, repeat, 10000 count
+```
+
+#### Option 4: I2C Device Responses (Most Complete)
+Ensure PCF50605 and WM8758 return valid responses when polled. The firmware may need PMU status before enabling other hardware.
+
 ## Conclusion
 
 The COP implementation is working correctly. The firmware simply doesn't reach the point where it needs to wake COP within 100M cycles. The primary blocker is the RTOS scheduler waiting for tasks that depend on:
-- Timer interrupts
-- I2C device responses
+- Device Init status register returning expected value
+- Timer interrupts (but timers aren't configured - chicken-egg)
+- I2C device responses (PMU/codec)
 - Other hardware events
 
-These need to be implemented for the firmware to progress beyond initialization.
+The most likely fix is understanding what value the firmware expects from the undocumented status register at 0x70000030.
