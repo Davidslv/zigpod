@@ -100,8 +100,39 @@ pub const MemoryBus = struct {
     /// Debug: count of LCD bridge writes
     lcd_bridge_write_count: u32,
 
+    /// Debug: count of SDRAM writes
+    sdram_write_count: u32,
+
+    /// Debug: count of IRAM writes
+    iram_write_count: u32,
+
+    /// Debug: track first few SDRAM writes
+    first_sdram_write_addr: u32,
+    first_sdram_write_value: u32,
+
     /// Flag indicating current access is from COP (for PROC_ID)
     is_cop_access: bool,
+
+    /// Debug: track ATA-related writes
+    debug_last_ata_read: bool,
+    debug_ata_write_count: u32,
+    debug_ata_first_write_addr: u32,
+    debug_ata_first_write_value: u32,
+    debug_ata_writes_to_sdram: u32,
+    debug_ata_writes_to_iram: u32,
+    /// Track writes around MBR boot signature offset (0x1FE)
+    debug_mbr_area_writes: u32,
+    /// Track first 8 write addresses/values after ATA reads
+    debug_ata_write_addrs: [8]u32,
+    debug_ata_write_vals: [8]u32,
+    /// Track writes containing MBR-related values
+    debug_mbr_value_writes: u32,
+    debug_mbr_value_last_addr: u32,
+    debug_mbr_value_last_val: u32,
+    /// Track all writes to 0x11002000-0x11003000 (where we see some data)
+    debug_region_writes: u32,
+    debug_region_first_addr: u32,
+    debug_region_first_val: u32,
 
     const Self = @This();
 
@@ -204,7 +235,26 @@ pub const MemoryBus = struct {
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
             .lcd_bridge_write_count = 0,
+            .sdram_write_count = 0,
+            .iram_write_count = 0,
+            .first_sdram_write_addr = 0,
+            .first_sdram_write_value = 0,
             .is_cop_access = false,
+            .debug_last_ata_read = false,
+            .debug_ata_write_count = 0,
+            .debug_ata_first_write_addr = 0,
+            .debug_ata_first_write_value = 0,
+            .debug_ata_writes_to_sdram = 0,
+            .debug_ata_writes_to_iram = 0,
+            .debug_mbr_area_writes = 0,
+            .debug_ata_write_addrs = [_]u32{0} ** 8,
+            .debug_ata_write_vals = [_]u32{0} ** 8,
+            .debug_mbr_value_writes = 0,
+            .debug_mbr_value_last_addr = 0,
+            .debug_mbr_value_last_val = 0,
+            .debug_region_writes = 0,
+            .debug_region_first_addr = 0,
+            .debug_region_first_val = 0,
         };
     }
 
@@ -233,7 +283,26 @@ pub const MemoryBus = struct {
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
             .lcd_bridge_write_count = 0,
+            .sdram_write_count = 0,
+            .iram_write_count = 0,
+            .first_sdram_write_addr = 0,
+            .first_sdram_write_value = 0,
             .is_cop_access = false,
+            .debug_last_ata_read = false,
+            .debug_ata_write_count = 0,
+            .debug_ata_first_write_addr = 0,
+            .debug_ata_first_write_value = 0,
+            .debug_ata_writes_to_sdram = 0,
+            .debug_ata_writes_to_iram = 0,
+            .debug_mbr_area_writes = 0,
+            .debug_ata_write_addrs = [_]u32{0} ** 8,
+            .debug_ata_write_vals = [_]u32{0} ** 8,
+            .debug_mbr_value_writes = 0,
+            .debug_mbr_value_last_addr = 0,
+            .debug_mbr_value_last_val = 0,
+            .debug_region_writes = 0,
+            .debug_region_first_addr = 0,
+            .debug_region_first_val = 0,
         };
     }
 
@@ -284,6 +353,11 @@ pub const MemoryBus = struct {
         const region = getRegion(addr);
         self.last_access_addr = addr;
         self.last_access_region = region;
+
+        // Track ATA DATA register reads (offset 0x1E0 from ATA_START)
+        if (region == .ata and (addr - ATA_START) == 0x1E0) {
+            self.debug_last_ata_read = true;
+        }
 
         return switch (region) {
             .boot_rom => self.readRom(addr),
@@ -383,6 +457,51 @@ pub const MemoryBus = struct {
             self.lcd_bridge_write_count += 1;
         }
 
+        // Debug: track writes after ATA DATA reads
+        if (self.debug_last_ata_read) {
+            // Capture first 8 write addresses/values
+            if (self.debug_ata_write_count < 8) {
+                self.debug_ata_write_addrs[self.debug_ata_write_count] = addr;
+                self.debug_ata_write_vals[self.debug_ata_write_count] = value;
+            }
+            self.debug_ata_write_count += 1;
+            if (self.debug_ata_write_count == 1) {
+                self.debug_ata_first_write_addr = addr;
+                self.debug_ata_first_write_value = value;
+            }
+            if (region == .sdram) {
+                self.debug_ata_writes_to_sdram += 1;
+            } else if (region == .iram) {
+                self.debug_ata_writes_to_iram += 1;
+            }
+            // Check if writing near MBR signature area (offset 0x1FC-0x200 in any buffer)
+            const low_offset = addr & 0x1FF; // Offset within 512-byte boundary
+            if (low_offset >= 0x1BC and low_offset <= 0x200) {
+                self.debug_mbr_area_writes += 1;
+            }
+            self.debug_last_ata_read = false;
+        }
+
+        // Track writes containing MBR-related values (0xAA55 or 0x0B in specific positions)
+        // Look for boot signature 0xAA55 in low 16 bits or high 16 bits
+        const has_aa55 = ((value & 0xFFFF) == 0xAA55) or (((value >> 16) & 0xFFFF) == 0xAA55);
+        // Look for partition type 0x0B followed by 0xFE (word = 0xFE0B)
+        const has_fe0b = ((value & 0xFFFF) == 0xFE0B) or (((value >> 16) & 0xFFFF) == 0xFE0B);
+        if (has_aa55 or has_fe0b) {
+            self.debug_mbr_value_writes += 1;
+            self.debug_mbr_value_last_addr = addr;
+            self.debug_mbr_value_last_val = value;
+        }
+
+        // Track writes to 0x11002000-0x11003000 region
+        if (addr >= 0x11002000 and addr < 0x11003000) {
+            if (self.debug_region_writes == 0) {
+                self.debug_region_first_addr = addr;
+                self.debug_region_first_val = value;
+            }
+            self.debug_region_writes += 1;
+        }
+
         switch (region) {
             .boot_rom => {}, // ROM is read-only
             .proc_id => {}, // PROC_ID is read-only
@@ -433,10 +552,16 @@ pub const MemoryBus = struct {
     fn writeSdram(self: *Self, addr: u32, value: u32) void {
         const offset = addr - SDRAM_START;
         if (offset + 3 < self.sdram.len) {
+            // Capture first SDRAM write
+            if (self.sdram_write_count == 0) {
+                self.first_sdram_write_addr = addr;
+                self.first_sdram_write_value = value;
+            }
             self.sdram[offset] = @truncate(value);
             self.sdram[offset + 1] = @truncate(value >> 8);
             self.sdram[offset + 2] = @truncate(value >> 16);
             self.sdram[offset + 3] = @truncate(value >> 24);
+            self.sdram_write_count += 1;
         }
     }
 
@@ -458,6 +583,7 @@ pub const MemoryBus = struct {
             self.iram[offset + 1] = @truncate(value >> 8);
             self.iram[offset + 2] = @truncate(value >> 16);
             self.iram[offset + 3] = @truncate(value >> 24);
+            self.iram_write_count += 1;
         }
     }
 

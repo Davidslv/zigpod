@@ -397,6 +397,8 @@ pub fn main() !void {
     });
     print("Bus LCD writes: {d}\n", .{emu.bus.lcd_write_count});
     print("Bus LCD bridge writes: {d}\n", .{emu.bus.lcd_bridge_write_count});
+    print("Bus SDRAM writes: {d}, IRAM writes: {d}\n", .{emu.bus.sdram_write_count, emu.bus.iram_write_count});
+    print("First SDRAM write: addr=0x{X:0>8}, value=0x{X:0>8}\n", .{emu.bus.first_sdram_write_addr, emu.bus.first_sdram_write_value});
 
     // LCD2 bridge debug
     const lcd_mod = @import("peripherals/lcd.zig");
@@ -431,9 +433,63 @@ pub fn main() !void {
         ata_mod.AtaController.debug_disk_null,
         ata_mod.AtaController.debug_mbr_sig,
     });
+    print("ATA part1: type=0x{X:0>2}, lba={d}, sectors={d}\n", .{
+        ata_mod.AtaController.debug_part1_type,
+        ata_mod.AtaController.debug_part1_lba,
+        ata_mod.AtaController.debug_part1_sectors,
+    });
+    print("ATA part bytes read ({d}): ", .{ata_mod.AtaController.debug_part_bytes_captured});
+    for (ata_mod.AtaController.debug_part_bytes) |b| {
+        print("{X:0>2} ", .{b});
+    }
+    print("\n", .{});
+    print("ATA s0 words read: {d}, s0 loads: {d}\n", .{ ata_mod.AtaController.debug_s0_words_read, ata_mod.AtaController.debug_sector0_loads });
+    print("ATA first 8 words: ", .{});
+    for (ata_mod.AtaController.debug_first_8_words) |w| {
+        print("{X:0>4} ", .{w});
+    }
+    print("\n", .{});
+    print("ATA s0 key words: @1BE={X:0>4}, @1C0={X:0>4}, @1C2={X:0>4}, @1FE={X:0>4}\n", .{
+        ata_mod.AtaController.debug_s0_word_at_1be,
+        ata_mod.AtaController.debug_s0_word_at_1c0,
+        ata_mod.AtaController.debug_s0_word_at_1c2,
+        ata_mod.AtaController.debug_s0_word_at_1fe,
+    });
+    print("ATA part words returned: 0xE0={X:0>4}, 0xE1={X:0>4}, 0xE3={X:0>4}, 0xE4={X:0>4}, 0xE5={X:0>4}, 0xE6={X:0>4}\n", .{
+        ata_mod.AtaController.debug_part_word_0xE0,
+        ata_mod.AtaController.debug_part_word_0xE1,
+        ata_mod.AtaController.debug_part_word_0xE3,
+        ata_mod.AtaController.debug_part_word_0xE4,
+        ata_mod.AtaController.debug_part_word_0xE5,
+        ata_mod.AtaController.debug_part_word_0xE6,
+    });
     print("ATA commands: count={d}, last_cmd=0x{X:0>2}\n", .{
         ata_mod.AtaController.debug_cmd_count,
         ata_mod.AtaController.debug_last_cmd,
+    });
+
+    // ATA->Memory write tracking
+    print("ATA writes tracked: total={d}, to_sdram={d}, to_iram={d}, mbr_area={d}\n", .{
+        emu.bus.debug_ata_write_count,
+        emu.bus.debug_ata_writes_to_sdram,
+        emu.bus.debug_ata_writes_to_iram,
+        emu.bus.debug_mbr_area_writes,
+    });
+    print("ATA first 8 writes:\n", .{});
+    for (emu.bus.debug_ata_write_addrs, 0..) |addr, idx| {
+        if (addr != 0 or idx == 0) {
+            print("  [{d}] 0x{X:0>8} = 0x{X:0>8}\n", .{ idx, addr, emu.bus.debug_ata_write_vals[idx] });
+        }
+    }
+    print("MBR value writes: {d}, last: 0x{X:0>8} = 0x{X:0>8}\n", .{
+        emu.bus.debug_mbr_value_writes,
+        emu.bus.debug_mbr_value_last_addr,
+        emu.bus.debug_mbr_value_last_val,
+    });
+    print("Region 0x11002xxx writes: {d}, first: 0x{X:0>8} = 0x{X:0>8}\n", .{
+        emu.bus.debug_region_writes,
+        emu.bus.debug_region_first_addr,
+        emu.bus.debug_region_first_val,
     });
 
     // I2S debug
@@ -455,6 +511,317 @@ pub fn main() !void {
             print("  +{d:>3}: 0x{X:0>8} \"{s}\"\n", .{ offset, val, bytes });
         } else {
             print("  +{d:>3}: 0x{X:0>8}\n", .{ offset, val });
+        }
+    }
+    print("=================================\n", .{});
+
+    // Scan SDRAM for partition signature (0xAA55 at offset 0x1FE)
+    print("\n=== Scanning SDRAM for MBR signature ===\n", .{});
+    var found_mbr: u32 = 0;
+    var scan_addr: u32 = 0x10000000;
+    while (scan_addr < 0x10100000) : (scan_addr += 0x200) { // Scan first 1MB, 512-byte aligned
+        const sig = emu.bus.read16(scan_addr + 0x1FE);
+        if (sig == 0xAA55) {
+            found_mbr += 1;
+            if (found_mbr <= 3) { // Show first 3 matches
+                const ptype = emu.bus.read8(scan_addr + 0x1C2);
+                const plba = emu.bus.read32(scan_addr + 0x1C6);
+                print("  MBR found at 0x{X:0>8}: type=0x{X:0>2}, lba={d}\n", .{ scan_addr, ptype, plba });
+            }
+        }
+    }
+    print("  Total MBR signatures found in SDRAM (aligned): {d}\n", .{found_mbr});
+
+    // Also scan for 0xAA55 at any 2-byte aligned address around where writes happen (0x11000000)
+    print("=== Scanning for 0xAA55 near 0x11000000 ===\n", .{});
+    var found_sig: u32 = 0;
+    scan_addr = 0x11000000;
+    while (scan_addr < 0x11100000) : (scan_addr += 2) { // Scan 1MB near 0x11000000
+        const sig = emu.bus.read16(scan_addr);
+        if (sig == 0xAA55) {
+            found_sig += 1;
+            if (found_sig <= 5) {
+                print("  0xAA55 at 0x{X:0>8}\n", .{scan_addr});
+            }
+        }
+    }
+    print("  Total 0xAA55 found near 0x11000000: {d}\n", .{found_sig});
+
+    // Examine data around 0x11002D98 where we found 0xAA55
+    print("=== Data around 0x11002D98 ===\n", .{});
+    const sig_addr: u32 = 0x11002D98;
+    // Print 32 bytes before and after
+    print("  Bytes at sig-16: ", .{});
+    var i: u32 = 0;
+    while (i < 32) : (i += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(sig_addr - 16 + i)});
+    }
+    print("\n", .{});
+    // Check if there's valid partition data 0x1FE bytes before the signature
+    const possible_start = sig_addr - 0x1FE;
+    print("  If sector start at 0x{X:0>8}:\n", .{possible_start});
+    print("    Boot sig offset: 0x{X:0>8}\n", .{sig_addr});
+    const ptype_addr = possible_start + 0x1C2;
+    print("    Part type at 0x{X:0>8}: 0x{X:0>2}\n", .{ ptype_addr, emu.bus.read8(ptype_addr) });
+
+    // Show partition entry area (16 bytes at offset 0x1BE from possible sector start)
+    const part_entry_addr = possible_start + 0x1BE;
+    print("  Partition entry at 0x{X:0>8}: ", .{part_entry_addr});
+    i = 0;
+    while (i < 16) : (i += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(part_entry_addr + i)});
+    }
+    print("\n", .{});
+
+    // Also check sector-aligned addresses near 0x11000000
+    print("=== Checking sector-aligned buffers near 0x11000000 ===\n", .{});
+    var check_addr: u32 = 0x11000000;
+    while (check_addr < 0x11004000) : (check_addr += 0x200) {
+        const test_sig = emu.bus.read16(check_addr + 0x1FE);
+        if (test_sig == 0xAA55) {
+            print("  MBR at 0x{X:0>8}: type=0x{X:0>2}, lba={d}, sectors={d}\n", .{
+                check_addr,
+                emu.bus.read8(check_addr + 0x1C2),
+                emu.bus.read32(check_addr + 0x1C6),
+                emu.bus.read32(check_addr + 0x1CA),
+            });
+        }
+    }
+
+    // Scan ALL of SDRAM for pattern 0x55 0xAA at any byte offset
+    print("=== Scanning first 64KB of SDRAM region at 0x11000000 for AA55 ===\n", .{});
+    var aa55_count: u32 = 0;
+    scan_addr = 0x11000000;
+    while (scan_addr < 0x11010000) : (scan_addr += 2) {
+        const word = emu.bus.read16(scan_addr);
+        if (word == 0xAA55) {
+            aa55_count += 1;
+            if (aa55_count <= 10) {
+                const sector_start = scan_addr - 0x1FE;
+                const part_type = emu.bus.read8(sector_start + 0x1C2);
+                print("  0xAA55 at 0x{X:0>8} (offset 0x{X:0>4}), implied sector start 0x{X:0>8}, part type 0x{X:0>2}\n", .{
+                    scan_addr,
+                    scan_addr & 0x1FF,
+                    sector_start,
+                    part_type,
+                });
+            }
+        }
+    }
+    print("  Total 0xAA55 occurrences in first 64KB: {d}\n", .{aa55_count});
+
+    // Search for the actual MBR partition signature bytes (0x0B at correct offset)
+    print("=== Searching for partition type 0x0B in SDRAM ===\n", .{});
+    var part_type_count: u32 = 0;
+    scan_addr = 0x11000000;
+    while (scan_addr < 0x11010000) : (scan_addr += 1) {
+        if (emu.bus.read8(scan_addr) == 0x0B) {
+            // Check if this might be a partition type byte
+            // (followed by 0xFE for CHS end head)
+            if (emu.bus.read8(scan_addr + 1) == 0xFE) {
+                part_type_count += 1;
+                if (part_type_count <= 5) {
+                    print("  Found 0x0B,0xFE at 0x{X:0>8}\n", .{scan_addr});
+                    // Show context: 8 bytes before and 8 bytes after
+                    print("    Context: ", .{});
+                    var ctx: u32 = 0;
+                    while (ctx < 20) : (ctx += 1) {
+                        const ctx_addr = scan_addr - 8 + ctx;
+                        if (ctx_addr >= 0x11000000) {
+                            print("{X:0>2} ", .{emu.bus.read8(ctx_addr)});
+                        }
+                    }
+                    print("\n", .{});
+                }
+            }
+        }
+    }
+    print("  Found {d} potential partition entries with 0x0B,0xFE pattern\n", .{part_type_count});
+
+    // Scan ENTIRE used SDRAM region for AA55
+    print("=== Scanning all used SDRAM (0x11000000-0x11100000) for AA55 ===\n", .{});
+    var total_aa55: u32 = 0;
+    scan_addr = 0x11000000;
+    while (scan_addr < 0x11100000) : (scan_addr += 2) {
+        if (emu.bus.read16(scan_addr) == 0xAA55) {
+            total_aa55 += 1;
+        }
+    }
+    print("  Total 0xAA55 in 1MB region: {d}\n", .{total_aa55});
+
+    // Also scan for MBR at 512-byte aligned in this range
+    print("=== Scanning for MBR near 0x11000000 ===\n", .{});
+    var found_mbr2: u32 = 0;
+    scan_addr = 0x11000000;
+    while (scan_addr < 0x11100000) : (scan_addr += 0x200) {
+        const sig = emu.bus.read16(scan_addr + 0x1FE);
+        if (sig == 0xAA55) {
+            found_mbr2 += 1;
+            if (found_mbr2 <= 3) {
+                const ptype = emu.bus.read8(scan_addr + 0x1C2);
+                const plba = emu.bus.read32(scan_addr + 0x1C6);
+                print("  MBR found at 0x{X:0>8}: type=0x{X:0>2}, lba={d}\n", .{ scan_addr, ptype, plba });
+            }
+        }
+    }
+    print("  Total MBR found near 0x11000000: {d}\n", .{found_mbr2});
+
+    // Also scan IRAM
+    print("\n=== Scanning IRAM for MBR signature ===\n", .{});
+    var found_iram_mbr: u32 = 0;
+    var iram_addr: u32 = 0x40000000;
+    while (iram_addr < 0x40018000) : (iram_addr += 0x200) {
+        const sig = emu.bus.read16(iram_addr + 0x1FE);
+        if (sig == 0xAA55) {
+            found_iram_mbr += 1;
+            const ptype = emu.bus.read8(iram_addr + 0x1C2);
+            const plba = emu.bus.read32(iram_addr + 0x1C6);
+            print("  MBR found at 0x{X:0>8}: type=0x{X:0>2}, lba={d}\n", .{ iram_addr, ptype, plba });
+        }
+    }
+    print("  Total MBR signatures found in IRAM: {d}\n", .{found_iram_mbr});
+
+    // Scan IRAM for 0xAA55 at any offset
+    print("=== Scanning IRAM for 0xAA55 at any offset ===\n", .{});
+    var iram_aa55_count: u32 = 0;
+    iram_addr = 0x40000000;
+    while (iram_addr < 0x40018000) : (iram_addr += 2) {
+        if (emu.bus.read16(iram_addr) == 0xAA55) {
+            iram_aa55_count += 1;
+            if (iram_aa55_count <= 5) {
+                print("  0xAA55 at 0x{X:0>8}\n", .{iram_addr});
+            }
+        }
+    }
+    print("  Total 0xAA55 in IRAM: {d}\n", .{iram_aa55_count});
+
+    // Scan IRAM for partition pattern 0x0B, 0xFE
+    print("=== Scanning IRAM for partition type 0x0B ===\n", .{});
+    var iram_part_count: u32 = 0;
+    iram_addr = 0x40000000;
+    while (iram_addr < 0x40018000) : (iram_addr += 1) {
+        if (emu.bus.read8(iram_addr) == 0x0B and emu.bus.read8(iram_addr + 1) == 0xFE) {
+            iram_part_count += 1;
+            if (iram_part_count <= 5) {
+                print("  Found 0x0B,0xFE at 0x{X:0>8}\n", .{iram_addr});
+                // Show context
+                print("    Context: ", .{});
+                var ctx: u32 = 0;
+                while (ctx < 20) : (ctx += 1) {
+                    const ctx_addr = iram_addr - 8 + ctx;
+                    if (ctx_addr >= 0x40000000 and ctx_addr < 0x40018000) {
+                        print("{X:0>2} ", .{emu.bus.read8(ctx_addr)});
+                    }
+                }
+                print("\n", .{});
+            }
+        }
+    }
+    print("  Found {d} potential partition entries in IRAM\n", .{iram_part_count});
+
+    // Search for other MBR patterns: 0xFE0B as a 16-bit word
+    print("=== Searching for 0xFE0B word (partition entry) ===\n", .{});
+    var fe0b_count: u32 = 0;
+    scan_addr = 0x10000000;
+    while (scan_addr < 0x12000000) : (scan_addr += 2) {
+        if (emu.bus.read16(scan_addr) == 0xFE0B) {
+            fe0b_count += 1;
+            if (fe0b_count <= 5) {
+                print("  0xFE0B at 0x{X:0>8}\n", .{scan_addr});
+            }
+        }
+    }
+    iram_addr = 0x40000000;
+    while (iram_addr < 0x40018000) : (iram_addr += 2) {
+        if (emu.bus.read16(iram_addr) == 0xFE0B) {
+            fe0b_count += 1;
+            if (fe0b_count <= 10) {
+                print("  0xFE0B at 0x{X:0>8} (IRAM)\n", .{iram_addr});
+            }
+        }
+    }
+    print("  Total 0xFE0B occurrences: {d}\n", .{fe0b_count});
+
+    // Search for LBA=1 pattern (bytes 01 00 00 00)
+    print("=== Searching for LBA=1 (0x00000001) pattern ===\n", .{});
+    var lba1_count: u32 = 0;
+    scan_addr = 0x11000000;
+    while (scan_addr < 0x11100000) : (scan_addr += 4) {
+        if (emu.bus.read32(scan_addr) == 0x00000001) {
+            // Check if followed by sector count (0x0001FFFF or similar)
+            const next_word = emu.bus.read32(scan_addr + 4);
+            if (next_word > 0x1000 and next_word < 0x10000000) {
+                lba1_count += 1;
+                if (lba1_count <= 10) {
+                    print("  LBA=1 at 0x{X:0>8}, next_word=0x{X:0>8}\n", .{ scan_addr, next_word });
+                    // Show context: 32 bytes around this location
+                    print("    Memory at -16: ", .{});
+                    var ctx: u32 = 0;
+                    while (ctx < 32) : (ctx += 1) {
+                        const ctx_addr = scan_addr - 16 + ctx;
+                        if (ctx_addr >= 0x11000000) {
+                            print("{X:0>2} ", .{emu.bus.read8(ctx_addr)});
+                        }
+                    }
+                    print("\n", .{});
+                }
+            }
+        }
+    }
+    print("  Potential LBA=1 entries found: {d}\n", .{lba1_count});
+
+    // Dump memory around 0x11001A30 where LBA=1 was found
+    print("=== Examining partition struct at 0x11001A20 ===\n", .{});
+    print("  Bytes: ", .{});
+    var dump_addr: u32 = 0x11001A20;
+    while (dump_addr < 0x11001A60) : (dump_addr += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(dump_addr)});
+    }
+    print("\n", .{});
+    print("  As u32: ", .{});
+    dump_addr = 0x11001A20;
+    while (dump_addr < 0x11001A60) : (dump_addr += 4) {
+        print("{X:0>8} ", .{emu.bus.read32(dump_addr)});
+    }
+    print("\n", .{});
+
+    // Search for raw partition entry first 4 bytes: 00 FE FF FF
+    print("=== Searching for raw partition entry (00 FE FF FF) ===\n", .{});
+    var raw_part_count: u32 = 0;
+    scan_addr = 0x10000000;
+    while (scan_addr < 0x12000000) : (scan_addr += 1) {
+        if (emu.bus.read8(scan_addr) == 0x00 and
+            emu.bus.read8(scan_addr + 1) == 0xFE and
+            emu.bus.read8(scan_addr + 2) == 0xFF and
+            emu.bus.read8(scan_addr + 3) == 0xFF)
+        {
+            raw_part_count += 1;
+            if (raw_part_count <= 5) {
+                print("  Found at 0x{X:0>8}: ", .{scan_addr});
+                var prt: u32 = 0;
+                while (prt < 16) : (prt += 1) {
+                    print("{X:0>2} ", .{emu.bus.read8(scan_addr + prt)});
+                }
+                print("\n", .{});
+            }
+        }
+    }
+    print("  Total raw partition entries found: {d}\n", .{raw_part_count});
+
+    // Also check IRAM for the same pattern
+    iram_addr = 0x40000000;
+    while (iram_addr < 0x40017FFC) : (iram_addr += 1) {
+        if (emu.bus.read8(iram_addr) == 0x00 and
+            emu.bus.read8(iram_addr + 1) == 0xFE and
+            emu.bus.read8(iram_addr + 2) == 0xFF and
+            emu.bus.read8(iram_addr + 3) == 0xFF)
+        {
+            print("  Found in IRAM at 0x{X:0>8}: ", .{iram_addr});
+            var prt: u32 = 0;
+            while (prt < 16) : (prt += 1) {
+                print("{X:0>2} ", .{emu.bus.read8(iram_addr + prt)});
+            }
+            print("\n", .{});
         }
     }
     print("=================================\n", .{});

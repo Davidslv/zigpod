@@ -92,6 +92,9 @@ pub const AtaController = struct {
     // LBA mode flag
     lba_mode: bool,
 
+    // Multiple mode sector count
+    multiple_count: u8,
+
     // Disk image backend
     disk: ?*DiskBackend,
 
@@ -144,6 +147,7 @@ pub const AtaController = struct {
             .is_read = false,
             .is_write = false,
             .lba_mode = false,
+            .multiple_count = 1,
             .disk = null,
             .int_ctrl = null,
         };
@@ -218,12 +222,39 @@ pub const AtaController = struct {
                 self.status = Status.DRDY | Status.DSC;
                 self.assertInterrupt();
             },
+            Command.SET_MULTIPLE => {
+                // Set multiple mode - store block count
+                // sector_count contains the block size (sectors per block)
+                self.multiple_count = if (self.sector_count == 0) 1 else self.sector_count;
+                self.status = Status.DRDY | Status.DSC;
+                self.assertInterrupt();
+            },
             else => {
                 // Unknown command
                 self.err = 0x04; // Aborted command
                 self.status = Status.DRDY | Status.ERR;
                 self.assertInterrupt();
             },
+        }
+    }
+
+    /// Copy ATA string with byte swapping (ATA swaps bytes within each 16-bit word)
+    fn copyAtaString(dest: []u8, src: []const u8) void {
+        var i: usize = 0;
+        while (i < dest.len and i < src.len) : (i += 2) {
+            // Swap bytes within each word
+            if (i + 1 < src.len and i + 1 < dest.len) {
+                dest[i] = src[i + 1];
+                dest[i + 1] = src[i];
+            } else if (i < src.len and i < dest.len) {
+                dest[i] = ' ';
+                if (i + 1 < dest.len) dest[i + 1] = src[i];
+            }
+        }
+        // Pad remainder with spaces (swapped)
+        while (i < dest.len) : (i += 2) {
+            dest[i] = ' ';
+            if (i + 1 < dest.len) dest[i + 1] = ' ';
         }
     }
 
@@ -235,17 +266,17 @@ pub const AtaController = struct {
         self.data_buffer[0] = 0x00;
         self.data_buffer[1] = 0x00;
 
-        // Words 10-19: Serial number (20 characters)
+        // Words 10-19: Serial number (20 characters, ATA byte-swapped)
         const serial = "ZigPod-iFlash-Solo01";
-        @memcpy(self.data_buffer[20..40], serial);
+        copyAtaString(self.data_buffer[20..40], serial);
 
-        // Words 23-26: Firmware revision (8 characters)
+        // Words 23-26: Firmware revision (8 characters, ATA byte-swapped)
         const firmware = "1.0.0   ";
-        @memcpy(self.data_buffer[46..54], firmware);
+        copyAtaString(self.data_buffer[46..54], firmware);
 
-        // Words 27-46: Model number (40 characters)
+        // Words 27-46: Model number (40 characters, ATA byte-swapped)
         const model = "iFlash Solo CF Adapter                  ";
-        @memcpy(self.data_buffer[54..94], model);
+        copyAtaString(self.data_buffer[54..94], model);
 
         // Word 47: Max sectors per R/W multiple
         self.data_buffer[94] = 16; // 16 sectors max
@@ -311,8 +342,22 @@ pub const AtaController = struct {
             debug_disk_read_success += 1;
             // Capture MBR signature if sector 0
             if (lba == 0) {
+                debug_sector0_in_buffer = true;
+                debug_sector0_loads += 1;
                 debug_mbr_sig = @as(u16, self.data_buffer[510]) |
                     (@as(u16, self.data_buffer[511]) << 8);
+                // Capture partition 1 type and sector count for debugging
+                debug_part1_type = self.data_buffer[0x1C2];
+                debug_part1_lba = @as(u32, self.data_buffer[0x1C6]) |
+                    (@as(u32, self.data_buffer[0x1C7]) << 8) |
+                    (@as(u32, self.data_buffer[0x1C8]) << 16) |
+                    (@as(u32, self.data_buffer[0x1C9]) << 24);
+                debug_part1_sectors = @as(u32, self.data_buffer[0x1CA]) |
+                    (@as(u32, self.data_buffer[0x1CB]) << 8) |
+                    (@as(u32, self.data_buffer[0x1CC]) << 16) |
+                    (@as(u32, self.data_buffer[0x1CD]) << 24);
+            } else {
+                debug_sector0_in_buffer = false;
             }
         } else {
             // No disk attached - return zeros
@@ -386,6 +431,29 @@ pub const AtaController = struct {
     pub var debug_disk_read_success: u32 = 0;
     pub var debug_disk_null: u32 = 0;
     pub var debug_mbr_sig: u16 = 0;
+    pub var debug_part1_type: u8 = 0;
+    pub var debug_part1_lba: u32 = 0;
+    pub var debug_part1_sectors: u32 = 0;
+    pub var debug_part_bytes: [16]u8 = [_]u8{0} ** 16;
+    pub var debug_part_bytes_captured: u8 = 0;
+    pub var debug_sector0_in_buffer: bool = false;
+    pub var debug_sector0_loads: u32 = 0; // How many times sector 0 was loaded
+    // Track partition-related data returns
+    pub var debug_part_word_0xE0: u32 = 0; // Word at 0x1C0 (offset 224)
+    pub var debug_part_word_0xE1: u32 = 0; // Word at 0x1C2 (type byte)
+    pub var debug_part_word_0xE3: u32 = 0; // Word at 0x1C6 (LBA low)
+    pub var debug_part_word_0xE4: u32 = 0; // Word at 0x1C8 (LBA high)
+    pub var debug_part_word_0xE5: u32 = 0; // Word at 0x1CA (sectors low)
+    pub var debug_part_word_0xE6: u32 = 0; // Word at 0x1CC (sectors high)
+    pub var debug_s0_words_read: u32 = 0; // How many words read from sector 0
+    // Track first 8 words returned
+    pub var debug_first_8_words: [8]u16 = [_]u16{0} ** 8;
+    pub var debug_first_8_captured: bool = false;
+    // Track words at partition offset
+    pub var debug_s0_word_at_1be: u16 = 0; // Word at 0x1BE
+    pub var debug_s0_word_at_1c0: u16 = 0; // Word at 0x1C0
+    pub var debug_s0_word_at_1c2: u16 = 0; // Word at 0x1C2 (type byte)
+    pub var debug_s0_word_at_1fe: u16 = 0; // Word at 0x1FE (boot sig)
 
     /// Read register
     pub fn read(self: *Self, offset: u32) u32 {
@@ -399,12 +467,52 @@ pub const AtaController = struct {
                     debug_data_reads_not_ready += 1;
                     break :blk 0;
                 }
-                debug_last_buffer_byte = self.data_buffer[0];
+                // Capture partition table area (0x1BE-0x1CD) when reading sector 0
+                if (debug_part_bytes_captured == 0 and debug_sector0_in_buffer and self.buffer_pos == 0) {
+                    // Capture the whole partition entry when starting to read sector 0
+                    var i: usize = 0;
+                    while (i < 16) : (i += 1) {
+                        debug_part_bytes[i] = self.data_buffer[0x1BE + i];
+                    }
+                    debug_part_bytes_captured = 16;
+                }
                 const lo = self.data_buffer[self.buffer_pos];
                 const hi = if (self.buffer_pos + 1 < self.buffer_len)
                     self.data_buffer[self.buffer_pos + 1]
                 else
                     0;
+                const word: u32 = @as(u32, lo) | (@as(u32, hi) << 8);
+
+                // Track partition-related word returns for sector 0
+                if (debug_sector0_in_buffer) {
+                    debug_s0_words_read += 1;
+                    // Capture first 8 words of first sector 0 read
+                    if (!debug_first_8_captured and self.buffer_pos < 16) {
+                        debug_first_8_words[self.buffer_pos / 2] = @truncate(word);
+                        if (self.buffer_pos == 14) {
+                            debug_first_8_captured = true;
+                        }
+                    }
+                    // buffer_pos is the current position BEFORE incrementing
+                    // Capture specific partition-related words
+                    switch (self.buffer_pos) {
+                        0x1BE => debug_s0_word_at_1be = @truncate(word),
+                        0x1C0 => {
+                            debug_part_word_0xE0 = word;
+                            debug_s0_word_at_1c0 = @truncate(word);
+                        },
+                        0x1C2 => {
+                            debug_part_word_0xE1 = word;
+                            debug_s0_word_at_1c2 = @truncate(word);
+                        },
+                        0x1C6 => debug_part_word_0xE3 = word,
+                        0x1C8 => debug_part_word_0xE4 = word,
+                        0x1CA => debug_part_word_0xE5 = word,
+                        0x1CC => debug_part_word_0xE6 = word,
+                        0x1FE => debug_s0_word_at_1fe = @truncate(word),
+                        else => {},
+                    }
+                }
                 self.buffer_pos += 2;
 
                 // Check if sector is complete
@@ -420,7 +528,7 @@ pub const AtaController = struct {
                     }
                 }
 
-                break :blk @as(u32, lo) | (@as(u32, hi) << 8);
+                break :blk word;
             },
             REG_ERROR => self.err,
             REG_NSECTOR => self.sector_count,
