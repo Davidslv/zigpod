@@ -289,10 +289,58 @@ pub fn main() !void {
     root_entries[entry_idx].fst_clus_lo = @truncate(rockbox_dir_cluster);
     root_entries[entry_idx].file_size = 0;  // Directories have size 0
 
+    entry_idx += 1;
+
+    // Also add rockbox.ipod directly to root for fallback testing
+    // This helps debug if the issue is with subdirectory access vs file lookup
+    const root_ipod_short: [11]u8 = "ROCKBO~2IPO".*;  // Use ~2 to avoid conflict
+    const root_ipod_checksum = lfnChecksum(&root_ipod_short);
+
+    // LFN entry for rockbox.ipod in root
+    const root_lfn = @as(*LfnEntry, @ptrCast(@alignCast(&root_sector_data[entry_idx * 32])));
+    root_lfn.seq_num = 0x41;
+    root_lfn.attr = ATTR_LFN;
+    root_lfn.reserved = 0;
+    root_lfn.checksum = root_ipod_checksum;
+    root_lfn.cluster = 0;
+
+    const ipod_name = "rockbox.ipod";
+    writeUcs2Char(&root_lfn.name1, 0, ipod_name[0]);
+    writeUcs2Char(&root_lfn.name1, 1, ipod_name[1]);
+    writeUcs2Char(&root_lfn.name1, 2, ipod_name[2]);
+    writeUcs2Char(&root_lfn.name1, 3, ipod_name[3]);
+    writeUcs2Char(&root_lfn.name1, 4, ipod_name[4]);
+
+    writeUcs2Char(&root_lfn.name2, 0, ipod_name[5]);
+    writeUcs2Char(&root_lfn.name2, 1, ipod_name[6]);
+    writeUcs2Char(&root_lfn.name2, 2, ipod_name[7]);
+    writeUcs2Char(&root_lfn.name2, 3, ipod_name[8]);
+    writeUcs2Char(&root_lfn.name2, 4, ipod_name[9]);
+    writeUcs2Char(&root_lfn.name2, 5, ipod_name[10]);
+
+    writeUcs2Char(&root_lfn.name3, 0, ipod_name[11]);
+    writeUcs2Null(&root_lfn.name3, 1);
+
+    entry_idx += 1;
+
+    // 8.3 entry for root rockbox.ipod
+    root_entries[entry_idx].name = root_ipod_short;
+    root_entries[entry_idx].attr = ATTR_ARCHIVE;
+    root_entries[entry_idx].nt_res = 0;
+    root_entries[entry_idx].crt_time_tenth = 0;
+    root_entries[entry_idx].crt_time = 0;
+    root_entries[entry_idx].crt_date = 0x5421;
+    root_entries[entry_idx].lst_acc_date = 0x5421;
+    root_entries[entry_idx].fst_clus_hi = 0;
+    root_entries[entry_idx].wrt_time = 0;
+    root_entries[entry_idx].wrt_date = 0x5421;
+    root_entries[entry_idx].fst_clus_lo = 4;  // Same cluster as .rockbox version
+    root_entries[entry_idx].file_size = 12;  // Same as .rockbox version
+
     // Write updated root directory
     try file.seekTo(root_sector * SECTOR_SIZE);
     try file.writeAll(&root_sector_data);
-    std.debug.print("Added .ROCKBOX directory entry to root\n", .{});
+    std.debug.print("Added .ROCKBOX directory entry and /rockbox.ipod to root\n", .{});
 
     // Create .rockbox directory contents
     var rockbox_dir_data: [SECTOR_SIZE]u8 = [_]u8{0} ** SECTOR_SIZE;

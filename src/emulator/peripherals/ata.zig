@@ -348,7 +348,7 @@ pub const AtaController = struct {
             if (lba == 2055 or lba == 2056) {
                 std.debug.print("=== Sector {} directory entries ===\n", .{lba});
                 var entry_idx: usize = 0;
-                while (entry_idx < 4) : (entry_idx += 1) {
+                while (entry_idx < 8) : (entry_idx += 1) {
                     const offset = entry_idx * 32;
                     const name_slice = self.data_buffer[offset .. offset + 11];
                     const attr = self.data_buffer[offset + 11];
