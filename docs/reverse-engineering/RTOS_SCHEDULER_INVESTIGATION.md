@@ -415,11 +415,32 @@ Based on the values observed:
 - **0x00000002** = ???
 - **0x00000003** = ready to run (target for kickstart)
 
-### Next Approach: Direct TCB Modification
+### TCB Modification Results (FAILED)
 
-Try modifying the task state field at 0x108701CC:
-- Change from 0x00000001 (sleeping) to 0x00000003 (ready)
-- This might wake up task 0 and break the scheduler loop
+Attempted to modify task state field at 0x108701CC:
+- Changed from 0x00000001 (sleeping) to 0x00000003 (ready)
+- Result: **Scheduler still stuck at 0x1000097C**
+
+Also tried aggressive hw_accel modification:
+- Always return task 0 as "ready" (state 11) on every read
+- Result: **No effect - hw_accel not polled after init**
+
+### Key Insight
+
+The scheduler at 0x1000097C is NOT polling:
+- hw_accel region (0x60003000) - only used during init
+- TCB state at 0x108701CC - modification has no effect
+
+The wait_for_event function (0x100277C0) must be waiting for:
+1. **Interrupt** - Timer/IRQ, but dispatch tables not initialized
+2. **I2C completion** - PMU or codec device response
+3. **Event flag** - Set by peripheral driver we're not emulating
+
+### Next Approach: I2C Device Response
+
+Since peripheral access counts show 0 I2C accesses during the scheduler
+wait, the firmware might be waiting for I2C initialization to complete
+before reaching the scheduler. Need to investigate early boot I2C sequence.
 
 ---
 
@@ -429,10 +450,12 @@ Try modifying the task state field at 0x108701CC:
 2. [ ] Disassemble subroutine at 0x229C10
 3. [x] Test hw_accel kickstart (partial success)
 4. [x] Investigate task 0 blocking reason (blocked on unknown RAM state)
-5. [ ] Implement I2C device responses (PMU/codec)
+5. [~] Implement I2C device responses (PMU/codec) ← **PRIORITY**
 6. [x] Find task state RAM address (found: 0x108701CC and related TCB fields)
 7. [ ] Find and initialize IRQ dispatch tables
-8. [ ] Try direct TCB modification at 0x108701CC
+8. [x] Try direct TCB modification at 0x108701CC ← **FAILED - no effect**
+9. [ ] Analyze wait_for_event function at 0x100277C0
+10. [ ] Trace what conditions wait_for_event is checking
 
 ---
 
