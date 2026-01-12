@@ -30,6 +30,7 @@ pub const Region = enum {
     lcd,
     lcd_bridge, // LCD2 bridge at 0x70008a00 (what Rockbox uses)
     proc_id, // Processor ID at 0x60000000
+    mailbox, // CPU/COP mailbox registers at 0x60001000-0x60001FFF
     interrupt_ctrl,
     timers,
     system_ctrl,
@@ -42,6 +43,7 @@ pub const Region = enum {
     i2c,
     clickwheel,
     ata,
+    flash_ctrl, // Flash/memory controller at 0xF000F000 (Apple firmware uses this)
     unmapped,
 };
 
@@ -89,6 +91,16 @@ pub const MemoryBus = struct {
 
     /// Stub registers for unimplemented peripherals
     stub_registers: [256]u32,
+
+    /// Flash controller registers (0xF000F000-0xF000F0FF)
+    /// Offset 0x0C contains return address for boot ROM call
+    flash_ctrl_regs: [64]u32,
+
+    /// Mailbox registers for CPU/COP synchronization
+    /// cpu_queue: bit 29 set by CPU writes, cleared by COP reads
+    /// cop_queue: bit 29 set by COP writes, cleared by CPU reads
+    cpu_queue: u32,
+    cop_queue: u32,
 
     /// Access tracking for debugging
     last_access_addr: u32,
@@ -149,6 +161,16 @@ pub const MemoryBus = struct {
     debug_pinfo_write_vals: [8]u32,
     /// Track reads from part[0] area (0x11001A30-0x11001A3C)
     debug_part0_reads: u32,
+    /// Track writes containing LFN entry pattern (0x41 byte)
+    debug_lfn_write_count: u32,
+    debug_lfn_write_addrs: [8]u32,
+    debug_lfn_write_vals: [8]u32,
+    /// Track reads from sector buffer area (0x11006F40-0x11006F80)
+    debug_sector_read_count: u32,
+    debug_sector_read_addrs: [32]u32,
+    debug_sector_read_vals: [32]u32,
+    /// Track reads where attr byte (offset 0x0B) == 0x0F
+    debug_lfn_attr_read_count: u32,
 
     const Self = @This();
 
@@ -180,6 +202,14 @@ pub const MemoryBus = struct {
 
     /// Processor ID register
     const PROC_ID_ADDR: u32 = 0x60000000;
+
+    /// Mailbox/Queue registers for CPU/COP communication
+    /// CPU_QUEUE at 0x60001010: CPU sets bit 29, only COP read clears it
+    /// COP_QUEUE at 0x60001020: COP sets bit 29, only CPU read clears it
+    const MAILBOX_START: u32 = 0x60001000;
+    const MAILBOX_END: u32 = 0x60001FFF;
+    const CPU_QUEUE_OFFSET: u32 = 0x10; // 0x60001010
+    const COP_QUEUE_OFFSET: u32 = 0x20; // 0x60001020
 
     /// System Controller (includes processor control at 0x60007000)
     const SYS_CTRL_START: u32 = 0x60006000;
@@ -225,6 +255,28 @@ pub const MemoryBus = struct {
     const ATA_START: u32 = 0xC3000000;
     const ATA_END: u32 = 0xC30003FF;
 
+    /// Flash/Memory Controller (Apple firmware writes config here before jumping to ROM)
+    const FLASH_CTRL_START: u32 = 0xF000F000;
+    const FLASH_CTRL_END: u32 = 0xF000F0FF;
+
+    /// Apple firmware encoded address range (0x04xxxxxx → 0x10xxxxxx)
+    /// Apple firmware uses 0x04 prefix + offset to reference data within the firmware image
+    /// Since firmware is loaded at 0x10000000, 0x04XXXXXX maps to 0x10XXXXXX
+    const ENCODED_FW_START: u32 = 0x04000000;
+    const ENCODED_FW_END: u32 = 0x04FFFFFF;
+    const ENCODED_FW_MASK: u32 = 0x00FFFFFF; // Extract lower 24 bits
+
+    /// Translate Apple firmware encoded addresses to real SDRAM addresses
+    /// 0x04xxxxxx → 0x10xxxxxx (firmware offset within SDRAM)
+    fn translateAddress(addr: u32) u32 {
+        if (addr >= ENCODED_FW_START and addr <= ENCODED_FW_END) {
+            // Extract offset from encoded address and add SDRAM base
+            const offset = addr & ENCODED_FW_MASK;
+            return SDRAM_START + offset;
+        }
+        return addr;
+    }
+
     /// Initialize the memory bus
     pub fn init(sdram_size: usize, boot_rom: []const u8) Self {
         _ = sdram_size;
@@ -247,6 +299,9 @@ pub const MemoryBus = struct {
             .lcd = null,
             .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
+            .flash_ctrl_regs = [_]u32{0} ** 64,
+            .cpu_queue = 0,
+            .cop_queue = 0,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
@@ -298,6 +353,9 @@ pub const MemoryBus = struct {
             .lcd = null,
             .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
+            .flash_ctrl_regs = [_]u32{0} ** 64,
+            .cpu_queue = 0,
+            .cop_queue = 0,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
@@ -333,6 +391,13 @@ pub const MemoryBus = struct {
             .debug_pinfo_write_addrs = [_]u32{0} ** 8,
             .debug_pinfo_write_vals = [_]u32{0} ** 8,
             .debug_part0_reads = 0,
+            .debug_lfn_write_count = 0,
+            .debug_lfn_write_addrs = [_]u32{0} ** 8,
+            .debug_lfn_write_vals = [_]u32{0} ** 8,
+            .debug_sector_read_count = 0,
+            .debug_sector_read_addrs = [_]u32{0} ** 32,
+            .debug_sector_read_vals = [_]u32{0} ** 32,
+            .debug_lfn_attr_read_count = 0,
         };
     }
 
@@ -348,6 +413,7 @@ pub const MemoryBus = struct {
         if (addr >= LCD_START and addr <= LCD_END) return .lcd;
         if (addr >= IRAM_START and addr <= IRAM_END) return .iram;
         if (addr == PROC_ID_ADDR) return .proc_id;
+        if (addr >= MAILBOX_START and addr <= MAILBOX_END) return .mailbox;
         if (addr >= INT_CTRL_START and addr <= INT_CTRL_END) return .interrupt_ctrl;
         if (addr >= TIMER_START and addr <= TIMER_END) return .timers;
         if (addr >= SYS_CTRL_START and addr <= SYS_CTRL_END) return .system_ctrl;
@@ -361,6 +427,7 @@ pub const MemoryBus = struct {
         if (addr >= I2C_START and addr <= I2C_END) return .i2c;
         if (addr >= CLICKWHEEL_START and addr <= CLICKWHEEL_END) return .clickwheel;
         if (addr >= ATA_START and addr <= ATA_END) return .ata;
+        if (addr >= FLASH_CTRL_START and addr <= FLASH_CTRL_END) return .flash_ctrl;
         return .unmapped;
     }
 
@@ -380,12 +447,14 @@ pub const MemoryBus = struct {
 
     /// Read 32-bit value
     pub fn read32(self: *Self, addr: u32) u32 {
-        const region = getRegion(addr);
-        self.last_access_addr = addr;
+        // Translate Apple firmware encoded addresses (0x04xxxxxx → 0x10xxxxxx)
+        const translated_addr = translateAddress(addr);
+        const region = getRegion(translated_addr);
+        self.last_access_addr = translated_addr;
         self.last_access_region = region;
 
         // Track ATA DATA register reads (offset 0x1E0 from ATA_START)
-        if (region == .ata and (addr - ATA_START) == 0x1E0) {
+        if (region == .ata and (translated_addr - ATA_START) == 0x1E0) {
             self.debug_last_ata_read = true;
         }
 
@@ -403,24 +472,26 @@ pub const MemoryBus = struct {
         }
 
         const value = switch (region) {
-            .boot_rom => self.readRom(addr),
-            .sdram => self.readSdram(addr),
-            .iram => self.readIram(addr),
-            .lcd => self.readPeripheral(self.lcd, addr, LCD_START),
+            .boot_rom => self.readRom(translated_addr),
+            .sdram => self.readSdram(translated_addr),
+            .iram => self.readIram(translated_addr),
+            .lcd => self.readPeripheral(self.lcd, translated_addr, LCD_START),
             .proc_id => if (self.is_cop_access) @as(u32, 0xAA) else @as(u32, 0x55),
-            .interrupt_ctrl => self.readPeripheral(self.interrupt_ctrl, addr, INT_CTRL_START),
-            .timers => self.readPeripheral(self.timers, addr, TIMER_START),
-            .system_ctrl => self.readPeripheral(self.system_ctrl, addr, SYS_CTRL_START),
-            .cache_ctrl => self.readPeripheral(self.cache_ctrl, addr, CACHE_CTRL_START),
-            .dma => self.readPeripheral(self.dma, addr, DMA_START),
-            .gpio => self.readPeripheral(self.gpio, addr, GPIO_START),
-            .device_init => self.readPeripheral(self.device_init, addr, DEV_INIT_START),
-            .gpo32 => self.readPeripheral(self.gpo32, addr, GPO32_START),
-            .i2s => self.readPeripheral(self.i2s, addr, I2S_START),
-            .i2c => self.readPeripheral(self.i2c, addr, I2C_START),
-            .clickwheel => self.readPeripheral(self.clickwheel, addr, CLICKWHEEL_START),
-            .lcd_bridge => self.readPeripheral(self.lcd_bridge, addr, LCD_BRIDGE_START),
-            .ata => self.readPeripheral(self.ata, addr, ATA_START),
+            .mailbox => self.readMailbox(translated_addr),
+            .interrupt_ctrl => self.readPeripheral(self.interrupt_ctrl, translated_addr, INT_CTRL_START),
+            .timers => self.readPeripheral(self.timers, translated_addr, TIMER_START),
+            .system_ctrl => self.readPeripheral(self.system_ctrl, translated_addr, SYS_CTRL_START),
+            .cache_ctrl => self.readPeripheral(self.cache_ctrl, translated_addr, CACHE_CTRL_START),
+            .dma => self.readPeripheral(self.dma, translated_addr, DMA_START),
+            .gpio => self.readPeripheral(self.gpio, translated_addr, GPIO_START),
+            .device_init => self.readPeripheral(self.device_init, translated_addr, DEV_INIT_START),
+            .gpo32 => self.readPeripheral(self.gpo32, translated_addr, GPO32_START),
+            .i2s => self.readPeripheral(self.i2s, translated_addr, I2S_START),
+            .i2c => self.readPeripheral(self.i2c, translated_addr, I2C_START),
+            .clickwheel => self.readPeripheral(self.clickwheel, translated_addr, CLICKWHEEL_START),
+            .lcd_bridge => self.readPeripheral(self.lcd_bridge, translated_addr, LCD_BRIDGE_START),
+            .ata => self.readPeripheral(self.ata, translated_addr, ATA_START),
+            .flash_ctrl => self.readFlashCtrl(translated_addr),
             .unmapped => 0, // Return 0 for unmapped addresses
         };
 
@@ -429,6 +500,58 @@ pub const MemoryBus = struct {
             if (self.debug_part_reads < 16) {
                 self.debug_part_read_vals[self.debug_part_reads] = value;
                 self.debug_part_reads += 1;
+            }
+        }
+
+        // Track reads from sector buffer area where .rockbox LFN entry should be
+        // Buffer at 0x11006F14, LFN entry at offset 0x40 (addr 0x11006F54)
+        // Track reads from 0x11006F40 to 0x11006F80 (covers entries at offset 0x2C-0x6C)
+        if (addr >= 0x11006F40 and addr < 0x11006F80) {
+            if (self.debug_sector_read_count < 32) {
+                self.debug_sector_read_addrs[self.debug_sector_read_count] = addr;
+                self.debug_sector_read_vals[self.debug_sector_read_count] = value;
+                self.debug_sector_read_count += 1;
+            }
+            // Check if this read includes the attr byte position for an LFN check
+            // LFN attr is at offset 0x0B within 32-byte entry
+            // Entry at 0x11006F54 has attr at 0x11006F5F
+            // Check if the value contains 0x0F at the expected position
+            if (addr == 0x11006F5C) { // 0x11006F5F aligned down to 32-bit boundary
+                const attr_byte = (value >> 24) & 0xFF; // byte at offset 3 (0x5F)
+                if (attr_byte == 0x0F) {
+                    self.debug_lfn_attr_read_count += 1;
+                }
+                // Print real-time trace showing LFN write count at time of read
+                const print = std.debug.print;
+                print("ATTR READ at 0x{X:0>8}: val=0x{X:0>8}, attr_byte=0x{X:0>2}, lfn_writes={d}\n", .{ addr, value, attr_byte, self.debug_lfn_write_count });
+            }
+            // Also trace reads from 0x11006F54 (LFN entry start)
+            if (addr == 0x11006F54) {
+                const print = std.debug.print;
+                print("LFN_START READ at 0x{X:0>8}: val=0x{X:0>8}, lfn_writes={d}\n", .{ addr, value, self.debug_lfn_write_count });
+            }
+            // Trace reads from 0x11006F74 (SHORT entry at offset 0x60 in .rockbox dir)
+            if (addr == 0x11006F74) {
+                const print = std.debug.print;
+                print("SHORT_ENTRY READ at 0x{X:0>8}: val=0x{X:0>8}, lfn_writes={d}\n", .{ addr, value, self.debug_lfn_write_count });
+            }
+        }
+        // Trace reads from checksum area (entry+0x0C..0x0F contains checksum at byte 0x0D)
+        if (addr == 0x11006F60) { // entry + 0x0C aligned
+            const print = std.debug.print;
+            const chksum_byte = (value >> 8) & 0xFF; // byte at offset 0x0D
+            print("CHECKSUM READ at 0x{X:0>8}: val=0x{X:0>8}, checksum_byte=0x{X:0>2}, lfn_writes={d}\n", .{ addr, value, chksum_byte, self.debug_lfn_write_count });
+        }
+        // Trace directory entry first bytes (to see iteration pattern)
+        // Buffer starts at ~0x11006F14, entries at 0x20 intervals
+        // Entry 0 (.) at 0x11006F14, Entry 1 (..) at 0x11006F34, Entry 2 (LFN) at 0x11006F54
+        const entry_offsets = [_]u32{ 0x11006F14, 0x11006F34, 0x11006F54, 0x11006F74, 0x11006F94 };
+        for (entry_offsets) |entry_addr| {
+            if (addr == entry_addr) {
+                const print = std.debug.print;
+                const first_byte = value & 0xFF;
+                const char: u8 = if (first_byte >= 0x20 and first_byte < 0x7F) @truncate(first_byte) else '.';
+                print("DIR_ENTRY[0x{X:0>8}]: first_byte=0x{X:0>2}('{c}'), val=0x{X:0>8}, lfn_writes={d}\n", .{ entry_addr, first_byte, char, value, self.debug_lfn_write_count });
             }
         }
 
@@ -498,8 +621,10 @@ pub const MemoryBus = struct {
 
     /// Write 32-bit value
     pub fn write32(self: *Self, addr: u32, value: u32) void {
-        const region = getRegion(addr);
-        self.last_access_addr = addr;
+        // Translate Apple firmware encoded addresses (0x04xxxxxx → 0x10xxxxxx)
+        const translated_addr = translateAddress(addr);
+        const region = getRegion(translated_addr);
+        self.last_access_addr = translated_addr;
         self.last_access_region = region;
 
         // Debug: track LCD writes
@@ -508,6 +633,32 @@ pub const MemoryBus = struct {
         }
         if (region == .lcd_bridge) {
             self.lcd_bridge_write_count += 1;
+        }
+
+        // Debug: track writes containing LFN entry signature for "rockbox.ipod"
+        // First 16-bit word of LFN entry is: 0x41 (ord) + 0x72 ('r') = 0x7241
+        // Or as 32-bit: 0x006F7241 (two UTF-16LE chars: 'r' + 'o')
+        // Check for 0x7241 pattern (LFN start) or 0x4E checksum pattern
+        const lo16 = value & 0xFFFF;
+        const hi16 = (value >> 16) & 0xFFFF;
+        if (lo16 == 0x7241 or hi16 == 0x7241 or lo16 == 0x2E41 or hi16 == 0x2E41) {
+            // 0x7241 = start of "rockbox.ipod" LFN, 0x2E41 = start of ".rockbox" LFN
+            if (self.debug_lfn_write_count < 8) {
+                self.debug_lfn_write_addrs[self.debug_lfn_write_count] = addr;
+                self.debug_lfn_write_vals[self.debug_lfn_write_count] = value;
+                self.debug_lfn_write_count += 1;
+            }
+        }
+
+        // Track ALL writes to 0x11006F74 (where SHORT entry should be in .rockbox dir)
+        if (addr == 0x11006F74) {
+            const print = std.debug.print;
+            print("WRITE to 0x11006F74: val=0x{X:0>8}, lfn_writes={d}\n", .{ value, self.debug_lfn_write_count });
+        }
+        // Track ALL writes containing LFN start pattern anywhere in SDRAM (to find other buffers)
+        if (region == .sdram and value == 0x6F007241) {
+            const print = std.debug.print;
+            print("LFN_PATTERN WRITE at 0x{X:0>8}: val=0x{X:0>8}\n", .{ addr, value });
         }
 
         // Debug: track writes after ATA DATA reads
@@ -584,23 +735,91 @@ pub const MemoryBus = struct {
         switch (region) {
             .boot_rom => {}, // ROM is read-only
             .proc_id => {}, // PROC_ID is read-only
-            .sdram => self.writeSdram(addr, value),
-            .iram => self.writeIram(addr, value),
-            .lcd => self.writePeripheral(self.lcd, addr, LCD_START, value),
-            .interrupt_ctrl => self.writePeripheral(self.interrupt_ctrl, addr, INT_CTRL_START, value),
-            .timers => self.writePeripheral(self.timers, addr, TIMER_START, value),
-            .system_ctrl => self.writePeripheral(self.system_ctrl, addr, SYS_CTRL_START, value),
-            .cache_ctrl => self.writePeripheral(self.cache_ctrl, addr, CACHE_CTRL_START, value),
-            .dma => self.writePeripheral(self.dma, addr, DMA_START, value),
-            .gpio => self.writePeripheral(self.gpio, addr, GPIO_START, value),
-            .device_init => self.writePeripheral(self.device_init, addr, DEV_INIT_START, value),
-            .gpo32 => self.writePeripheral(self.gpo32, addr, GPO32_START, value),
-            .i2s => self.writePeripheral(self.i2s, addr, I2S_START, value),
-            .i2c => self.writePeripheral(self.i2c, addr, I2C_START, value),
-            .clickwheel => self.writePeripheral(self.clickwheel, addr, CLICKWHEEL_START, value),
-            .lcd_bridge => self.writePeripheral(self.lcd_bridge, addr, LCD_BRIDGE_START, value),
-            .ata => self.writePeripheral(self.ata, addr, ATA_START, value),
+            .mailbox => self.writeMailbox(translated_addr, value),
+            .sdram => self.writeSdram(translated_addr, value),
+            .iram => self.writeIram(translated_addr, value),
+            .lcd => self.writePeripheral(self.lcd, translated_addr, LCD_START, value),
+            .interrupt_ctrl => self.writePeripheral(self.interrupt_ctrl, translated_addr, INT_CTRL_START, value),
+            .timers => self.writePeripheral(self.timers, translated_addr, TIMER_START, value),
+            .system_ctrl => self.writePeripheral(self.system_ctrl, translated_addr, SYS_CTRL_START, value),
+            .cache_ctrl => self.writePeripheral(self.cache_ctrl, translated_addr, CACHE_CTRL_START, value),
+            .dma => self.writePeripheral(self.dma, translated_addr, DMA_START, value),
+            .gpio => self.writePeripheral(self.gpio, translated_addr, GPIO_START, value),
+            .device_init => self.writePeripheral(self.device_init, translated_addr, DEV_INIT_START, value),
+            .gpo32 => self.writePeripheral(self.gpo32, translated_addr, GPO32_START, value),
+            .i2s => self.writePeripheral(self.i2s, translated_addr, I2S_START, value),
+            .i2c => self.writePeripheral(self.i2c, translated_addr, I2C_START, value),
+            .clickwheel => self.writePeripheral(self.clickwheel, translated_addr, CLICKWHEEL_START, value),
+            .lcd_bridge => self.writePeripheral(self.lcd_bridge, translated_addr, LCD_BRIDGE_START, value),
+            .ata => self.writePeripheral(self.ata, translated_addr, ATA_START, value),
+            .flash_ctrl => self.writeFlashCtrl(translated_addr, value),
             .unmapped => {}, // Ignore writes to unmapped addresses
+        }
+    }
+
+    // Flash controller read/write (stores return address for boot ROM)
+    fn readFlashCtrl(self: *const Self, addr: u32) u32 {
+        const offset = (addr - FLASH_CTRL_START) >> 2;
+        if (offset < 64) {
+            return self.flash_ctrl_regs[offset];
+        }
+        return 0;
+    }
+
+    fn writeFlashCtrl(self: *Self, addr: u32, value: u32) void {
+        const offset = (addr - FLASH_CTRL_START) >> 2;
+        if (offset < 64) {
+            self.flash_ctrl_regs[offset] = value;
+            // Debug: log writes to help understand boot protocol
+            const print = std.debug.print;
+            print("FLASH_CTRL[0x{X:0>2}] = 0x{X:0>8}\n", .{ offset * 4, value });
+        }
+    }
+
+    // Mailbox registers for CPU/COP synchronization
+    // CPU_QUEUE at 0x60001010: CPU writes set bits, COP reads clear them
+    // COP_QUEUE at 0x60001020: COP writes set bits, CPU reads clear them
+    fn readMailbox(self: *Self, addr: u32) u32 {
+        const offset = addr - MAILBOX_START;
+        return switch (offset) {
+            CPU_QUEUE_OFFSET => blk: {
+                // COP reading CPU_QUEUE clears bit 29
+                if (self.is_cop_access) {
+                    const val = self.cpu_queue;
+                    self.cpu_queue &= ~@as(u32, 1 << 29);
+                    break :blk val;
+                }
+                break :blk self.cpu_queue;
+            },
+            COP_QUEUE_OFFSET => blk: {
+                // CPU reading COP_QUEUE clears bit 29
+                if (!self.is_cop_access) {
+                    const val = self.cop_queue;
+                    self.cop_queue &= ~@as(u32, 1 << 29);
+                    break :blk val;
+                }
+                break :blk self.cop_queue;
+            },
+            else => 0, // Other mailbox registers return 0
+        };
+    }
+
+    fn writeMailbox(self: *Self, addr: u32, value: u32) void {
+        const offset = addr - MAILBOX_START;
+        switch (offset) {
+            CPU_QUEUE_OFFSET => {
+                // CPU writing to CPU_QUEUE sets bits (OR operation for bit 29)
+                if (!self.is_cop_access) {
+                    self.cpu_queue |= value;
+                }
+            },
+            COP_QUEUE_OFFSET => {
+                // COP writing to COP_QUEUE sets bits (OR operation for bit 29)
+                if (self.is_cop_access) {
+                    self.cop_queue |= value;
+                }
+            },
+            else => {}, // Ignore other mailbox addresses
         }
     }
 
@@ -608,13 +827,47 @@ pub const MemoryBus = struct {
 
     fn readRom(self: *const Self, addr: u32) u32 {
         const offset = addr - ROM_START;
+
+        // If actual boot ROM is loaded, use it
         if (offset + 3 < self.boot_rom.len) {
             return @as(u32, self.boot_rom[offset]) |
                 (@as(u32, self.boot_rom[offset + 1]) << 8) |
                 (@as(u32, self.boot_rom[offset + 2]) << 16) |
                 (@as(u32, self.boot_rom[offset + 3]) << 24);
         }
-        return 0;
+
+        // Boot ROM stub for Apple firmware - calls function at 0xF000F00C and continues
+        // Apple firmware writes callback address to 0xF000F00C before jumping to ROM
+        // ROM should call that function with R0 = flash_ctrl base (0xF000F000)
+        // The callback uses R0 as a pointer to write back data at various offsets
+        // After callback, ROM should return to firmware (MOV PC, #0x10000A3C or next instr)
+        // Firmware jumped to ROM from 0x10000A38, so return to 0x10000A3C
+        // Layout:
+        //   0x23C: LDR R1, [PC, #0x14] ; R1 = 0xF000F00C (addr of callback ptr) from 0x258
+        //   0x240: LDR R0, [PC, #0x14] ; R0 = 0xF000F000 (flash ctrl base) from 0x25C
+        //   0x244: LDR R1, [R1]        ; R1 = callback address (dereference)
+        //   0x248: MOV LR, PC          ; LR = 0x250 (return point after BX)
+        //   0x24C: BX R1               ; Call callback with R0=flash_ctrl_base
+        //   0x250: LDR PC, [PC, #0xC]  ; Return to firmware at 0x10000A3C (from 0x264)
+        //   0x254: NOP                 ; Padding
+        //   0x258: 0xF000F00C          ; Literal: address of callback pointer
+        //   0x25C: 0xF000F000          ; Literal: flash_ctrl base address
+        //   0x260: NOP                 ; Padding
+        //   0x264: 0x10000A3C          ; Literal: firmware return address
+        return switch (addr) {
+            0x0000023C => 0xE59F1014, // LDR R1, [PC, #0x14] ; R1 = 0xF000F00C (from 0x258)
+            0x00000240 => 0xE59F0014, // LDR R0, [PC, #0x14] ; R0 = 0xF000F000 (from 0x25C)
+            0x00000244 => 0xE5911000, // LDR R1, [R1]        ; R1 = callback address
+            0x00000248 => 0xE1A0E00F, // MOV LR, PC          ; LR = 0x250
+            0x0000024C => 0xE12FFF11, // BX R1               ; Call callback
+            0x00000250 => 0xE59FF00C, // LDR PC, [PC, #0xC]  ; Jump to 0x10000A3C (from 0x264)
+            0x00000254 => 0xE1A00000, // NOP
+            0x00000258 => 0xF000F00C, // Literal: &flash_ctrl_regs[3]
+            0x0000025C => 0xF000F000, // Literal: flash_ctrl base
+            0x00000260 => 0xE1A00000, // NOP
+            0x00000264 => 0x10000A3C, // Literal: firmware return address
+            else => 0, // Return 0 for other unmapped ROM addresses
+        };
     }
 
     fn readSdram(self: *const Self, addr: u32) u32 {
@@ -735,6 +988,7 @@ pub const MemoryBus = struct {
             .lcd => "LCD",
             .lcd_bridge => "LCD Bridge",
             .proc_id => "Processor ID",
+            .mailbox => "Mailbox",
             .interrupt_ctrl => "Interrupt Controller",
             .timers => "Timers",
             .system_ctrl => "System Controller",

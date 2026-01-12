@@ -139,6 +139,7 @@ pub fn main() !void {
     var trace_count: u64 = 0;
     var max_cycles: ?u64 = null;
     var gdb_port: ?u16 = null;
+    var entry_point: ?u32 = null; // Custom entry point (e.g., 0x10000800 for Apple firmware)
 
     // Skip program name
     _ = args.next();
@@ -194,6 +195,17 @@ pub fn main() !void {
                 return error.InvalidArguments;
             };
             gdb_port = try std.fmt.parseInt(u16, port_str, 10);
+        } else if (std.mem.eql(u8, arg, "--entry")) {
+            const entry_str = args.next() orelse {
+                printErr("Error: --entry requires an address (e.g., 0x10000800)\n", .{});
+                return error.InvalidArguments;
+            };
+            // Parse hex address (with or without 0x prefix)
+            const hex_str = if (std.mem.startsWith(u8, entry_str, "0x") or std.mem.startsWith(u8, entry_str, "0X"))
+                entry_str[2..]
+            else
+                entry_str;
+            entry_point = try std.fmt.parseInt(u32, hex_str, 16);
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             disk_path = arg;
         } else {
@@ -245,7 +257,7 @@ pub fn main() !void {
     var sdram_firmware: ?[]u8 = null;
     if (sdram_firmware_path) |path| {
         print("Loading SDRAM firmware: {s}\n", .{path});
-        sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+        sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024); // 16MB max for large firmware
         print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{sdram_firmware.?.len});
         emu.loadSdram(0, sdram_firmware.?);
     }
@@ -264,8 +276,11 @@ pub fn main() !void {
     // Reset and start
     emu.reset();
 
-    // Set PC based on where firmware was loaded
-    if (iram_firmware_path != null) {
+    // Set PC based on where firmware was loaded (or custom entry point)
+    if (entry_point) |ep| {
+        emu.cpu.setPc(ep);
+        print("PC set to 0x{X:0>8} (custom entry point)\n", .{ep});
+    } else if (iram_firmware_path != null) {
         emu.cpu.setPc(0x40000000);
         print("PC set to 0x40000000 (IRAM)\n", .{});
     } else if (sdram_firmware_path != null) {
@@ -338,6 +353,11 @@ pub fn main() !void {
             else
                 emu.run(cycles);
             print("Executed {d} cycles\n", .{actual_cycles});
+            print("Final PC: 0x{X:0>8}, Mode: {s}, Thumb: {}\n", .{
+                emu.getPc(),
+                if (emu.cpu.getMode()) |m| @tagName(m) else "unknown",
+                emu.isThumb(),
+            });
         } else {
             if (emu.isGdbEnabled()) {
                 print("Running with GDB debugging (Ctrl+C in GDB to stop)...\n", .{});
@@ -541,6 +561,24 @@ pub fn main() !void {
         }
     }
     print("Reads from part[0] area (0x11001A30-0x11001A3C): {d}\n", .{emu.bus.debug_part0_reads});
+    // LFN write tracking
+    print("Writes containing 0x41 byte (potential LFN): {d}\n", .{emu.bus.debug_lfn_write_count});
+    for (emu.bus.debug_lfn_write_addrs, 0..) |addr, idx| {
+        if (idx < emu.bus.debug_lfn_write_count and idx < 8) {
+            print("  LFN write [{d}]: 0x{X:0>8} = 0x{X:0>8}\n", .{ idx, addr, emu.bus.debug_lfn_write_vals[idx] });
+        }
+    }
+    // Sector buffer read tracking
+    print("Reads from sector buffer area (0x11006F40-0x11006F80): {d}\n", .{emu.bus.debug_sector_read_count});
+    print("LFN attr reads (0x0F at expected position): {d}\n", .{emu.bus.debug_lfn_attr_read_count});
+    if (emu.bus.debug_sector_read_count > 0) {
+        print("First 16 reads:\n", .{});
+        for (emu.bus.debug_sector_read_addrs, 0..) |addr, idx| {
+            if (idx < emu.bus.debug_sector_read_count and idx < 16) {
+                print("  Read [{d:>2}]: 0x{X:0>8} = 0x{X:0>8}\n", .{ idx, addr, emu.bus.debug_sector_read_vals[idx] });
+            }
+        }
+    }
 
     // I2S debug
     const i2s_mod = @import("peripherals/i2s.zig");
@@ -1040,6 +1078,24 @@ pub fn main() !void {
         }
     }
     print("  Total LFN entries for rockbox.ipod found: {d}\n", .{lfn_found});
+
+    // Specifically check address 0x11006F54 where .rockbox LFN was written
+    print("=== Checking address 0x11006F54 (where .rockbox LFN was written) ===\n", .{});
+    print("  Raw 32 bytes: ", .{});
+    var dump_idx: u32 = 0;
+    while (dump_idx < 32) : (dump_idx += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x11006F54 + dump_idx)});
+    }
+    print("\n", .{});
+    const chk_ord = emu.bus.read8(0x11006F54);
+    const chk_attr = emu.bus.read8(0x11006F54 + 11);
+    const chk_chksum = emu.bus.read8(0x11006F54 + 13);
+    print("  ord=0x{X:0>2}, attr=0x{X:0>2}, checksum=0x{X:0>2}\n", .{ chk_ord, chk_attr, chk_chksum });
+    if (chk_ord == 0x41 and chk_attr == 0x0F) {
+        print("  This IS an LFN entry (chksum should be 0x4E for .rockbox/rockbox.ipod)\n", .{});
+    } else {
+        print("  This is NOT an LFN entry - data was OVERWRITTEN!\n", .{});
+    }
 
     print("Emulator stopped.\n", .{});
 }
