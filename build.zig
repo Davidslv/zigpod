@@ -208,6 +208,95 @@ pub fn build(b: *std.Build) void {
     sim_step.dependOn(&run_sim.step);
 
     // ============================================================
+    // PP5021C Emulator (Accurate ARM7TDMI + Peripherals)
+    // ============================================================
+
+    const emulator_module = b.createModule(.{
+        .root_source_file = b.path("src/emulator/main.zig"),
+        .target = default_target,
+        .optimize = optimize,
+    });
+
+    // Add SDL2 build option for emulator
+    const emulator_build_options = b.addOptions();
+    emulator_build_options.addOption(bool, "enable_sdl2", enable_sdl2);
+    emulator_module.addOptions("build_options", emulator_build_options);
+
+    const emulator_exe = b.addExecutable(.{
+        .name = "zigpod-emulator",
+        .root_module = emulator_module,
+    });
+
+    // Link SDL2 if enabled
+    if (enable_sdl2) {
+        emulator_exe.linkSystemLibrary("SDL2");
+        emulator_exe.linkLibC();
+    }
+
+    b.installArtifact(emulator_exe);
+
+    const run_emulator = b.addRunArtifact(emulator_exe);
+    run_emulator.step.dependOn(b.getInstallStep());
+
+    // Pass command line args to emulator
+    if (b.args) |args| {
+        run_emulator.addArgs(args);
+    }
+
+    const emulator_step = b.step("emulator", "Run the PP5021C emulator");
+    emulator_step.dependOn(&run_emulator.step);
+
+    // ============================================================
+    // Emulator LCD Test Firmware (ARM)
+    // ============================================================
+
+    const lcd_test = b.addExecutable(.{
+        .name = "lcd-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emulator/test_firmware/lcd_test.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+
+    lcd_test.setLinkerScript(b.path("linker/emulator_test.ld"));
+
+    const lcd_test_bin = lcd_test.addObjCopy(.{
+        .basename = "lcd-test.bin",
+        .format = .bin,
+    });
+
+    const install_lcd_test = b.addInstallFile(lcd_test_bin.getOutput(), "bin/lcd-test.bin");
+
+    const lcd_test_step = b.step("lcd-test", "Build LCD test firmware for emulator");
+    lcd_test_step.dependOn(&install_lcd_test.step);
+
+    // ============================================================
+    // Emulator Thumb Mode Test Firmware (ARM + Thumb)
+    // ============================================================
+
+    const thumb_test = b.addExecutable(.{
+        .name = "thumb-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emulator/test_firmware/thumb_test.zig"),
+            .target = arm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+
+    thumb_test.setLinkerScript(b.path("linker/emulator_test.ld"));
+
+    const thumb_test_bin = thumb_test.addObjCopy(.{
+        .basename = "thumb-test.bin",
+        .format = .bin,
+    });
+
+    const install_thumb_test = b.addInstallFile(thumb_test_bin.getOutput(), "bin/thumb-test.bin");
+
+    const thumb_test_step = b.step("thumb-test", "Build Thumb mode test firmware for emulator");
+    thumb_test_step.dependOn(&install_thumb_test.step);
+
+    // ============================================================
     // iPod Detection Tool (Host)
     // ============================================================
 
@@ -232,6 +321,140 @@ pub fn build(b: *std.Build) void {
 
     const ipod_detect_step = b.step("ipod-detect", "Detect connected iPod devices");
     ipod_detect_step.dependOn(&run_ipod_detect.step);
+
+    // ============================================================
+    // Firmware Generator Tools (Host)
+    // ============================================================
+
+    // Boot Stub Generator
+    const gen_boot_stub = b.addExecutable(.{
+        .name = "gen-boot-stub",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_boot_stub.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_boot_stub);
+
+    const run_gen_boot_stub = b.addRunArtifact(gen_boot_stub);
+    run_gen_boot_stub.step.dependOn(b.getInstallStep());
+    const gen_boot_stub_step = b.step("gen-boot-stub", "Generate boot stub firmware");
+    gen_boot_stub_step.dependOn(&run_gen_boot_stub.step);
+
+    // Test Firmware Generator
+    const gen_test_firmware = b.addExecutable(.{
+        .name = "gen-test-firmware",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_test_firmware.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_test_firmware);
+
+    const run_gen_test_firmware = b.addRunArtifact(gen_test_firmware);
+    run_gen_test_firmware.step.dependOn(b.getInstallStep());
+    const gen_test_firmware_step = b.step("gen-test-firmware", "Generate test firmware");
+    gen_test_firmware_step.dependOn(&run_gen_test_firmware.step);
+
+    // IRQ Test Firmware Generator
+    const gen_irq_test = b.addExecutable(.{
+        .name = "gen-irq-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_irq_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_irq_test);
+
+    const run_gen_irq_test = b.addRunArtifact(gen_irq_test);
+    run_gen_irq_test.step.dependOn(b.getInstallStep());
+    const gen_irq_test_step = b.step("gen-irq-test", "Generate IRQ test firmware");
+    gen_irq_test_step.dependOn(&run_gen_irq_test.step);
+
+    // LCD Test Firmware Generator
+    const gen_lcd_test = b.addExecutable(.{
+        .name = "gen-lcd-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_lcd_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_lcd_test);
+
+    const run_gen_lcd_test = b.addRunArtifact(gen_lcd_test);
+    run_gen_lcd_test.step.dependOn(b.getInstallStep());
+    const gen_lcd_test_step = b.step("gen-lcd-test", "Generate LCD test firmware");
+    gen_lcd_test_step.dependOn(&run_gen_lcd_test.step);
+
+    // ATA Test Firmware Generator
+    const gen_ata_test = b.addExecutable(.{
+        .name = "gen-ata-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_ata_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_ata_test);
+
+    const run_gen_ata_test = b.addRunArtifact(gen_ata_test);
+    run_gen_ata_test.step.dependOn(b.getInstallStep());
+    const gen_ata_test_step = b.step("gen-ata-test", "Generate ATA test firmware");
+    gen_ata_test_step.dependOn(&run_gen_ata_test.step);
+
+    // Audio Test Firmware Generator
+    const gen_audio_test = b.addExecutable(.{
+        .name = "gen-audio-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_audio_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_audio_test);
+
+    const run_gen_audio_test = b.addRunArtifact(gen_audio_test);
+    run_gen_audio_test.step.dependOn(b.getInstallStep());
+    const gen_audio_test_step = b.step("gen-audio-test", "Generate audio test firmware");
+    gen_audio_test_step.dependOn(&run_gen_audio_test.step);
+
+    // Disk Inspection Tool
+    const disk_inspect = b.addExecutable(.{
+        .name = "disk-inspect",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/disk_inspect.zig"),
+            .target = default_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fat32", .module = b.createModule(.{
+                    .root_source_file = b.path("src/emulator/storage/fat32.zig"),
+                    .target = default_target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+    b.installArtifact(disk_inspect);
+
+    // Rockbox-like PP5020 Test Firmware Generator
+    const gen_rockbox_test = b.addExecutable(.{
+        .name = "gen-rockbox-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_rockbox_test.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen_rockbox_test);
+
+    const run_gen_rockbox_test = b.addRunArtifact(gen_rockbox_test);
+    run_gen_rockbox_test.step.dependOn(b.getInstallStep());
+    const gen_rockbox_test_step = b.step("gen-rockbox-test", "Generate PP5020 test firmware");
+    gen_rockbox_test_step.dependOn(&run_gen_rockbox_test.step);
 
     // ============================================================
     // UI Demo (Native with SDL2)
@@ -278,8 +501,24 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    // Emulator unit tests
+    const emulator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emulator/core.zig"),
+            .target = default_target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_emulator_tests = b.addRunArtifact(emulator_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_emulator_tests.step);
+
+    // Dedicated emulator test step
+    const emulator_test_step = b.step("test-emulator", "Run emulator unit tests");
+    emulator_test_step.dependOn(&run_emulator_tests.step);
 
     // ============================================================
     // Integration Tests
