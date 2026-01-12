@@ -343,6 +343,29 @@ pub const AtaController = struct {
                 return;
             }
             debug_disk_read_success += 1;
+
+            // Debug: dump directory entries for sectors 2055 and 2056
+            if (lba == 2055 or lba == 2056) {
+                std.debug.print("=== Sector {} directory entries ===\n", .{lba});
+                var entry_idx: usize = 0;
+                while (entry_idx < 4) : (entry_idx += 1) {
+                    const offset = entry_idx * 32;
+                    const name_slice = self.data_buffer[offset .. offset + 11];
+                    const attr = self.data_buffer[offset + 11];
+                    const cluster_lo = @as(u16, self.data_buffer[offset + 26]) |
+                        (@as(u16, self.data_buffer[offset + 27]) << 8);
+                    std.debug.print("  Entry {}: name=", .{entry_idx});
+                    for (name_slice) |c| {
+                        if (c >= 0x20 and c < 0x7f) {
+                            std.debug.print("{c}", .{c});
+                        } else {
+                            std.debug.print(".", .{});
+                        }
+                    }
+                    std.debug.print(" attr=0x{X:0>2} cluster={}\n", .{ attr, cluster_lo });
+                }
+            }
+
             // Capture MBR signature if sector 0
             if (lba == 0) {
                 debug_sector0_in_buffer = true;

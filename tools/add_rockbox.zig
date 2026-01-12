@@ -51,8 +51,64 @@ const ATTR_SYSTEM: u8 = 0x04;
 const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
 const ATTR_ARCHIVE: u8 = 0x20;
+const ATTR_LFN: u8 = 0x0F; // Long File Name entry
 
 const FAT_END_OF_CHAIN: u32 = 0x0FFFFFFF;
+
+/// Long File Name directory entry structure
+const LfnEntry = extern struct {
+    seq_num: u8,           // Sequence number (last entry | 0x40)
+    name1: [10]u8,         // Characters 1-5 (UCS-2)
+    attr: u8,              // Always 0x0F for LFN
+    reserved: u8,          // Always 0
+    checksum: u8,          // Checksum of short name
+    name2: [12]u8,         // Characters 6-11 (UCS-2)
+    cluster: u16 align(1), // Always 0
+    name3: [4]u8,          // Characters 12-13 (UCS-2)
+};
+
+/// Calculate LFN checksum for 8.3 short name
+fn lfnChecksum(name: *const [11]u8) u8 {
+    var sum: u8 = 0;
+    for (name) |byte| {
+        // Rotate right by 1 and add
+        sum = ((sum >> 1) | ((sum & 1) << 7)) +% byte;
+    }
+    return sum;
+}
+
+/// Write UCS-2 character at position in LFN entry
+fn writeUcs2Char(dest: []u8, pos: usize, char: u8) void {
+    if (pos * 2 < dest.len) {
+        dest[pos * 2] = char;
+        if (pos * 2 + 1 < dest.len) {
+            dest[pos * 2 + 1] = 0; // High byte is 0 for ASCII
+        }
+    }
+}
+
+/// Write UCS-2 null terminator
+fn writeUcs2Null(dest: []u8, pos: usize) void {
+    if (pos * 2 < dest.len) {
+        dest[pos * 2] = 0;
+        if (pos * 2 + 1 < dest.len) {
+            dest[pos * 2 + 1] = 0;
+        }
+    }
+}
+
+/// Fill remaining with 0xFF
+fn fillUcs2Padding(dest: []u8, start_pos: usize, end_chars: usize) void {
+    var pos = start_pos;
+    while (pos < end_chars) : (pos += 1) {
+        if (pos * 2 < dest.len) {
+            dest[pos * 2] = 0xFF;
+            if (pos * 2 + 1 < dest.len) {
+                dest[pos * 2 + 1] = 0xFF;
+            }
+        }
+    }
+}
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -185,13 +241,42 @@ pub fn main() !void {
         return;
     }
 
-    // Add .rockbox directory entry
-    // Note: FAT short name rules - leading dot is special
-    // ".rockbox" becomes ".ROCKBOX   " (11 chars, space padded)
-    // But actually FAT doesn't allow leading dots in 8.3 names!
-    // We need to use "ROCKBOX    " and mark it as hidden, or use LFN
-    // For simplicity, let's just use "ROCKBOX " directory name
-    root_entries[entry_idx].name = ".ROCKBOX   ".*;  // Actually this won't work properly
+    // Add .rockbox directory entry with LFN
+    // FAT 8.3 format doesn't support leading dots for regular entries
+    // So we need: LFN entry with ".rockbox" + short name "ROCKBO~1   "
+
+    // Short name for .rockbox (without leading dot, 8.3 format)
+    const rockbox_dir_short: [11]u8 = "ROCKBO~1   ".*;
+    const rockbox_dir_lfn_checksum = lfnChecksum(&rockbox_dir_short);
+
+    // Entry 1: LFN entry for ".rockbox" (8 chars fits in 1 entry)
+    const lfn_dir_entry = @as(*LfnEntry, @ptrCast(@alignCast(&root_sector_data[entry_idx * 32])));
+    lfn_dir_entry.seq_num = 0x41; // Sequence 1 with last flag
+    lfn_dir_entry.attr = ATTR_LFN;
+    lfn_dir_entry.reserved = 0;
+    lfn_dir_entry.checksum = rockbox_dir_lfn_checksum;
+    lfn_dir_entry.cluster = 0;
+
+    // Fill ".rockbox" into LFN entry (8 chars)
+    const rockbox_dirname = ".rockbox";
+    writeUcs2Char(&lfn_dir_entry.name1, 0, rockbox_dirname[0]); // '.'
+    writeUcs2Char(&lfn_dir_entry.name1, 1, rockbox_dirname[1]); // 'r'
+    writeUcs2Char(&lfn_dir_entry.name1, 2, rockbox_dirname[2]); // 'o'
+    writeUcs2Char(&lfn_dir_entry.name1, 3, rockbox_dirname[3]); // 'c'
+    writeUcs2Char(&lfn_dir_entry.name1, 4, rockbox_dirname[4]); // 'k'
+
+    writeUcs2Char(&lfn_dir_entry.name2, 0, rockbox_dirname[5]); // 'b'
+    writeUcs2Char(&lfn_dir_entry.name2, 1, rockbox_dirname[6]); // 'o'
+    writeUcs2Char(&lfn_dir_entry.name2, 2, rockbox_dirname[7]); // 'x'
+    writeUcs2Null(&lfn_dir_entry.name2, 3);  // null terminator
+    fillUcs2Padding(&lfn_dir_entry.name2, 4, 6);  // Fill rest with 0xFFFF
+
+    fillUcs2Padding(&lfn_dir_entry.name3, 0, 2);  // Fill with 0xFFFF
+
+    entry_idx += 1;
+
+    // Entry 2: 8.3 short name entry
+    root_entries[entry_idx].name = rockbox_dir_short;
     root_entries[entry_idx].attr = ATTR_DIRECTORY;
     root_entries[entry_idx].nt_res = 0;
     root_entries[entry_idx].crt_time_tenth = 0;
@@ -231,19 +316,53 @@ pub fn main() !void {
     rockbox_entries[1].crt_date = 0x5421;
     rockbox_entries[1].wrt_date = 0x5421;
 
-    // rockbox.ipod file entry
-    rockbox_entries[2].name = "ROCKBOX IPO".*;  // 8.3 format: ROCKBOX.IPO -> ROCKBOX IPO (no dot)
-    rockbox_entries[2].attr = ATTR_ARCHIVE;
-    rockbox_entries[2].nt_res = 0;
-    rockbox_entries[2].crt_time_tenth = 0;
-    rockbox_entries[2].crt_time = 0;
-    rockbox_entries[2].crt_date = 0x5421;
-    rockbox_entries[2].lst_acc_date = 0x5421;
-    rockbox_entries[2].fst_clus_hi = 0;
-    rockbox_entries[2].wrt_time = 0;
-    rockbox_entries[2].wrt_date = 0x5421;
-    rockbox_entries[2].fst_clus_lo = @truncate(rockbox_file_cluster);
-    rockbox_entries[2].file_size = file_size;
+    // rockbox.ipod file entry with Long File Name support
+    // The filename "rockbox.ipod" has 12 characters, requiring 1 LFN entry
+    // 8.3 short name: "ROCKBO~1" + "IPO" (since "ipod" is 4 chars, truncated)
+    const short_name: [11]u8 = "ROCKBO~1IPO".*;
+    const lfn_checksum = lfnChecksum(&short_name);
+
+    // Entry 2: LFN entry for "rockbox.ipod" (12 chars fits in 1 LFN entry)
+    const lfn_entry = @as(*LfnEntry, @ptrCast(@alignCast(&rockbox_dir_data[2 * 32])));
+    lfn_entry.seq_num = 0x41; // Sequence 1 with last flag (0x40)
+    lfn_entry.attr = ATTR_LFN;
+    lfn_entry.reserved = 0;
+    lfn_entry.checksum = lfn_checksum;
+    lfn_entry.cluster = 0;
+
+    // Fill name1 with first 5 chars: "r", "o", "c", "k", "b" (UCS-2)
+    const filename = "rockbox.ipod";
+    writeUcs2Char(&lfn_entry.name1, 0, filename[0]);  // 'r'
+    writeUcs2Char(&lfn_entry.name1, 1, filename[1]);  // 'o'
+    writeUcs2Char(&lfn_entry.name1, 2, filename[2]);  // 'c'
+    writeUcs2Char(&lfn_entry.name1, 3, filename[3]);  // 'k'
+    writeUcs2Char(&lfn_entry.name1, 4, filename[4]);  // 'b'
+
+    // Fill name2 with next 6 chars: "o", "x", ".", "i", "p", "o" (UCS-2)
+    writeUcs2Char(&lfn_entry.name2, 0, filename[5]);  // 'o'
+    writeUcs2Char(&lfn_entry.name2, 1, filename[6]);  // 'x'
+    writeUcs2Char(&lfn_entry.name2, 2, filename[7]);  // '.'
+    writeUcs2Char(&lfn_entry.name2, 3, filename[8]);  // 'i'
+    writeUcs2Char(&lfn_entry.name2, 4, filename[9]);  // 'p'
+    writeUcs2Char(&lfn_entry.name2, 5, filename[10]); // 'o'
+
+    // Fill name3 with last 2 chars: "d", null (UCS-2)
+    writeUcs2Char(&lfn_entry.name3, 0, filename[11]); // 'd'
+    writeUcs2Null(&lfn_entry.name3, 1);               // null terminator
+
+    // Entry 3: 8.3 short name entry (after LFN entry)
+    rockbox_entries[3].name = short_name;
+    rockbox_entries[3].attr = ATTR_ARCHIVE;
+    rockbox_entries[3].nt_res = 0;
+    rockbox_entries[3].crt_time_tenth = 0;
+    rockbox_entries[3].crt_time = 0;
+    rockbox_entries[3].crt_date = 0x5421;
+    rockbox_entries[3].lst_acc_date = 0x5421;
+    rockbox_entries[3].fst_clus_hi = 0;
+    rockbox_entries[3].wrt_time = 0;
+    rockbox_entries[3].wrt_date = 0x5421;
+    rockbox_entries[3].fst_clus_lo = @truncate(rockbox_file_cluster);
+    rockbox_entries[3].file_size = file_size;
 
     // Write .rockbox directory
     const rockbox_dir_sector = clusterToSector(rockbox_dir_cluster, data_start_sector, sectors_per_cluster);
