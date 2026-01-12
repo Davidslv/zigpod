@@ -935,11 +935,14 @@ pub const MemoryBus = struct {
             // If the value has task 0 in state 01 (sleeping), change to 11 (ready).
             // This must happen on the READ, not the write, because the scheduler
             // reads before writing updates.
-            if (offset == 0) {
+            //
+            // AGGRESSIVE MODE: Always modify hw_accel[0] to have task 0 ready
+            // This ensures the scheduler always sees a ready task, even if the
+            // firmware tries to put tasks back to sleep.
+            if (self.kickstart_enabled and offset == 0) {
                 const task0_state = value & 0x3;
-                // If task 0 is sleeping (01) and the value is stabilizing (>= 0x19 from init loop)
-                // change it to ready (11) to kickstart the scheduler
-                if (task0_state == 0x1 and value >= 0x19) {
+                // If task 0 is NOT ready (state != 11), change to ready
+                if (task0_state != 0x3 and value != 0) {
                     self.kickstart_read_count += 1;
                     const modified_value = (value & ~@as(u32, 0x3)) | 0x3;
                     if (self.kickstart_read_count <= 10) {
@@ -992,6 +995,32 @@ pub const MemoryBus = struct {
     pub fn enableSdramDataReadTracing(self: *Self) void {
         self.debug_sdram_data_read_enabled = true;
         std.debug.print("SDRAM DATA READ TRACING: Enabled\n", .{});
+    }
+
+    /// TCB Kickstart: Directly modify task state in RAM
+    /// Based on SDRAM tracing, task control blocks are at:
+    /// - 0x108701CC = task state (1=sleeping, 3=ready hypothesis)
+    /// This attempts to wake task 0 by setting its state to "ready"
+    pub fn tcbKickstart(self: *Self) void {
+        const tcb_state_addr: u32 = 0x108701CC;
+        const offset = tcb_state_addr - SDRAM_START;
+
+        if (offset + 3 < self.sdram.len) {
+            // Read current value
+            const current = @as(u32, self.sdram[offset]) |
+                (@as(u32, self.sdram[offset + 1]) << 8) |
+                (@as(u32, self.sdram[offset + 2]) << 16) |
+                (@as(u32, self.sdram[offset + 3]) << 24);
+
+            // Change state from 1 (sleeping) to 3 (ready)
+            const new_state: u32 = 0x00000003;
+            self.sdram[offset] = @truncate(new_state);
+            self.sdram[offset + 1] = @truncate(new_state >> 8);
+            self.sdram[offset + 2] = @truncate(new_state >> 16);
+            self.sdram[offset + 3] = @truncate(new_state >> 24);
+
+            std.debug.print("TCB KICKSTART: Modified 0x{X:0>8} from 0x{X:0>8} to 0x{X:0>8}\n", .{ tcb_state_addr, current, new_state });
+        }
     }
 
     /// Print SDRAM data read trace summary

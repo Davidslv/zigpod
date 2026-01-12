@@ -364,6 +364,7 @@ pub const Emulator = struct {
         // Approach 1: Enable hw_accel kickstart (modifies reads)
         // Approach 2: Enable IRQ and fire timer (may have valid dispatch tables now)
         // Approach 3: Trace SDRAM data reads to find task state array
+        // Approach 4: Direct TCB modification at 0x108701CC
         //
         // Enable tracing early (2000 cycles) to catch scheduler loop from start
         // Scheduler enters wait loop at ~3000 cycles
@@ -376,6 +377,12 @@ pub const Emulator = struct {
             // Enable I2C tracing
             self.i2c_ctrl.enableTracing();
             std.debug.print("RTOS KICKSTART: Enabled at cycle {} (tracing + kickstart)\n", .{self.total_cycles});
+        }
+
+        // TCB Kickstart: Try modifying task state directly in RAM at 5000 cycles
+        // The task state at 0x108701CC should be initialized by then
+        if (self.total_cycles >= 5_000 and self.total_cycles < 5_100) {
+            self.bus.tcbKickstart();
         }
 
         // NOTE: IRQ kickstart is DISABLED because:
