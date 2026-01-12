@@ -131,37 +131,81 @@ pub fn main() !void {
 
     std.debug.print("Data start: sector {}, {} clusters\n", .{ data_start, total_clusters });
 
-    // Create boot sector
+    // Create boot sector - write fields directly as bytes to avoid alignment issues
     var boot_sector: [SECTOR_SIZE]u8 = [_]u8{0} ** SECTOR_SIZE;
-    const boot: *Fat32BootSector = @ptrCast(&boot_sector);
 
-    boot.jump = .{ 0xEB, 0x58, 0x90 };  // JMP short + NOP
-    boot.oem_name = "ZIGPOD  ".*;
-    boot.bytes_per_sector = SECTOR_SIZE;
-    boot.sectors_per_cluster = sectors_per_cluster;
-    boot.reserved_sectors = reserved_sectors;
-    boot.num_fats = num_fats;
-    boot.root_entry_count = 0;  // FAT32
-    boot.total_sectors_16 = 0;  // FAT32 uses 32-bit field
-    boot.media_type = 0xF8;  // Fixed disk
-    boot.fat_size_16 = 0;  // FAT32 uses 32-bit field
-    boot.sectors_per_track = 63;
-    boot.num_heads = 255;
-    boot.hidden_sectors = partition_start;
-    boot.total_sectors_32 = partition_sectors;
-    boot.fat_size_32 = fat_size;
-    boot.ext_flags = 0;
-    boot.fs_version = 0;
-    boot.root_cluster = 2;  // First data cluster
-    boot.fs_info = 1;  // FSInfo at sector 1
-    boot.backup_boot = 0;  // No backup (to save space)
-    boot.reserved = [_]u8{0} ** 12;
-    boot.drive_number = 0x80;
-    boot.reserved1 = 0;
-    boot.boot_sig = 0x29;
-    boot.volume_id = 0x12345678;
-    boot.volume_label = "ZIGPOD     ".*;
-    boot.fs_type = "FAT32   ".*;
+    // Helper to write little-endian values
+    const writeU16 = struct {
+        fn f(buf: []u8, offset: usize, val: u16) void {
+            buf[offset] = @truncate(val);
+            buf[offset + 1] = @truncate(val >> 8);
+        }
+    }.f;
+    const writeU32 = struct {
+        fn f(buf: []u8, offset: usize, val: u32) void {
+            buf[offset] = @truncate(val);
+            buf[offset + 1] = @truncate(val >> 8);
+            buf[offset + 2] = @truncate(val >> 16);
+            buf[offset + 3] = @truncate(val >> 24);
+        }
+    }.f;
+
+    // 0x00: Jump instruction
+    boot_sector[0] = 0xEB;
+    boot_sector[1] = 0x58;
+    boot_sector[2] = 0x90;
+    // 0x03: OEM name
+    @memcpy(boot_sector[0x03..0x0B], "ZIGPOD  ");
+    // 0x0B: Bytes per sector
+    writeU16(&boot_sector, 0x0B, SECTOR_SIZE);
+    // 0x0D: Sectors per cluster
+    boot_sector[0x0D] = sectors_per_cluster;
+    // 0x0E: Reserved sectors
+    writeU16(&boot_sector, 0x0E, reserved_sectors);
+    // 0x10: Number of FATs
+    boot_sector[0x10] = num_fats;
+    // 0x11: Root entry count (0 for FAT32)
+    writeU16(&boot_sector, 0x11, 0);
+    // 0x13: Total sectors 16-bit (0 for FAT32)
+    writeU16(&boot_sector, 0x13, 0);
+    // 0x15: Media type
+    boot_sector[0x15] = 0xF8; // Fixed disk
+    // 0x16: FAT size 16-bit (0 for FAT32)
+    writeU16(&boot_sector, 0x16, 0);
+    // 0x18: Sectors per track
+    writeU16(&boot_sector, 0x18, 63);
+    // 0x1A: Number of heads
+    writeU16(&boot_sector, 0x1A, 255);
+    // 0x1C: Hidden sectors (partition start)
+    writeU32(&boot_sector, 0x1C, partition_start);
+    // 0x20: Total sectors 32-bit
+    writeU32(&boot_sector, 0x20, partition_sectors);
+    // FAT32 specific fields:
+    // 0x24: FAT size 32-bit
+    writeU32(&boot_sector, 0x24, fat_size);
+    // 0x28: Extended flags
+    writeU16(&boot_sector, 0x28, 0);
+    // 0x2A: Filesystem version
+    writeU16(&boot_sector, 0x2A, 0);
+    // 0x2C: Root cluster
+    writeU32(&boot_sector, 0x2C, 2); // First data cluster
+    // 0x30: FSInfo sector
+    writeU16(&boot_sector, 0x30, 1);
+    // 0x32: Backup boot sector
+    writeU16(&boot_sector, 0x32, 0);
+    // 0x34-0x3F: Reserved (already zeroed)
+    // 0x40: Drive number
+    boot_sector[0x40] = 0x80;
+    // 0x41: Reserved
+    boot_sector[0x41] = 0;
+    // 0x42: Extended boot signature
+    boot_sector[0x42] = 0x29;
+    // 0x43: Volume ID
+    writeU32(&boot_sector, 0x43, 0x12345678);
+    // 0x47: Volume label
+    @memcpy(boot_sector[0x47..0x52], "ZIGPOD     ");
+    // 0x52: Filesystem type
+    @memcpy(boot_sector[0x52..0x5A], "FAT32   ");
 
     // Boot sector signature
     boot_sector[510] = 0x55;
