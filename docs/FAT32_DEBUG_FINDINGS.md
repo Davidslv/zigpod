@@ -164,12 +164,37 @@ Possible causes:
 
 4. Verified ATA returns complete sectors (256 words each)
 
+## Investigation Progress
+
+### Ruled Out: Thumb Mode
+- Added BX instruction tracing to emulator
+- NO Thumb mode switches occur during FAT operations
+- Bootloader stays entirely in 32-bit ARM mode
+- See: docs/THUMB_MODE_INVESTIGATION.md
+
+### Verified Correct: Memory System
+- SDRAM read/write: Correct little-endian byte order
+- ATA data transfer: Returns correct 16-bit words
+- Memory bus: Properly handles byte/halfword/word access
+- Data path from disk -> ATA buffer -> CPU -> SDRAM verified
+
+### Key Observation
+The difference between working and non-working lookups:
+- `.rockbox` (directory, 8 chars): Found via LFN ✓
+- `rockbox.ipod` (file, 12 chars): NOT found via LFN ✗
+
+The longer filename requires more iterations in the LFN assembly loop.
+Possible causes:
+- Loop counter/branch condition bug in ARM executor
+- UTF-16 assembly loop early termination
+- String comparison issue with longer names
+
 ## Next Steps to Try
 
-1. Add CPU instruction tracing during file lookup
-2. Compare ARM register state between directory and file lookup
-3. Use GDB to step through the FAT driver code in emulator
-4. Test with simpler ARM firmware to validate string operations
+1. Add instruction-level tracing around directory enumeration loop
+2. Compare loop iteration counts for 8-char vs 12-char names
+3. Test strcasecmp equivalent with longer strings in isolation
+4. Use GDB to step through the FAT driver code in emulator
 5. Compare real iPod behavior with emulator using same disk image
 
 ## Test Files
