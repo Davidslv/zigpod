@@ -368,8 +368,8 @@ pub const Emulator = struct {
             self.bus.enableKickstart();
             // Enable I2C tracing to see what the firmware is requesting
             self.i2c_ctrl.enableTracing();
-            // NOTE: IRQ/timer1 interrupt disabled for now - causes CPSR corruption
-            // when firmware's nested exception handling interacts with our returnFromException
+            // NOTE: IRQ/timer interrupt disabled - causes jump to uninitialized function
+            // pointers when firmware hasn't set up its dispatch tables yet
             std.debug.print("RTOS KICKSTART: Enabled hw_accel[0] at cycle {}\n", .{self.total_cycles});
         }
 

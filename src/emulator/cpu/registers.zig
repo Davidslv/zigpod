@@ -171,6 +171,10 @@ pub const RegisterFile = struct {
 
     /// Initialize register file in Supervisor mode (typical after reset)
     pub fn init() Self {
+        // Initialize SPSRs to valid supervisor mode CPSR (0xD3 = supervisor + I=1 + F=1)
+        // This prevents crashes if code does exception return without proper SPSR setup
+        const default_spsr: u32 = 0xD3;
+
         var regs = Self{
             .r = [_]u32{0} ** 16,
             .cpsr = PSR.init(.supervisor),
@@ -180,19 +184,19 @@ pub const RegisterFile = struct {
             .r8_fiq = [_]u32{0} ** 5,
             .r13_fiq = 0,
             .r14_fiq = 0,
-            .spsr_fiq = 0,
+            .spsr_fiq = default_spsr,
             .r13_irq = 0,
             .r14_irq = 0,
-            .spsr_irq = 0,
+            .spsr_irq = default_spsr,
             .r13_svc = 0,
             .r14_svc = 0,
-            .spsr_svc = 0,
+            .spsr_svc = default_spsr,
             .r13_abt = 0,
             .r14_abt = 0,
-            .spsr_abt = 0,
+            .spsr_abt = default_spsr,
             .r13_und = 0,
             .r14_und = 0,
-            .spsr_und = 0,
+            .spsr_und = default_spsr,
         };
 
         // Set PC to reset vector
