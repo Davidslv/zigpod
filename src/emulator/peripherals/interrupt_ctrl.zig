@@ -212,6 +212,20 @@ pub const InterruptController = struct {
         return pending != 0;
     }
 
+    /// Check if any COP interrupt is pending
+    pub fn hasCopPendingIrq(self: *const Self) bool {
+        const status = self.raw_status | self.forced_status;
+        const pending = status & self.cop_enable & ~self.cop_fiq_enable;
+        return pending != 0;
+    }
+
+    /// Check if COP FIQ is pending
+    pub fn hasCopPendingFiq(self: *const Self) bool {
+        const status = self.raw_status | self.forced_status;
+        const pending = status & self.cop_enable & self.cop_fiq_enable;
+        return pending != 0;
+    }
+
     /// Get highest priority pending interrupt
     pub fn getHighestPending(self: *const Self) ?Interrupt {
         const status = self.raw_status | self.forced_status;

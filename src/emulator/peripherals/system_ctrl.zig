@@ -23,6 +23,22 @@
 const std = @import("std");
 const bus = @import("../memory/bus.zig");
 
+/// COP (Coprocessor) state machine
+/// The PP5021C has a dual-core ARM7TDMI where COP requires explicit
+/// wake/sleep management via COP_CTL register
+pub const CopState = enum {
+    /// COP not enabled via DEV_EN register
+    disabled,
+    /// COP is sleeping (PROC_SLEEP bit set in COP_CTL)
+    sleeping,
+    /// Wake request pending, will transition to running next cycle
+    waking,
+    /// COP is actively executing instructions
+    running,
+    /// COP halted due to error or debug
+    halted,
+};
+
 /// Device enable bits (DEV_EN)
 pub const Device = enum(u5) {
     timer1 = 0,
@@ -72,6 +88,9 @@ pub const SystemController = struct {
 
     /// COP control register (wake/sleep COP)
     cop_ctl: u32,
+
+    /// COP state machine
+    cop_state: CopState,
 
     /// Device reset callback (called when a device is reset)
     reset_callback: ?*const fn (Device) void,
@@ -133,6 +152,7 @@ pub const SystemController = struct {
             .cache_ctl = 0,
             .cpu_ctl = 0,
             .cop_ctl = DEFAULT_COP_CTL,
+            .cop_state = .disabled,
             .reset_callback = null,
             .enable_callback = null,
             .is_cop_access = false,
@@ -146,12 +166,66 @@ pub const SystemController = struct {
 
     /// Check if COP is sleeping (waiting in WFI)
     pub fn isCopSleeping(self: *const Self) bool {
-        return (self.cop_ctl & 0x80000000) != 0;
+        return self.cop_state == .sleeping;
     }
 
-    /// Wake up COP
+    /// Check if COP is running
+    pub fn isCopRunning(self: *const Self) bool {
+        return self.cop_state == .running;
+    }
+
+    /// Check if COP is waking
+    pub fn isCopWaking(self: *const Self) bool {
+        return self.cop_state == .waking;
+    }
+
+    /// Get COP state
+    pub fn getCopState(self: *const Self) CopState {
+        return self.cop_state;
+    }
+
+    /// Enable COP (called when DEV_EN bit 24 is set)
+    pub fn enableCop(self: *Self) void {
+        if (self.cop_state == .disabled) {
+            // COP starts in sleeping state when enabled
+            self.cop_state = .sleeping;
+            self.cop_ctl = DEFAULT_COP_CTL; // Sleep bit set
+        }
+    }
+
+    /// Disable COP
+    pub fn disableCop(self: *Self) void {
+        self.cop_state = .disabled;
+    }
+
+    /// Wake up COP (transition from sleeping to waking)
     pub fn wakeCop(self: *Self) void {
-        self.cop_ctl &= ~@as(u32, 0x80000000);
+        if (self.cop_state == .sleeping) {
+            self.cop_state = .waking;
+            self.cop_ctl &= ~@as(u32, 0x80000000); // Clear sleep bit
+        }
+    }
+
+    /// Put COP to sleep
+    pub fn sleepCop(self: *Self) void {
+        if (self.cop_state == .running or self.cop_state == .waking) {
+            self.cop_state = .sleeping;
+            self.cop_ctl |= 0x80000000; // Set sleep bit
+        }
+    }
+
+    /// Advance COP state (called each cycle)
+    /// Returns true if COP should execute this cycle
+    pub fn tickCopState(self: *Self) bool {
+        return switch (self.cop_state) {
+            .waking => {
+                // Transition to running
+                self.cop_state = .running;
+                return true;
+            },
+            .running => true,
+            .sleeping, .disabled, .halted => false,
+        };
     }
 
     /// Set reset callback
@@ -258,7 +332,21 @@ pub const SystemController = struct {
             },
             REG_DEV_EN => {
                 const changed = self.dev_en ^ value;
+                const old_value = self.dev_en;
                 self.dev_en = value;
+
+                // Handle COP enable/disable (bit 24)
+                const cop_mask = Device.cop.mask();
+                if ((changed & cop_mask) != 0) {
+                    if ((value & cop_mask) != 0) {
+                        // COP enabled
+                        self.enableCop();
+                    } else {
+                        // COP disabled
+                        self.disableCop();
+                    }
+                }
+
                 // Notify for changed devices
                 if (self.enable_callback) |callback| {
                     var bits = changed;
@@ -269,6 +357,7 @@ pub const SystemController = struct {
                         bits &= bits - 1;
                     }
                 }
+                _ = old_value;
             },
             REG_DEV_EN2 => self.dev_en2 = value,
             REG_DEV_INIT1 => self.dev_init1 = value,
@@ -283,7 +372,29 @@ pub const SystemController = struct {
             REG_PLL_STATUS => {}, // Read-only
             REG_CACHE_CTL => self.cache_ctl = value,
             REG_CPU_CTL => self.cpu_ctl = value,
-            REG_COP_CTL => self.cop_ctl = value,
+            REG_COP_CTL => {
+                const old = self.cop_ctl;
+                self.cop_ctl = value;
+
+                // PROC_SLEEP bit (bit 31)
+                const PROC_SLEEP: u32 = 0x80000000;
+
+                // Check for wake request (clearing PROC_SLEEP)
+                if ((old & PROC_SLEEP) != 0 and (value & PROC_SLEEP) == 0) {
+                    // Wake COP: sleeping -> waking
+                    if (self.cop_state == .sleeping) {
+                        self.cop_state = .waking;
+                    }
+                }
+
+                // Check for sleep request (setting PROC_SLEEP)
+                if ((old & PROC_SLEEP) == 0 and (value & PROC_SLEEP) != 0) {
+                    // Sleep COP: running/waking -> sleeping
+                    if (self.cop_state == .running or self.cop_state == .waking) {
+                        self.cop_state = .sleeping;
+                    }
+                }
+            },
             else => {},
         }
     }

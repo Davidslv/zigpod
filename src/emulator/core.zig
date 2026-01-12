@@ -323,7 +323,7 @@ pub const Emulator = struct {
     pub fn step(self: *Self) u32 {
         var cpu_bus = self.createCpuBus();
 
-        // Update IRQ line from interrupt controller
+        // Update CPU IRQ/FIQ lines from interrupt controller
         self.cpu.setIrqLine(self.int_ctrl.hasPendingIrq());
         self.cpu.setFiqLine(self.int_ctrl.hasPendingFiq());
 
@@ -331,11 +331,15 @@ pub const Emulator = struct {
         const cycles = self.cpu.step(&cpu_bus);
         self.total_cycles += cycles;
 
-        // Execute COP if enabled
+        // Execute COP if enabled and not sleeping
         if (self.cop) |*cop| {
-            if (self.sys_ctrl.isEnabled(.cop)) {
-                cop.setIrqLine(self.int_ctrl.hasPendingIrq());
-                // Set COP access flag for PROC_ID
+            // Use the COP state machine to determine if COP should execute
+            if (self.sys_ctrl.tickCopState()) {
+                // COP uses its own interrupt enable mask
+                cop.setIrqLine(self.int_ctrl.hasCopPendingIrq());
+                cop.setFiqLine(self.int_ctrl.hasCopPendingFiq());
+
+                // Set COP access flag for PROC_ID and mailbox operations
                 self.bus.setCopAccess(true);
                 _ = cop.step(&cpu_bus);
                 self.bus.setCopAccess(false);
@@ -421,6 +425,43 @@ pub const Emulator = struct {
     /// Check if CPU is in Thumb mode
     pub fn isThumb(self: *const Self) bool {
         return self.cpu.isThumb();
+    }
+
+    // === COP (Coprocessor) Support ===
+
+    /// Initialize COP with a specific entry point
+    /// This sets up the COP to start executing at the given address
+    /// COP starts in sleeping state and must be woken via COP_CTL
+    pub fn initCop(self: *Self, entry_point: u32) void {
+        if (self.cop) |*cop| {
+            cop.reset();
+            cop.setReg(15, entry_point);
+            // COP starts sleeping, waiting for wake from CPU
+            self.sys_ctrl.cop_state = .sleeping;
+        }
+    }
+
+    /// Get COP program counter (if COP exists)
+    pub fn getCopPc(self: *const Self) ?u32 {
+        if (self.cop) |*cop| {
+            return cop.getPc();
+        }
+        return null;
+    }
+
+    /// Get COP state
+    pub fn getCopState(self: *const Self) system_ctrl.CopState {
+        return self.sys_ctrl.getCopState();
+    }
+
+    /// Check if COP is running
+    pub fn isCopRunning(self: *const Self) bool {
+        return self.sys_ctrl.isCopRunning();
+    }
+
+    /// Check if COP is sleeping
+    pub fn isCopSleeping(self: *const Self) bool {
+        return self.sys_ctrl.isCopSleeping();
     }
 
     // === GDB Debugging Support ===

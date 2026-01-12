@@ -102,6 +102,7 @@ fn printUsage() void {
         \\  --trace <n>         Trace first n instructions
         \\  --cycles <n>        Run for n cycles then exit (headless only)
         \\  --gdb-port <port>   Enable GDB debugging on specified port
+        \\  --enable-cop        Enable COP (second core) for dual-core firmware
         \\  --help              Show this help
         \\
         \\Keyboard controls (with SDL2):
@@ -140,6 +141,7 @@ pub fn main() !void {
     var max_cycles: ?u64 = null;
     var gdb_port: ?u16 = null;
     var entry_point: ?u32 = null; // Custom entry point (e.g., 0x10000800 for Apple firmware)
+    var enable_cop = false; // Enable COP (second core) for dual-core firmware
 
     // Skip program name
     _ = args.next();
@@ -206,6 +208,8 @@ pub fn main() !void {
             else
                 entry_str;
             entry_point = try std.fmt.parseInt(u32, hex_str, 16);
+        } else if (std.mem.eql(u8, arg, "--enable-cop")) {
+            enable_cop = true;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             disk_path = arg;
         } else {
@@ -230,7 +234,12 @@ pub fn main() !void {
         .sdram_size = sdram_mb * 1024 * 1024,
         .cpu_freq_mhz = 80,
         .boot_rom = firmware,
+        .enable_cop = enable_cop,
     });
+
+    if (enable_cop) {
+        print("COP (second core) enabled\n", .{});
+    }
     defer emu.deinit();
 
     // Setup LCD bridge pointer now that emulator is in final memory location
@@ -279,13 +288,24 @@ pub fn main() !void {
     // Set PC based on where firmware was loaded (or custom entry point)
     if (entry_point) |ep| {
         emu.cpu.setPc(ep);
-        print("PC set to 0x{X:0>8} (custom entry point)\n", .{ep});
+        print("CPU PC set to 0x{X:0>8} (custom entry point)\n", .{ep});
+        // Also initialize COP at the same entry point if enabled
+        // Both cores start at the same address; firmware checks PROC_ID to differentiate
+        if (enable_cop) {
+            emu.initCop(ep);
+            print("COP PC set to 0x{X:0>8} (same entry point)\n", .{ep});
+        }
     } else if (iram_firmware_path != null) {
         emu.cpu.setPc(0x40000000);
         print("PC set to 0x40000000 (IRAM)\n", .{});
     } else if (sdram_firmware_path != null) {
         emu.cpu.setPc(0x10000000);
         print("PC set to 0x10000000 (SDRAM)\n", .{});
+        // Initialize COP at same entry point for dual-core firmware
+        if (enable_cop) {
+            emu.initCop(0x10000000);
+            print("COP PC set to 0x10000000 (same entry point)\n", .{});
+        }
     }
 
     if (debug) {
