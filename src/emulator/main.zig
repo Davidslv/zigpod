@@ -491,6 +491,56 @@ pub fn main() !void {
         emu.bus.debug_region_first_addr,
         emu.bus.debug_region_first_val,
     });
+    print("Partition struct reads ({d}):\n", .{emu.bus.debug_part_reads});
+    for (emu.bus.debug_part_read_addrs, 0..) |addr, idx| {
+        if (idx < emu.bus.debug_part_reads) {
+            print("  0x{X:0>8} = 0x{X:0>8}\n", .{ addr, emu.bus.debug_part_read_vals[idx] });
+        }
+    }
+    // New tracking for partition size/type writes
+    print("Partition SIZE writes ({d}): ", .{emu.bus.debug_part_size_writes});
+    for (emu.bus.debug_part_size_addrs, 0..) |addr, idx| {
+        if (idx < emu.bus.debug_part_size_writes and idx < 8) {
+            print("0x{X:0>8} ", .{addr});
+        }
+    }
+    print("\n", .{});
+    print("Partition TYPE writes ({d}): ", .{emu.bus.debug_part_type_writes});
+    for (emu.bus.debug_part_type_addrs, 0..) |addr, idx| {
+        if (idx < emu.bus.debug_part_type_writes and idx < 8) {
+            print("0x{X:0>8} ", .{addr});
+        }
+    }
+    print("\n", .{});
+
+    // Dump partition array memory to understand the layout
+    print("=== Partition array memory dump ===\n", .{});
+    print("part[0] area (assuming 32-bit sector_t):\n", .{});
+    print("  0x11001A30: 0x{X:0>8} (start)\n", .{emu.bus.read32(0x11001A30)});
+    print("  0x11001A34: 0x{X:0>8} (size)\n", .{emu.bus.read32(0x11001A34)});
+    print("  0x11001A38: 0x{X:0>8} (type)\n", .{emu.bus.read32(0x11001A38)});
+    print("part[0] area (assuming 64-bit sector_t):\n", .{});
+    print("  0x11001A30: 0x{X:0>8} 0x{X:0>8} (start)\n", .{emu.bus.read32(0x11001A30), emu.bus.read32(0x11001A34)});
+    print("  0x11001A38: 0x{X:0>8} 0x{X:0>8} (size) ← would be read here!\n", .{emu.bus.read32(0x11001A38), emu.bus.read32(0x11001A3C)});
+    print("  0x11001A40: 0x{X:0>8} (type)\n", .{emu.bus.read32(0x11001A40)});
+    print("part[1] area (0x11001A3C): start=0x{X:0>8}, size=0x{X:0>8}, type=0x{X:0>8}\n", .{
+        emu.bus.read32(0x11001A3C),
+        emu.bus.read32(0x11001A40),
+        emu.bus.read32(0x11001A44),
+    });
+    print("part[4] area (0x11001A60): start=0x{X:0>8}, size=0x{X:0>8}, type=0x{X:0>8}\n", .{
+        emu.bus.read32(0x11001A60),
+        emu.bus.read32(0x11001A64),
+        emu.bus.read32(0x11001A68),
+    });
+    // Writes to pinfo local variable area
+    print("Writes to pinfo area (0x11001A60-0x11001A70): {d}\n", .{emu.bus.debug_pinfo_writes});
+    for (emu.bus.debug_pinfo_write_addrs, 0..) |addr, idx| {
+        if (idx < emu.bus.debug_pinfo_writes and idx < 8) {
+            print("  0x{X:0>8} = 0x{X:0>8}\n", .{ addr, emu.bus.debug_pinfo_write_vals[idx] });
+        }
+    }
+    print("Reads from part[0] area (0x11001A30-0x11001A3C): {d}\n", .{emu.bus.debug_part0_reads});
 
     // I2S debug
     const i2s_mod = @import("peripherals/i2s.zig");

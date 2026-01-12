@@ -133,6 +133,22 @@ pub const MemoryBus = struct {
     debug_region_writes: u32,
     debug_region_first_addr: u32,
     debug_region_first_val: u32,
+    /// Track reads from partition struct area (0x11001A00-0x11001B00)
+    debug_part_reads: u32,
+    debug_part_read_addrs: [16]u32,
+    debug_part_read_vals: [16]u32,
+    /// Track writes containing partition size value (0x07FF = 2047)
+    debug_part_size_writes: u32,
+    debug_part_size_addrs: [8]u32,
+    /// Track writes containing partition type (0x0B) in low byte
+    debug_part_type_writes: u32,
+    debug_part_type_addrs: [8]u32,
+    /// Track writes to pinfo local variable area (0x11001A60-0x11001A70)
+    debug_pinfo_writes: u32,
+    debug_pinfo_write_addrs: [8]u32,
+    debug_pinfo_write_vals: [8]u32,
+    /// Track reads from part[0] area (0x11001A30-0x11001A3C)
+    debug_part0_reads: u32,
 
     const Self = @This();
 
@@ -255,6 +271,9 @@ pub const MemoryBus = struct {
             .debug_region_writes = 0,
             .debug_region_first_addr = 0,
             .debug_region_first_val = 0,
+            .debug_part_reads = 0,
+            .debug_part_read_addrs = [_]u32{0} ** 16,
+            .debug_part_read_vals = [_]u32{0} ** 16,
         };
     }
 
@@ -303,6 +322,17 @@ pub const MemoryBus = struct {
             .debug_region_writes = 0,
             .debug_region_first_addr = 0,
             .debug_region_first_val = 0,
+            .debug_part_reads = 0,
+            .debug_part_read_addrs = [_]u32{0} ** 16,
+            .debug_part_read_vals = [_]u32{0} ** 16,
+            .debug_part_size_writes = 0,
+            .debug_part_size_addrs = [_]u32{0} ** 8,
+            .debug_part_type_writes = 0,
+            .debug_part_type_addrs = [_]u32{0} ** 8,
+            .debug_pinfo_writes = 0,
+            .debug_pinfo_write_addrs = [_]u32{0} ** 8,
+            .debug_pinfo_write_vals = [_]u32{0} ** 8,
+            .debug_part0_reads = 0,
         };
     }
 
@@ -359,7 +389,20 @@ pub const MemoryBus = struct {
             self.debug_last_ata_read = true;
         }
 
-        return switch (region) {
+        // Track reads from partition struct area (0x11001A00-0x11001B00)
+        if (addr >= 0x11001A00 and addr < 0x11001B00) {
+            if (self.debug_part_reads < 16) {
+                self.debug_part_read_addrs[self.debug_part_reads] = addr;
+                // We'll fill in the value after reading
+            }
+        }
+
+        // Track reads from part[0] area (0x11001A30-0x11001A3C)
+        if (addr >= 0x11001A30 and addr < 0x11001A3C) {
+            self.debug_part0_reads += 1;
+        }
+
+        const value = switch (region) {
             .boot_rom => self.readRom(addr),
             .sdram => self.readSdram(addr),
             .iram => self.readIram(addr),
@@ -380,6 +423,16 @@ pub const MemoryBus = struct {
             .ata => self.readPeripheral(self.ata, addr, ATA_START),
             .unmapped => 0, // Return 0 for unmapped addresses
         };
+
+        // Complete tracking for partition struct area reads
+        if (addr >= 0x11001A00 and addr < 0x11001B00) {
+            if (self.debug_part_reads < 16) {
+                self.debug_part_read_vals[self.debug_part_reads] = value;
+                self.debug_part_reads += 1;
+            }
+        }
+
+        return value;
     }
 
     /// Write 8-bit value
@@ -500,6 +553,32 @@ pub const MemoryBus = struct {
                 self.debug_region_first_val = value;
             }
             self.debug_region_writes += 1;
+        }
+
+        // Track writes containing partition size (0x07FF = 2047) or partition type (0x0B)
+        // Size could be in low 16 bits or as a full 32-bit value
+        const has_size = (value == 0x000007FF) or ((value & 0xFFFF) == 0x07FF);
+        if (has_size and (region == .sdram or region == .iram)) {
+            if (self.debug_part_size_writes < 8) {
+                self.debug_part_size_addrs[self.debug_part_size_writes] = addr;
+            }
+            self.debug_part_size_writes += 1;
+        }
+        // Track writes with partition type 0x0B in low byte (but not 0x0B00...)
+        if ((value & 0xFF) == 0x0B and value != 0 and (region == .sdram or region == .iram)) {
+            if (self.debug_part_type_writes < 8) {
+                self.debug_part_type_addrs[self.debug_part_type_writes] = addr;
+            }
+            self.debug_part_type_writes += 1;
+        }
+
+        // Track writes to pinfo local variable area (0x11001A60-0x11001A70)
+        if (addr >= 0x11001A60 and addr < 0x11001A70) {
+            if (self.debug_pinfo_writes < 8) {
+                self.debug_pinfo_write_addrs[self.debug_pinfo_writes] = addr;
+                self.debug_pinfo_write_vals[self.debug_pinfo_writes] = value;
+            }
+            self.debug_pinfo_writes += 1;
         }
 
         switch (region) {
