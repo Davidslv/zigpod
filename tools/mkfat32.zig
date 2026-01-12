@@ -104,6 +104,41 @@ pub fn main() !void {
     const partition_start: u32 = 1;
     const partition_sectors = total_sectors - partition_start;
 
+    // Write MBR at sector 0
+    var mbr: [SECTOR_SIZE]u8 = [_]u8{0} ** SECTOR_SIZE;
+
+    // Partition 1 entry at offset 0x1BE (446)
+    // Boot indicator (0x80 = bootable, 0x00 = not bootable)
+    mbr[0x1BE] = 0x00;
+    // CHS start (dummy values for LBA mode)
+    mbr[0x1BF] = 0x01; // Head
+    mbr[0x1C0] = 0x01; // Sector (bits 0-5), Cylinder high (bits 6-7)
+    mbr[0x1C1] = 0x00; // Cylinder low
+    // Partition type: 0x0C = FAT32 LBA
+    mbr[0x1C2] = 0x0C;
+    // CHS end (dummy values)
+    mbr[0x1C3] = 0xFE; // Head
+    mbr[0x1C4] = 0xFF; // Sector/Cylinder
+    mbr[0x1C5] = 0xFF; // Cylinder low
+    // LBA start (4 bytes, little-endian)
+    mbr[0x1C6] = @truncate(partition_start);
+    mbr[0x1C7] = @truncate(partition_start >> 8);
+    mbr[0x1C8] = @truncate(partition_start >> 16);
+    mbr[0x1C9] = @truncate(partition_start >> 24);
+    // LBA sector count (4 bytes, little-endian)
+    mbr[0x1CA] = @truncate(partition_sectors);
+    mbr[0x1CB] = @truncate(partition_sectors >> 8);
+    mbr[0x1CC] = @truncate(partition_sectors >> 16);
+    mbr[0x1CD] = @truncate(partition_sectors >> 24);
+
+    // MBR signature
+    mbr[0x1FE] = 0x55;
+    mbr[0x1FF] = 0xAA;
+
+    try file.seekTo(0);
+    try file.writeAll(&mbr);
+    std.debug.print("Wrote MBR at sector 0\n", .{});
+
     std.debug.print("Partition: starts at sector {}, {} sectors\n", .{ partition_start, partition_sectors });
 
     // FAT32 parameters for small disk
