@@ -345,24 +345,45 @@ pub const AtaController = struct {
             debug_disk_read_success += 1;
 
             // Debug: dump directory entries for sectors 2055 and 2056
-            if (lba == 2055 or lba == 2056) {
-                std.debug.print("=== Sector {} directory entries ===\n", .{lba});
-                var entry_idx: usize = 0;
-                while (entry_idx < 8) : (entry_idx += 1) {
-                    const offset = entry_idx * 32;
-                    const name_slice = self.data_buffer[offset .. offset + 11];
-                    const attr = self.data_buffer[offset + 11];
-                    const cluster_lo = @as(u16, self.data_buffer[offset + 26]) |
-                        (@as(u16, self.data_buffer[offset + 27]) << 8);
-                    std.debug.print("  Entry {}: name=", .{entry_idx});
-                    for (name_slice) |c| {
-                        if (c >= 0x20 and c < 0x7f) {
-                            std.debug.print("{c}", .{c});
-                        } else {
-                            std.debug.print(".", .{});
-                        }
+            if (lba == 2055 or lba == 2056 or lba == 2057) {
+                std.debug.print("=== Sector {} ", .{lba});
+                if (lba == 2055) {
+                    std.debug.print("(ROOT DIR) ===\n", .{});
+                } else if (lba == 2056) {
+                    std.debug.print("(.ROCKBOX DIR) ===\n", .{});
+                } else {
+                    std.debug.print("(FILE CONTENT) ===\n", .{});
+                    // Hex dump first 32 bytes of file content
+                    std.debug.print("  First 32 bytes: ", .{});
+                    for (self.data_buffer[0..32]) |b| {
+                        std.debug.print("{X:0>2} ", .{b});
                     }
-                    std.debug.print(" attr=0x{X:0>2} cluster={}\n", .{ attr, cluster_lo });
+                    std.debug.print("\n", .{});
+                }
+                if (lba != 2057) {
+                    var entry_idx: usize = 0;
+                    while (entry_idx < 8) : (entry_idx += 1) {
+                        const offset = entry_idx * 32;
+                        const name_slice = self.data_buffer[offset .. offset + 11];
+                        const attr = self.data_buffer[offset + 11];
+                        const cluster_lo = @as(u16, self.data_buffer[offset + 26]) |
+                            (@as(u16, self.data_buffer[offset + 27]) << 8);
+                        std.debug.print("  Entry {}: name=", .{entry_idx});
+                        for (name_slice) |c| {
+                            if (c >= 0x20 and c < 0x7f) {
+                                std.debug.print("{c}", .{c});
+                            } else {
+                                std.debug.print(".", .{});
+                            }
+                        }
+                        std.debug.print(" attr=0x{X:0>2} cluster={}", .{ attr, cluster_lo });
+                        // For LFN entries, show checksum
+                        if (attr == 0x0F) {
+                            const checksum = self.data_buffer[offset + 13];
+                            std.debug.print(" (LFN checksum=0x{X:0>2})", .{checksum});
+                        }
+                        std.debug.print("\n", .{});
+                    }
                 }
             }
 
@@ -491,6 +512,9 @@ pub const AtaController = struct {
                 debug_data_reads += 1;
                 if (!self.is_read or self.buffer_pos >= self.buffer_len) {
                     debug_data_reads_not_ready += 1;
+                    if (debug_data_reads_not_ready < 10) {
+                        std.debug.print("ATA DATA READ: not ready (is_read={}, buf_pos={}, buf_len={})\n", .{ self.is_read, self.buffer_pos, self.buffer_len });
+                    }
                     break :blk 0;
                 }
                 // Capture partition table area (0x1BE-0x1CD) when reading sector 0
@@ -543,6 +567,10 @@ pub const AtaController = struct {
 
                 // Check if sector is complete
                 if (self.buffer_pos >= self.buffer_len) {
+                    const completed_lba = self.getLba();
+                    if (completed_lba == 2055 or completed_lba == 2056 or completed_lba == 2057) {
+                        std.debug.print("ATA: Completed reading sector {}, {} words read\n", .{ completed_lba, self.buffer_len / 2 });
+                    }
                     if (self.sectors_remaining > 0) {
                         self.sectors_remaining -= 1;
                         const lba = self.getLba();
