@@ -251,8 +251,19 @@ pub const Emulator = struct {
 
         // Initialize GPIO defaults for iPod hardware:
         // GPIO A bit 5 = hold switch (1 = not held, 0 = held)
-        // Set high so button_hold() returns false (switch OFF)
-        self.gpio_ctrl.setPin(.a, 5, true);
+        // GPIO A bits 0-4 = button inputs (active low on 1G-3G models)
+        //   Bit 4 (0x10) = MENU
+        //   Bit 3 (0x08) = LEFT
+        //   Bit 2 (0x04) = PLAY
+        //   Bit 1 (0x02) = unused
+        //   Bit 0 (0x01) = RIGHT
+        // Set all high so no buttons are "pressed" and hold switch is OFF
+        self.gpio_ctrl.setPin(.a, 0, true); // RIGHT not pressed
+        self.gpio_ctrl.setPin(.a, 1, true); // unused
+        self.gpio_ctrl.setPin(.a, 2, true); // PLAY not pressed
+        self.gpio_ctrl.setPin(.a, 3, true); // LEFT not pressed
+        self.gpio_ctrl.setPin(.a, 4, true); // MENU not pressed
+        self.gpio_ctrl.setPin(.a, 5, true); // Hold switch OFF
     }
 
     /// Reset the emulator

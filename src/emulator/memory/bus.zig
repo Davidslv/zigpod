@@ -35,6 +35,8 @@ pub const Region = enum {
     timers,
     system_ctrl,
     cache_ctrl,
+    mem_ctrl, // Undocumented memory controller at 0x60009000 (Apple firmware uses this)
+    hw_accel, // Hardware accelerator at 0x60003000 (Apple firmware uses this)
     dma,
     gpio,
     device_init,
@@ -95,6 +97,10 @@ pub const MemoryBus = struct {
     /// Flash controller registers (0xF000F000-0xF000F0FF)
     /// Offset 0x0C contains return address for boot ROM call
     flash_ctrl_regs: [64]u32,
+
+    /// Hardware accelerator buffer (0x60003000-0x60003FFF)
+    /// Apple firmware uses this for checksum/copy operations
+    hw_accel_regs: [1024]u32,
 
     /// Mailbox registers for CPU/COP synchronization
     /// cpu_queue: bit 29 set by CPU writes, cleared by COP reads
@@ -172,6 +178,19 @@ pub const MemoryBus = struct {
     /// Track reads where attr byte (offset 0x0B) == 0x0F
     debug_lfn_attr_read_count: u32,
 
+    /// Debug: track peripheral access counts for Apple firmware analysis
+    debug_timer_accesses: u32,
+    debug_gpio_accesses: u32,
+    debug_i2c_accesses: u32,
+    debug_sys_ctrl_accesses: u32,
+    debug_int_ctrl_accesses: u32,
+    debug_mailbox_accesses: u32,
+    debug_dev_init_accesses: u32,
+
+    /// Debug: track which device_init offsets are being accessed
+    debug_dev_init_offset_counts: [32]u32, // Histogram of accesses to offsets 0x00-0x7C (32 dwords)
+    debug_int_ctrl_offset_counts: [64]u32, // Histogram of interrupt controller offsets
+
     const Self = @This();
 
     /// Boot ROM range
@@ -215,9 +234,17 @@ pub const MemoryBus = struct {
     const SYS_CTRL_START: u32 = 0x60006000;
     const SYS_CTRL_END: u32 = 0x60007FFF; // Extended to include CPU_CTL/COP_CTL
 
+    /// Hardware accelerator/buffer at 0x60003000 (Apple firmware uses for checksum/copy)
+    const HW_ACCEL_START: u32 = 0x60003000;
+    const HW_ACCEL_END: u32 = 0x60003FFF;
+
     /// Cache Controller
     const CACHE_CTRL_START: u32 = 0x6000C000;
     const CACHE_CTRL_END: u32 = 0x6000C0FF;
+
+    /// Undocumented memory/DMA controller at 0x60009000 (Apple firmware uses this)
+    const MEM_CTRL_START: u32 = 0x60009000;
+    const MEM_CTRL_END: u32 = 0x600090FF;
 
     /// DMA
     const DMA_START: u32 = 0x6000A000;
@@ -300,6 +327,7 @@ pub const MemoryBus = struct {
             .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
             .flash_ctrl_regs = [_]u32{0} ** 64,
+            .hw_accel_regs = [_]u32{0} ** 1024,
             .cpu_queue = 0,
             .cop_queue = 0,
             .last_access_addr = 0,
@@ -354,6 +382,7 @@ pub const MemoryBus = struct {
             .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
             .flash_ctrl_regs = [_]u32{0} ** 64,
+            .hw_accel_regs = [_]u32{0} ** 1024,
             .cpu_queue = 0,
             .cop_queue = 0,
             .last_access_addr = 0,
@@ -398,6 +427,15 @@ pub const MemoryBus = struct {
             .debug_sector_read_addrs = [_]u32{0} ** 32,
             .debug_sector_read_vals = [_]u32{0} ** 32,
             .debug_lfn_attr_read_count = 0,
+            .debug_timer_accesses = 0,
+            .debug_gpio_accesses = 0,
+            .debug_i2c_accesses = 0,
+            .debug_sys_ctrl_accesses = 0,
+            .debug_int_ctrl_accesses = 0,
+            .debug_mailbox_accesses = 0,
+            .debug_dev_init_accesses = 0,
+            .debug_dev_init_offset_counts = [_]u32{0} ** 32,
+            .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
         };
     }
 
@@ -417,7 +455,9 @@ pub const MemoryBus = struct {
         if (addr >= INT_CTRL_START and addr <= INT_CTRL_END) return .interrupt_ctrl;
         if (addr >= TIMER_START and addr <= TIMER_END) return .timers;
         if (addr >= SYS_CTRL_START and addr <= SYS_CTRL_END) return .system_ctrl;
+        if (addr >= HW_ACCEL_START and addr <= HW_ACCEL_END) return .hw_accel;
         if (addr >= CACHE_CTRL_START and addr <= CACHE_CTRL_END) return .cache_ctrl;
+        if (addr >= MEM_CTRL_START and addr <= MEM_CTRL_END) return .mem_ctrl;
         if (addr >= DMA_START and addr <= DMA_END) return .dma;
         if (addr >= GPIO_START and addr <= GPIO_END) return .gpio;
         if (addr >= DEV_INIT_START and addr <= DEV_INIT_END) return .device_init;
@@ -471,6 +511,32 @@ pub const MemoryBus = struct {
             self.debug_part0_reads += 1;
         }
 
+        // Track peripheral access counts for debugging
+        switch (region) {
+            .timers => self.debug_timer_accesses += 1,
+            .gpio => self.debug_gpio_accesses += 1,
+            .i2c => self.debug_i2c_accesses += 1,
+            .system_ctrl => self.debug_sys_ctrl_accesses += 1,
+            .interrupt_ctrl => {
+                self.debug_int_ctrl_accesses += 1;
+                // Track offset histogram
+                const offset = (translated_addr - INT_CTRL_START) >> 2;
+                if (offset < 64) {
+                    self.debug_int_ctrl_offset_counts[offset] += 1;
+                }
+            },
+            .mailbox => self.debug_mailbox_accesses += 1,
+            .device_init => {
+                self.debug_dev_init_accesses += 1;
+                // Track offset histogram
+                const offset = (translated_addr - DEV_INIT_START) >> 2;
+                if (offset < 32) {
+                    self.debug_dev_init_offset_counts[offset] += 1;
+                }
+            },
+            else => {},
+        }
+
         const value = switch (region) {
             .boot_rom => self.readRom(translated_addr),
             .sdram => self.readSdram(translated_addr),
@@ -482,6 +548,8 @@ pub const MemoryBus = struct {
             .timers => self.readPeripheral(self.timers, translated_addr, TIMER_START),
             .system_ctrl => self.readPeripheral(self.system_ctrl, translated_addr, SYS_CTRL_START),
             .cache_ctrl => self.readPeripheral(self.cache_ctrl, translated_addr, CACHE_CTRL_START),
+            .mem_ctrl => self.readStub(translated_addr, MEM_CTRL_START),
+            .hw_accel => self.readHwAccel(translated_addr),
             .dma => self.readPeripheral(self.dma, translated_addr, DMA_START),
             .gpio => self.readPeripheral(self.gpio, translated_addr, GPIO_START),
             .device_init => self.readPeripheral(self.device_init, translated_addr, DEV_INIT_START),
@@ -732,6 +800,30 @@ pub const MemoryBus = struct {
             self.debug_pinfo_writes += 1;
         }
 
+        // Track peripheral access counts for debugging (writes)
+        switch (region) {
+            .timers => self.debug_timer_accesses += 1,
+            .gpio => self.debug_gpio_accesses += 1,
+            .i2c => self.debug_i2c_accesses += 1,
+            .system_ctrl => self.debug_sys_ctrl_accesses += 1,
+            .interrupt_ctrl => {
+                self.debug_int_ctrl_accesses += 1;
+                const offset = (translated_addr - INT_CTRL_START) >> 2;
+                if (offset < 64) {
+                    self.debug_int_ctrl_offset_counts[offset] += 1;
+                }
+            },
+            .mailbox => self.debug_mailbox_accesses += 1,
+            .device_init => {
+                self.debug_dev_init_accesses += 1;
+                const offset = (translated_addr - DEV_INIT_START) >> 2;
+                if (offset < 32) {
+                    self.debug_dev_init_offset_counts[offset] += 1;
+                }
+            },
+            else => {},
+        }
+
         switch (region) {
             .boot_rom => {}, // ROM is read-only
             .proc_id => {}, // PROC_ID is read-only
@@ -743,6 +835,8 @@ pub const MemoryBus = struct {
             .timers => self.writePeripheral(self.timers, translated_addr, TIMER_START, value),
             .system_ctrl => self.writePeripheral(self.system_ctrl, translated_addr, SYS_CTRL_START, value),
             .cache_ctrl => self.writePeripheral(self.cache_ctrl, translated_addr, CACHE_CTRL_START, value),
+            .mem_ctrl => self.writeStub(translated_addr, MEM_CTRL_START, value),
+            .hw_accel => self.writeHwAccel(translated_addr, value),
             .dma => self.writePeripheral(self.dma, translated_addr, DMA_START, value),
             .gpio => self.writePeripheral(self.gpio, translated_addr, GPIO_START, value),
             .device_init => self.writePeripheral(self.device_init, translated_addr, DEV_INIT_START, value),
@@ -773,6 +867,34 @@ pub const MemoryBus = struct {
             // Debug: log writes to help understand boot protocol
             const print = std.debug.print;
             print("FLASH_CTRL[0x{X:0>2}] = 0x{X:0>8}\n", .{ offset * 4, value });
+        }
+    }
+
+    // Stub read/write for undocumented peripherals
+    fn readStub(self: *const Self, addr: u32, base: u32) u32 {
+        const idx = ((addr - base) >> 2) & 0xFF;
+        return self.stub_registers[idx];
+    }
+
+    fn writeStub(self: *Self, addr: u32, base: u32, value: u32) void {
+        const idx = ((addr - base) >> 2) & 0xFF;
+        self.stub_registers[idx] = value;
+    }
+
+    // Hardware accelerator buffer at 0x60003000
+    // Apple firmware uses this for checksum/copy operations
+    fn readHwAccel(self: *const Self, addr: u32) u32 {
+        const offset = (addr - HW_ACCEL_START) >> 2;
+        if (offset < 1024) {
+            return self.hw_accel_regs[offset];
+        }
+        return 0;
+    }
+
+    fn writeHwAccel(self: *Self, addr: u32, value: u32) void {
+        const offset = (addr - HW_ACCEL_START) >> 2;
+        if (offset < 1024) {
+            self.hw_accel_regs[offset] = value;
         }
     }
 
@@ -923,6 +1045,28 @@ pub const MemoryBus = struct {
         if (handler) |h| {
             return h.read(addr - base);
         }
+        // Device Init special handling - PP_VER1/PP_VER2 and other init registers
+        if (base == DEV_INIT_START) {
+            const offset = addr - base;
+            return switch (offset) {
+                0x00 => 0x00005021, // PP_VER1: PP5021
+                0x04 => 0x000000C1, // PP_VER2: Revision C1
+                0x08 => 0x00000000, // STRAP_OPT_A
+                0x0C => 0x00000000, // STRAP_OPT_B
+                0x10 => 0xFFFFFFFF, // DEV_INIT1: All devices enabled
+                0x14 => 0xFFFFFFFF, // DEV_INIT1+4
+                0x20 => 0xFFFFFFFF, // DEV_INIT2: All devices enabled
+                0x24 => 0xFFFFFFFF, // DEV_INIT2+4
+                0x30 => 0x80000000, // Unknown status register - bit 31 = ready
+                0x34 => 0x00000000, // DEV_TIMING1
+                0x38 => 0x00000000, // XMB_NOR_CFG
+                0x3C => 0x00000000, // XMB_RAM_CFG
+                else => blk: {
+                    const idx = (offset >> 2) & 0xFF;
+                    break :blk self.stub_registers[idx];
+                },
+            };
+        }
         // Stub: return from stub register array
         const idx = ((addr - base) >> 2) & 0xFF;
         return self.stub_registers[idx];
@@ -993,6 +1137,7 @@ pub const MemoryBus = struct {
             .timers => "Timers",
             .system_ctrl => "System Controller",
             .cache_ctrl => "Cache Controller",
+            .mem_ctrl => "Memory Controller",
             .dma => "DMA",
             .gpio => "GPIO",
             .device_init => "Device Init",
@@ -1001,6 +1146,7 @@ pub const MemoryBus = struct {
             .i2c => "I2C",
             .clickwheel => "Click Wheel",
             .ata => "ATA",
+            .flash_ctrl => "Flash Controller",
             .unmapped => "Unmapped",
         };
     }

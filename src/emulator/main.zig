@@ -420,6 +420,49 @@ pub fn main() !void {
     print("Bus SDRAM writes: {d}, IRAM writes: {d}\n", .{emu.bus.sdram_write_count, emu.bus.iram_write_count});
     print("First SDRAM write: addr=0x{X:0>8}, value=0x{X:0>8}\n", .{emu.bus.first_sdram_write_addr, emu.bus.first_sdram_write_value});
 
+    // Peripheral access counts (for Apple firmware analysis)
+    print("\n=== Peripheral Access Counts ===\n", .{});
+    print("  Timers:     {d}\n", .{emu.bus.debug_timer_accesses});
+    print("  GPIO:       {d}\n", .{emu.bus.debug_gpio_accesses});
+    print("  I2C:        {d}\n", .{emu.bus.debug_i2c_accesses});
+    print("  Sys Ctrl:   {d}\n", .{emu.bus.debug_sys_ctrl_accesses});
+    print("  Int Ctrl:   {d}\n", .{emu.bus.debug_int_ctrl_accesses});
+    print("  Mailbox:    {d}\n", .{emu.bus.debug_mailbox_accesses});
+    print("  Dev Init:   {d}\n", .{emu.bus.debug_dev_init_accesses});
+
+    // Device init offset histogram (show non-zero only)
+    print("  Dev Init Offset Histogram:\n", .{});
+    for (emu.bus.debug_dev_init_offset_counts, 0..) |count, idx| {
+        if (count > 0) {
+            print("    0x{X:0>2}: {d} accesses\n", .{ idx * 4, count });
+        }
+    }
+
+    // Interrupt controller offset histogram (show top entries)
+    print("  Int Ctrl Offset Histogram (top 10):\n", .{});
+    // Find top 10 by sorting indices
+    var int_indices: [64]usize = undefined;
+    for (0..64) |i| {
+        int_indices[i] = i;
+    }
+    // Simple bubble sort for top 10
+    for (0..10) |i| {
+        for (i + 1..64) |j| {
+            if (emu.bus.debug_int_ctrl_offset_counts[int_indices[j]] > emu.bus.debug_int_ctrl_offset_counts[int_indices[i]]) {
+                const tmp = int_indices[i];
+                int_indices[i] = int_indices[j];
+                int_indices[j] = tmp;
+            }
+        }
+    }
+    for (0..10) |i| {
+        const idx = int_indices[i];
+        const count = emu.bus.debug_int_ctrl_offset_counts[idx];
+        if (count > 0) {
+            print("    0x{X:0>3}: {d} accesses\n", .{ idx * 4, count });
+        }
+    }
+
     // LCD2 bridge debug
     const lcd_mod = @import("peripherals/lcd.zig");
     print("LCD2 bridge: total={d}, data={d}, ctrl={d}, starts={d}, last_ctrl=0x{X:0>8}\n", .{

@@ -5,17 +5,27 @@
 //! Reference: Rockbox firmware/export/pp5020.h
 //!
 //! Registers (base 0x60004000):
-//! - 0x000: CPU_INT_STAT - Interrupt status (read)
-//! - 0x024: CPU_INT_EN - Enable interrupts (write 1 to enable)
-//! - 0x028: CPU_INT_CLR - Disable interrupts (write 1 to disable, also called CPU_INT_DIS)
-//! - 0x02C: CPU_INT_PRIORITY - Priority configuration
+//! - 0x000: CPU_INT_STAT - CPU interrupt status (pending & enabled)
+//! - 0x004: COP_INT_STAT - COP interrupt status
+//! - 0x008: CPU_FIQ_STAT - CPU FIQ status
+//! - 0x00C: COP_FIQ_STAT - COP FIQ status
+//! - 0x010: INT_STAT - Raw interrupt status (all pending)
+//! - 0x014: INT_FORCED_STAT - Forced interrupt status
+//! - 0x018: INT_FORCED_SET - Set forced interrupt (write 1 to force)
+//! - 0x01C: INT_FORCED_CLR - Clear forced interrupt (write 1 to clear)
+//! - 0x020: CPU_INT_EN_STAT - CPU enable status (read-only)
+//! - 0x024: CPU_INT_EN - Enable CPU interrupts (write 1 to enable)
+//! - 0x028: CPU_INT_DIS - Disable CPU interrupts (write 1 to disable)
+//! - 0x02C: CPU_INT_PRIORITY - CPU priority configuration
+//! - 0x030: COP_INT_EN_STAT - COP enable status (read-only)
+//! - 0x034: COP_INT_EN - Enable COP interrupts (write 1 to enable)
+//! - 0x038: COP_INT_DIS - Disable COP interrupts (write 1 to disable)
+//! - 0x03C: COP_INT_PRIORITY - COP priority configuration
 //!
 //! High priority interrupt registers at offset 0x100:
 //! - 0x100: CPU_HI_INT_STAT
 //! - 0x104: CPU_HI_INT_EN
 //! - 0x108: CPU_HI_INT_CLR
-//!
-//! COP (second core) registers at offset 0x100xx (CPU) and 0x200xx (COP)
 
 const std = @import("std");
 const bus = @import("../memory/bus.zig");
@@ -42,11 +52,29 @@ pub const Interrupt = enum(u5) {
 
 /// Interrupt Controller state
 pub const InterruptController = struct {
-    /// Interrupt status (pending interrupts)
-    status: u32,
+    /// Raw interrupt status (all pending interrupts from peripherals)
+    raw_status: u32,
 
-    /// Interrupt enable mask
-    enable: u32,
+    /// Forced interrupt status (software-triggered)
+    forced_status: u32,
+
+    /// CPU interrupt enable mask
+    cpu_enable: u32,
+
+    /// COP interrupt enable mask
+    cop_enable: u32,
+
+    /// CPU FIQ enable mask
+    cpu_fiq_enable: u32,
+
+    /// COP FIQ enable mask
+    cop_fiq_enable: u32,
+
+    /// CPU priority configuration
+    cpu_priority: u32,
+
+    /// COP priority configuration
+    cop_priority: u32,
 
     /// High priority status
     hi_status: u32,
@@ -54,39 +82,59 @@ pub const InterruptController = struct {
     /// High priority enable
     hi_enable: u32,
 
-    /// Priority configuration
-    priority: u32,
-
-    /// FIQ configuration (which interrupts are FIQ vs IRQ)
-    fiq_enable: u32,
-
     /// Callback to update CPU IRQ/FIQ lines
     irq_callback: ?*const fn (bool) void,
     fiq_callback: ?*const fn (bool) void,
 
     const Self = @This();
 
-    /// Register offsets
+    /// Register offsets (from base 0x60004000)
     const REG_CPU_INT_STAT: u32 = 0x000;
+    const REG_COP_INT_STAT: u32 = 0x004;
+    const REG_CPU_FIQ_STAT: u32 = 0x008;
+    const REG_COP_FIQ_STAT: u32 = 0x00C;
+    const REG_INT_STAT: u32 = 0x010;
+    const REG_INT_FORCED_STAT: u32 = 0x014;
+    const REG_INT_FORCED_SET: u32 = 0x018;
+    const REG_INT_FORCED_CLR: u32 = 0x01C;
+    const REG_CPU_INT_EN_STAT: u32 = 0x020;
     const REG_CPU_INT_EN: u32 = 0x024;
-    const REG_CPU_INT_CLR: u32 = 0x028;
+    const REG_CPU_INT_DIS: u32 = 0x028;
     const REG_CPU_INT_PRIORITY: u32 = 0x02C;
+    const REG_COP_INT_EN_STAT: u32 = 0x030;
+    const REG_COP_INT_EN: u32 = 0x034;
+    const REG_COP_INT_DIS: u32 = 0x038;
+    const REG_COP_INT_PRIORITY: u32 = 0x03C;
+    const REG_CPU_FIQ_EN: u32 = 0x040;
+    const REG_COP_FIQ_EN: u32 = 0x044;
     const REG_CPU_HI_INT_STAT: u32 = 0x100;
     const REG_CPU_HI_INT_EN: u32 = 0x104;
     const REG_CPU_HI_INT_CLR: u32 = 0x108;
-    const REG_CPU_FIQ_EN: u32 = 0x040;
 
     pub fn init() Self {
         return .{
-            .status = 0,
-            .enable = 0,
+            .raw_status = 0,
+            .forced_status = 0,
+            .cpu_enable = 0,
+            .cop_enable = 0,
+            .cpu_fiq_enable = 0,
+            .cop_fiq_enable = 0,
+            .cpu_priority = 0,
+            .cop_priority = 0,
             .hi_status = 0,
             .hi_enable = 0,
-            .priority = 0,
-            .fiq_enable = 0,
             .irq_callback = null,
             .fiq_callback = null,
         };
+    }
+
+    // Legacy accessors for compatibility
+    pub fn getStatus(self: *const Self) u32 {
+        return self.raw_status | self.forced_status;
+    }
+
+    pub fn getEnable(self: *const Self) u32 {
+        return self.cpu_enable;
     }
 
     /// Set IRQ line callback
@@ -101,13 +149,13 @@ pub const InterruptController = struct {
 
     /// Assert an interrupt from a peripheral
     pub fn assertInterrupt(self: *Self, irq: Interrupt) void {
-        self.status |= irq.mask();
+        self.raw_status |= irq.mask();
         self.updateLines();
     }
 
     /// Clear an interrupt (usually called by peripheral when acknowledged)
     pub fn clearInterrupt(self: *Self, irq: Interrupt) void {
-        self.status &= ~irq.mask();
+        self.raw_status &= ~irq.mask();
         self.updateLines();
     }
 
@@ -115,7 +163,7 @@ pub const InterruptController = struct {
     pub fn assertHiInterrupt(self: *Self, bit: u5) void {
         self.hi_status |= @as(u32, 1) << bit;
         // Also set the HI_IRQ bit in main status
-        self.status |= Interrupt.hi_irq.mask();
+        self.raw_status |= Interrupt.hi_irq.mask();
         self.updateLines();
     }
 
@@ -123,45 +171,51 @@ pub const InterruptController = struct {
     pub fn clearHiInterrupt(self: *Self, bit: u5) void {
         self.hi_status &= ~(@as(u32, 1) << bit);
         if (self.hi_status == 0) {
-            self.status &= ~Interrupt.hi_irq.mask();
+            self.raw_status &= ~Interrupt.hi_irq.mask();
         }
         self.updateLines();
     }
 
     /// Update CPU IRQ/FIQ lines based on current state
     fn updateLines(self: *Self) void {
-        // Calculate pending interrupts
-        const pending = self.status & self.enable;
+        // Combined status includes raw (peripheral) and forced (software) interrupts
+        const status = self.raw_status | self.forced_status;
+
+        // Calculate CPU pending interrupts
+        const cpu_pending = status & self.cpu_enable;
         const hi_pending = self.hi_status & self.hi_enable;
 
-        // Separate FIQ and IRQ
-        const fiq_pending = pending & self.fiq_enable;
-        const irq_pending = (pending & ~self.fiq_enable) | (if (hi_pending != 0) Interrupt.hi_irq.mask() else @as(u32, 0));
+        // Separate CPU FIQ and IRQ
+        const cpu_fiq_pending = cpu_pending & self.cpu_fiq_enable;
+        const cpu_irq_pending = (cpu_pending & ~self.cpu_fiq_enable) | (if (hi_pending != 0) Interrupt.hi_irq.mask() else @as(u32, 0));
 
         // Notify CPU
         if (self.irq_callback) |callback| {
-            callback(irq_pending != 0);
+            callback(cpu_irq_pending != 0);
         }
         if (self.fiq_callback) |callback| {
-            callback(fiq_pending != 0);
+            callback(cpu_fiq_pending != 0);
         }
     }
 
-    /// Check if any interrupt is pending
+    /// Check if any CPU interrupt is pending
     pub fn hasPendingIrq(self: *const Self) bool {
-        const pending = self.status & self.enable & ~self.fiq_enable;
+        const status = self.raw_status | self.forced_status;
+        const pending = status & self.cpu_enable & ~self.cpu_fiq_enable;
         return pending != 0;
     }
 
-    /// Check if FIQ is pending
+    /// Check if CPU FIQ is pending
     pub fn hasPendingFiq(self: *const Self) bool {
-        const pending = self.status & self.enable & self.fiq_enable;
+        const status = self.raw_status | self.forced_status;
+        const pending = status & self.cpu_enable & self.cpu_fiq_enable;
         return pending != 0;
     }
 
     /// Get highest priority pending interrupt
     pub fn getHighestPending(self: *const Self) ?Interrupt {
-        const pending = self.status & self.enable;
+        const status = self.raw_status | self.forced_status;
+        const pending = status & self.cpu_enable;
         if (pending == 0) return null;
 
         // Find lowest set bit (highest priority)
@@ -171,15 +225,41 @@ pub const InterruptController = struct {
 
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
+        const status = self.raw_status | self.forced_status;
         return switch (offset) {
-            REG_CPU_INT_STAT => self.status,
-            REG_CPU_INT_EN => self.enable,
-            REG_CPU_INT_CLR => 0, // Write-only
-            REG_CPU_INT_PRIORITY => self.priority,
+            // CPU status registers
+            REG_CPU_INT_STAT => status & self.cpu_enable & ~self.cpu_fiq_enable,
+            REG_COP_INT_STAT => status & self.cop_enable & ~self.cop_fiq_enable,
+            REG_CPU_FIQ_STAT => status & self.cpu_enable & self.cpu_fiq_enable,
+            REG_COP_FIQ_STAT => status & self.cop_enable & self.cop_fiq_enable,
+
+            // Raw/forced status
+            REG_INT_STAT => status,
+            REG_INT_FORCED_STAT => self.forced_status,
+            REG_INT_FORCED_SET => 0, // Write-only
+            REG_INT_FORCED_CLR => 0, // Write-only
+
+            // CPU enable/priority
+            REG_CPU_INT_EN_STAT => self.cpu_enable,
+            REG_CPU_INT_EN => 0, // Write-only
+            REG_CPU_INT_DIS => 0, // Write-only
+            REG_CPU_INT_PRIORITY => self.cpu_priority,
+
+            // COP enable/priority
+            REG_COP_INT_EN_STAT => self.cop_enable,
+            REG_COP_INT_EN => 0, // Write-only
+            REG_COP_INT_DIS => 0, // Write-only
+            REG_COP_INT_PRIORITY => self.cop_priority,
+
+            // FIQ enables
+            REG_CPU_FIQ_EN => self.cpu_fiq_enable,
+            REG_COP_FIQ_EN => self.cop_fiq_enable,
+
+            // High priority
             REG_CPU_HI_INT_STAT => self.hi_status,
             REG_CPU_HI_INT_EN => self.hi_enable,
             REG_CPU_HI_INT_CLR => 0, // Write-only
-            REG_CPU_FIQ_EN => self.fiq_enable,
+
             else => 0,
         };
     }
@@ -187,24 +267,63 @@ pub const InterruptController = struct {
     /// Write register
     pub fn write(self: *Self, offset: u32, value: u32) void {
         switch (offset) {
+            // CPU status - writing clears raw status bits (write 1 to clear)
             REG_CPU_INT_STAT => {
-                // Writing to status clears bits (write 1 to clear)
-                self.status &= ~value;
+                self.raw_status &= ~value;
                 self.updateLines();
             },
+            REG_COP_INT_STAT => {
+                self.raw_status &= ~value;
+                self.updateLines();
+            },
+
+            // Forced interrupt control
+            REG_INT_FORCED_SET => {
+                self.forced_status |= value;
+                self.updateLines();
+            },
+            REG_INT_FORCED_CLR => {
+                self.forced_status &= ~value;
+                self.updateLines();
+            },
+
+            // CPU enable/disable
             REG_CPU_INT_EN => {
-                // Write 1 to enable
-                self.enable |= value;
+                self.cpu_enable |= value;
                 self.updateLines();
             },
-            REG_CPU_INT_CLR => {
-                // Write 1 to disable
-                self.enable &= ~value;
+            REG_CPU_INT_DIS => {
+                self.cpu_enable &= ~value;
                 self.updateLines();
             },
             REG_CPU_INT_PRIORITY => {
-                self.priority = value;
+                self.cpu_priority = value;
             },
+
+            // COP enable/disable
+            REG_COP_INT_EN => {
+                self.cop_enable |= value;
+                self.updateLines();
+            },
+            REG_COP_INT_DIS => {
+                self.cop_enable &= ~value;
+                self.updateLines();
+            },
+            REG_COP_INT_PRIORITY => {
+                self.cop_priority = value;
+            },
+
+            // FIQ enables
+            REG_CPU_FIQ_EN => {
+                self.cpu_fiq_enable = value;
+                self.updateLines();
+            },
+            REG_COP_FIQ_EN => {
+                self.cop_fiq_enable = value;
+                self.updateLines();
+            },
+
+            // High priority
             REG_CPU_HI_INT_STAT => {
                 self.hi_status &= ~value;
                 self.updateLines();
@@ -217,10 +336,7 @@ pub const InterruptController = struct {
                 self.hi_enable &= ~value;
                 self.updateLines();
             },
-            REG_CPU_FIQ_EN => {
-                self.fiq_enable = value;
-                self.updateLines();
-            },
+
             else => {},
         }
     }
@@ -251,18 +367,18 @@ test "interrupt enable/disable" {
 
     // Enable timer1 interrupt
     ctrl.write(InterruptController.REG_CPU_INT_EN, Interrupt.timer1.mask());
-    try std.testing.expectEqual(Interrupt.timer1.mask(), ctrl.enable);
+    try std.testing.expectEqual(Interrupt.timer1.mask(), ctrl.cpu_enable);
 
     // Disable timer1 interrupt
-    ctrl.write(InterruptController.REG_CPU_INT_CLR, Interrupt.timer1.mask());
-    try std.testing.expectEqual(@as(u32, 0), ctrl.enable);
+    ctrl.write(InterruptController.REG_CPU_INT_DIS, Interrupt.timer1.mask());
+    try std.testing.expectEqual(@as(u32, 0), ctrl.cpu_enable);
 }
 
 test "interrupt assertion" {
     var ctrl = InterruptController.init();
 
     // Enable and assert timer1
-    ctrl.enable = Interrupt.timer1.mask();
+    ctrl.cpu_enable = Interrupt.timer1.mask();
     ctrl.assertInterrupt(.timer1);
 
     try std.testing.expect(ctrl.hasPendingIrq());
@@ -277,7 +393,7 @@ test "interrupt priority" {
     var ctrl = InterruptController.init();
 
     // Enable multiple interrupts
-    ctrl.enable = Interrupt.timer1.mask() | Interrupt.timer2.mask() | Interrupt.i2s.mask();
+    ctrl.cpu_enable = Interrupt.timer1.mask() | Interrupt.timer2.mask() | Interrupt.i2s.mask();
 
     // Assert all three
     ctrl.assertInterrupt(.timer1);
@@ -286,4 +402,19 @@ test "interrupt priority" {
 
     // Lowest bit (timer1) should be highest priority
     try std.testing.expectEqual(Interrupt.timer1, ctrl.getHighestPending().?);
+}
+
+test "forced interrupt" {
+    var ctrl = InterruptController.init();
+
+    // Enable timer1 interrupt
+    ctrl.cpu_enable = Interrupt.timer1.mask();
+
+    // Force the interrupt via software
+    ctrl.write(InterruptController.REG_INT_FORCED_SET, Interrupt.timer1.mask());
+    try std.testing.expect(ctrl.hasPendingIrq());
+
+    // Clear the forced interrupt
+    ctrl.write(InterruptController.REG_INT_FORCED_CLR, Interrupt.timer1.mask());
+    try std.testing.expect(!ctrl.hasPendingIrq());
 }
