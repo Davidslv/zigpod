@@ -916,19 +916,27 @@ pub const MemoryBus = struct {
             self.hw_accel_read_count += 1;
             var value = self.hw_accel_regs[offset];
 
-            // RTOS kickstart: modify task state to indicate ready
-            // When enabled, change task 0 state from 01 (sleeping) to 11 (ready)
-            // This tricks the scheduler into thinking a task is ready to run
-            if (self.kickstart_enabled and offset == 0) {
-                self.kickstart_read_count += 1;
-                // Change bits 0-1 from 01 to 11 (task 0 ready)
-                value = (value & ~@as(u32, 0x3)) | 0x3;
-                // Log first 20 kickstart reads
-                if (self.kickstart_read_count <= 20) {
-                    std.debug.print("HW_ACCEL READ  [0x{X:0>8}] = 0x{X:0>8} [KICKSTART #{d}]\n", .{ addr, value, self.kickstart_read_count });
+            // RTOS kickstart: Modify reads to indicate task 0 is ready
+            // The scheduler reads hw_accel[0] to check task states.
+            // If the value has task 0 in state 01 (sleeping), change to 11 (ready).
+            // This must happen on the READ, not the write, because the scheduler
+            // reads before writing updates.
+            if (offset == 0) {
+                const task0_state = value & 0x3;
+                // If task 0 is sleeping (01) and the value is stabilizing (>= 0x19 from init loop)
+                // change it to ready (11) to kickstart the scheduler
+                if (task0_state == 0x1 and value >= 0x19) {
+                    self.kickstart_read_count += 1;
+                    const modified_value = (value & ~@as(u32, 0x3)) | 0x3;
+                    if (self.kickstart_read_count <= 10) {
+                        std.debug.print("HW_ACCEL KICKSTART READ: Modifying 0x{X:0>8} -> 0x{X:0>8} (task 0 = ready)\n", .{ value, modified_value });
+                    }
+                    value = modified_value;
                 }
-            } else if (offset < 16 and self.hw_accel_read_count <= 100) {
-                // Log first 100 normal reads
+            }
+
+            // Log first 100 normal reads
+            if (offset < 16 and self.hw_accel_read_count <= 100) {
                 std.debug.print("HW_ACCEL READ  [0x{X:0>8}] offset=0x{X:0>2} = 0x{X:0>8}\n", .{ addr, offset * 4, value });
             }
             return value;
@@ -940,6 +948,7 @@ pub const MemoryBus = struct {
         const offset = (addr - HW_ACCEL_START) >> 2;
         if (offset < 1024) {
             self.hw_accel_write_count += 1;
+
             // Log first 16 task slots (offsets 0x00-0x3C)
             if (offset < 16 and self.hw_accel_write_count <= 100) {
                 std.debug.print("HW_ACCEL WRITE [0x{X:0>8}] offset=0x{X:0>2} = 0x{X:0>8}\n", .{ addr, offset * 4, value });

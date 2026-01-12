@@ -193,6 +193,16 @@ pub const Timers = struct {
         }
     }
 
+    /// Force fire a timer1 IRQ (for RTOS kickstart debugging)
+    pub fn forceTimerIrq(self: *Self) void {
+        if (self.int_ctrl) |ctrl| {
+            std.debug.print("TIMER: Forcing timer1 IRQ assertion\n", .{});
+            ctrl.assertInterrupt(.timer1);
+        } else {
+            std.debug.print("TIMER: Cannot force IRQ - no interrupt controller\n", .{});
+        }
+    }
+
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
         return switch (offset) {

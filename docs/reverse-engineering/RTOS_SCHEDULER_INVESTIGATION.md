@@ -263,13 +263,98 @@ Implement I2C device responses for:
 
 ---
 
+---
+
+## Session 3: Deep Dive Analysis (2026-01-12)
+
+### Problem: hw_accel Kickstart Not Working
+
+The previous kickstart at 1M cycles no longer works. Investigation revealed:
+
+#### Timeline Discovery
+
+| Cycles | State |
+|--------|-------|
+| ~500 | Boot sequence running |
+| ~1000 | Peripheral init |
+| ~2000 | hw_accel init loop |
+| ~3000 | **Enters scheduler wait loop** |
+| 100k+ | Still at 0x1000097C |
+
+The firmware enters the SWI wait loop at ~3000 cycles, BEFORE our kickstart at 100k cycles.
+
+#### hw_accel Analysis
+
+**Access Pattern:**
+```
+Read  0x00 → Write 0x01
+Read  0x01 → Write 0x09
+Read  0x09 → Write 0x19
+Read  0x19 → Write 0x59 (final)
+```
+
+**Key Finding:** After the init loop (16 reads/writes), **NO MORE hw_accel reads occur**.
+
+The scheduler does NOT read hw_accel to check for ready tasks - it uses a different data structure in RAM.
+
+#### SWI Handler Loop Analysis
+
+**Stuck Address:** 0x1000097C
+
+```asm
+; SWI entry at 0x10000960:
+LDR  R12, [R10]           ; Read PROC_ID (0x60000000)
+CMP  R12, #0x55           ; Is CPU?
+BNE  elsewhere            ; No, branch
+SUB  LR, LR, #4           ; Adjust return address
+PUSH {R0-R8, LR}          ; Save context
+BL   0x100277C0           ; Call wait_for_event
+LDM  SP!, {R0-R8, LR, PC}^ ; Exception return ← STUCK HERE
+```
+
+The `wait_for_event` function at 0x100277C0 blocks until a task is ready. It never returns success, so the loop continues forever.
+
+#### IRQ Kickstart Failure
+
+Tried enabling IRQ at 200k and 500k cycles:
+
+| Cycle | Result |
+|-------|--------|
+| 200k | Crash: PC=0xE12FFF1C, Mode=unknown |
+| 500k | Crash: PC=0xE12FFF1C, Mode=unknown |
+
+**Root Cause:** IRQ dispatch tables are NOT initialized.
+- The IRQ handler at 0x10000980 eventually calls uninitialized function pointers
+- Dispatch tables would be set up by tasks that never run (chicken-egg problem)
+
+### Conclusions
+
+1. **hw_accel is only used during initialization** - scheduler doesn't poll it
+2. **Task state lives in RAM** - need to find the address
+3. **IRQ cannot work** until dispatch tables are initialized
+4. **The scheduler wait loop starts at ~3000 cycles** - too early for any kickstart
+
+### Potential Solutions
+
+1. **Find task state RAM address**: The scheduler reads task state from somewhere in SDRAM (possibly around 0x108xxxxx). Modifying this directly might work.
+
+2. **Implement I2C device responses**: Tasks may be waiting for PMU (PCF50605) or codec (WM8758) responses. With proper I2C emulation, tasks might complete and mark themselves ready.
+
+3. **Manual dispatch table initialization**: Find where the IRQ dispatch tables should be and pre-initialize them so IRQ can work.
+
+4. **Different firmware path**: Maybe there's a boot flag or memory location that controls whether the scheduler waits for tasks.
+
+---
+
 ## Next Steps
 
 1. [x] Add hw_accel access tracing to emulator
 2. [ ] Disassemble subroutine at 0x229C10
 3. [x] Test hw_accel kickstart (partial success)
-4. [ ] Investigate task 0 blocking reason
+4. [x] Investigate task 0 blocking reason (blocked on unknown RAM state)
 5. [ ] Implement I2C device responses (PMU/codec)
+6. [ ] Find task state RAM address
+7. [ ] Find and initialize IRQ dispatch tables
 
 ---
 

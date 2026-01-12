@@ -355,23 +355,36 @@ pub const Emulator = struct {
         // Tick peripherals
         self.timer.tick(cycles);
 
-        // RTOS Kickstart: Modify hw_accel to indicate a task is ready
-        // The Apple firmware RTOS scheduler waits for tasks to become ready,
-        // but tasks need timer interrupts to wake up. This breaks the chicken-egg.
-        // After 1M cycles when values stabilize at (0x59, 0xA6, 0xFF, 0x00):
-        // - 0x59 = tasks in states: 01 01 10 01 (sleeping/blocked)
-        // - Set slot 0 to 0x5B (task 0 = 11 = ready) to kickstart scheduler
-        if (!self.rtos_kickstart_fired and self.total_cycles >= 1_000_000) {
+        // RTOS Kickstart: Try multiple approaches to break the scheduler wait loop
+        // The Apple firmware RTOS scheduler waits for tasks to become ready.
+        // Tasks need timer interrupts to wake up, but IRQ was disabled because
+        // dispatch tables weren't ready. Let's try enabling IRQ later when
+        // more initialization has completed.
+        //
+        // Approach 1: Enable hw_accel kickstart (modifies reads)
+        // Approach 2: Enable IRQ and fire timer (may have valid dispatch tables now)
+        if (!self.rtos_kickstart_fired and self.total_cycles >= 100_000) {
             self.rtos_kickstart_fired = true;
             // Enable kickstart mode - hw_accel reads will return modified values
-            // to indicate task 0 is ready, breaking the scheduler loop
             self.bus.enableKickstart();
-            // Enable I2C tracing to see what the firmware is requesting
+            // Enable I2C tracing
             self.i2c_ctrl.enableTracing();
-            // NOTE: IRQ/timer interrupt disabled - causes jump to uninitialized function
-            // pointers when firmware hasn't set up its dispatch tables yet
-            std.debug.print("RTOS KICKSTART: Enabled hw_accel[0] at cycle {}\n", .{self.total_cycles});
+            std.debug.print("RTOS KICKSTART: Enabled hw_accel kickstart at cycle {}\n", .{self.total_cycles});
         }
+
+        // NOTE: IRQ kickstart is DISABLED because:
+        // 1. Firmware enters scheduler wait loop at ~3000 cycles
+        // 2. IRQ dispatch tables are set up by tasks that never run
+        // 3. Firing IRQ causes crash to 0xE12FFF1C (uninitialized handler)
+        //
+        // The scheduler wait loop at 0x1000097C calls wait_for_event (0x100277C0)
+        // which blocks until task state changes. Task state lives in RAM somewhere,
+        // not in hw_accel (which is only used during init).
+        //
+        // Possible solutions:
+        // 1. Find task state RAM address and modify it directly
+        // 2. Implement I2C device responses - tasks may be waiting for PMU/codec
+        // 3. Find where dispatch tables should be and initialize them manually
 
         return cycles;
     }
