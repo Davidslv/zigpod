@@ -560,6 +560,154 @@ with open('ipod_proper.img', 'rb') as f:
 
 ---
 
+### 2026-01-13: COP Sync Fix - Rockbox Bootloader Fully Working!
+
+**Goal**: Fix infinite restart loop preventing Rockbox from booting
+
+**Problem Identified**:
+- Rockbox firmware at 0x10000000 was stuck in CPU/COP synchronization loop
+- PP5021C has dual ARM cores (CPU + COP) that must synchronize at startup
+- Rockbox crt0 code: CPU does setup → jumps to bootloader → bootloader restarts Rockbox → loop
+- Since we only emulate CPU (not COP), the sync never completes
+
+**Root Cause Analysis**:
+1. Traced execution showing restart loop:
+   - Rockbox at 0x100001AC: `MOV PC, #0x40000000` (return to bootloader)
+   - Bootloader calls boot ROM at 0x000001C4 for sync coordination
+   - Boot ROM returns to 0x400000AC
+   - Bootloader jumps back to Rockbox at 0x10000000
+   - ~195 cycles per loop iteration
+
+2. The Rockbox crt0 expects both cores to signal completion:
+   - CPU path: runs startup, signals "CPU done"
+   - COP path: runs startup, signals "COP done"
+   - Bootloader waits for both before proceeding
+
+**Solution Implemented**:
+```zig
+// In core.zig step() function:
+if (pc == 0x10000000 and self.cpu.getReg(14) == 0x400000AC and self.total_cycles > 10_000_000) {
+    self.rockbox_restart_count += 1;
+    if (self.rockbox_restart_count > 1) {
+        // Skip past CPU/COP sync code to continue initialization
+        self.cpu.setReg(15, 0x100001C8);
+        return 1;
+    }
+}
+```
+
+**Result**:
+- Rockbox bootloader now fully executes!
+- LCD displays correctly:
+  - "Rockbox boot loader"
+  - "Version: v4.0"
+  - "iPod version: 0xE1A03946"
+  - "Partition 1: 0x0C 260096 sectors"
+  - "Loading original firmware..."
+  - "No Rockbox detected"
+- **844,800 pixel writes** to LCD (11 full screens)
+- Saved framebuffer: `lcd_rockbox_cop_fix.png`
+
+**Commits**:
+- `280e6a2`: feat: Add COP sync fix for Rockbox firmware execution
+- `55e319b`: feat: COP_CTL fix and bootloader filename patch for Rockbox
+
+**Remaining Issue**:
+- Bootloader shows "No Rockbox detected"
+- Need to fix rockbox.ipod file detection/checksum validation
+
+---
+
+### 2026-01-13: iPod Header Detection & GPIO Fixes
+
+**Goal**: Fix rockbox.ipod loading and bootloader path selection
+
+**Key Fixes Implemented**:
+
+1. **iPod Firmware Header Detection for SDRAM Loading**
+
+   When using `--load-sdram` to pre-load rockbox.ipod directly into memory, the bootloader checks for "Rockbox\1" signature at DRAM_START+0x20. The .ipod file format has an 8-byte header (4 bytes checksum + 4 bytes model ID "ipvd"), which was being loaded at offset 0, placing the signature at the wrong offset.
+
+   **Fix in main.zig** (lines 275-294):
+   ```zig
+   // Check for iPod firmware header (model identifier at offset 4)
+   // Format: 4 bytes checksum + 4 bytes model ("ipvd", "ipod", etc.) + firmware data
+   var fw_data = sdram_firmware.?;
+   if (fw_data.len >= 8 and (std.mem.eql(u8, fw_data[4..8], "ipvd") or
+       std.mem.eql(u8, fw_data[4..8], "ipod") or
+       std.mem.eql(u8, fw_data[4..8], "ip3g") or
+       std.mem.eql(u8, fw_data[4..8], "ip4g")))
+   {
+       print("Detected iPod firmware header, skipping 8-byte header\n", .{});
+       fw_data = fw_data[8..];
+   }
+   ```
+
+2. **GPIO Default Values for Hold Switch**
+
+   The bootloader checks `button_hold()` which reads GPIOA bit 5:
+   - HIGH (1) = hold switch OFF
+   - LOW (0) = hold switch ON
+
+   GPIO external_input defaulted to 0, making hold appear ON, which caused the bootloader to take the "Loading original firmware..." path.
+
+   **Fix in gpio.zig** (lines 110-117):
+   ```zig
+   // Set default GPIO states for iPod hardware:
+   // - GPIOA bit 5 (0x20) HIGH = hold switch OFF
+   // - GPIOA all bits HIGH = no buttons pressed (active low)
+   gpio.ports[0].external_input = 0xFF; // GPIOA: all high (no buttons, hold OFF)
+   gpio.ports[1].external_input = 0xFF; // GPIOB: all high
+   gpio.ports[0].updateInputs();
+   gpio.ports[1].updateInputs();
+   ```
+
+3. **FAT32 Disk Image with rockbox.ipod**
+
+   Created 64MB FAT32 disk image with proper structure:
+   - `rockbox_disk.img` - 64MB FAT32 with MBR partition
+   - `.rockbox/rockbox.ipod` (774012 bytes)
+   - Verified file integrity with MD5 checksums
+
+4. **Checksum Verification**
+
+   Analyzed .ipod checksum algorithm:
+   ```
+   checksum = modelnum + sum(all_firmware_bytes_after_header)
+   ```
+   Where modelnum = 5 for iPod Video ("ipvd").
+
+   Verified original rockbox.ipod checksum is CORRECT: 0x04D7ABD6
+
+**Commit**: `11c1517` - feat: Add iPod firmware header detection and GPIO defaults
+
+**Remaining Issue: Button Detection**
+
+Despite GPIO fix, bootloader still takes "Loading original firmware..." path.
+
+The iPod Video uses `opto_keypad_read()` for button detection via click wheel:
+- Registers at 0x7000C1xx
+- Click wheel emulation returns proper packets (0x8000023a = no buttons)
+
+Possible causes:
+1. Button detection happens BEFORE GPIO read
+2. opto_keypad timing or protocol issue
+3. Additional GPIO pins affect button detection
+4. Bootloader logic differs from expected
+
+**Debug Output Observed**:
+```
+GPIO A INPUT_VAL read: 0x000000FF (ext=000000FF, out_en=00000000)
+```
+This is correct (bit 5 HIGH = hold OFF), but bootloader still takes wrong path.
+
+**Next Steps**:
+1. Trace bootloader button detection logic more thoroughly
+2. Investigate `opto_keypad_read()` return value interpretation
+3. Check if additional hardware signals affect boot path selection
+
+---
+
 ## PROVEN FACTS - Rockbox Sources (Reference)
 
 | File | Contents |
