@@ -33,18 +33,65 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 
 ---
 
-### 2025-01-12: RTOS Scheduler Investigation (Current)
+### 2025-01-12: RTOS Scheduler Investigation
 
 **Goal**: Break out of RTOS scheduler loop to reach peripheral initialization
 
 **Current State**:
-- PC stuck at: 0x10229BB4
+- PC stuck at: 0x10229BB4 then 0x1000097C
 - 0 Timer accesses
 - 0 I2C accesses
 - 0 LCD writes
 - Firmware accessing hw_accel region (0x60003000)
 
 **Investigation**: See [RTOS_SCHEDULER_INVESTIGATION.md](RTOS_SCHEDULER_INVESTIGATION.md)
+
+---
+
+### 2025-01-12: Scheduler Deep Dive and Filesystem Discovery (Current)
+
+**Goal**: Understand why scheduler loop never finds a runnable task
+
+**Key Discoveries**:
+
+1. **Scheduler Mutex Mechanism**
+   - 0x1081D858: Main scheduler mutex (test-and-set at 0x1025B348)
+   - 0x1081D860: Task selection mutex
+   - Function at 0x1025B348 checks if value == 0 (not just bit 0)
+   - Must completely zero mutex for acquisition to succeed
+
+2. **IRQ Chicken-and-Egg Problem**
+   - Tasks are sleeping, waiting for events (timer IRQ, etc.)
+   - IRQ dispatch tables are set up by tasks that never run
+   - Firing IRQ without proper handlers crashes to 0xE12FFF1C
+
+3. **CRITICAL DISCOVERY: Filesystem Access**
+   - Firmware is actively trying to read FAT32 directory entries!
+   - Reading from 0x11006Fxx (disk buffer area)
+   - Looking for: DIR_ENTRY, LFN (Long File Name), attributes, checksum
+   - All reads return 0x00000000 (empty/no data)
+   - **The firmware is stuck because it can't find expected files!**
+
+**Directory Entry Read Pattern**:
+```
+DIR_ENTRY[0x11006F14]: first_byte=0x00
+DIR_ENTRY[0x11006F34]: first_byte=0x00
+LFN_START READ at 0x11006F54
+ATTR READ at 0x11006F5C
+CHECKSUM READ at 0x11006F60
+SHORT_ENTRY READ at 0x11006F74
+```
+
+**Next Steps**:
+1. Create proper FAT32 filesystem with iPod directory structure
+2. Include: iPod_Control/, iTunes database files
+3. Or: Skip disk read by patching firmware to return "disk ready"
+
+**Files Changed**:
+- `bus.zig`: Updated schedulerKickstart() to fully zero mutexes
+- `core.zig`: Disabled IRQ kickstart (crashes without proper handlers)
+
+**Commits**: To be committed
 
 ---
 

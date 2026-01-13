@@ -394,19 +394,32 @@ pub const Emulator = struct {
             self.bus.tcbKickstart();
         }
 
-        // NOTE: IRQ kickstart is DISABLED because:
+        // Timer IRQ kickstart: DISABLED - crashes because IRQ dispatch tables not initialized
+        // The firmware needs tasks to run first to set up IRQ handlers, but tasks are sleeping.
+        // Chicken-and-egg problem: tasks need IRQs to wake up, IRQs need tasks to set up handlers.
+        //
+        // if (self.total_cycles >= 10_000 and self.total_cycles < 10_100) {
+        //     self.cpu.enableIrq();
+        //     self.int_ctrl.forceEnableCpuInterrupt(.timer1);
+        //     self.int_ctrl.assertInterrupt(.timer1);
+        // }
+
+        // Debug: Log PC and registers periodically when stuck
+        if (self.total_cycles >= 50_000 and self.total_cycles < 50_003) {
+            std.debug.print("DEBUG @ {}: PC=0x{X:0>8}, Mode={s}, IRQ_disabled={}\n", .{
+                self.total_cycles,
+                self.cpu.regs.r[15],
+                @tagName(self.cpu.regs.cpsr.getMode() orelse .user),
+                self.cpu.regs.cpsr.irq_disable,
+            });
+        }
+
+        // NOTE: Earlier attempts at IRQ kickstart crashed because:
         // 1. Firmware enters scheduler wait loop at ~3000 cycles
         // 2. IRQ dispatch tables are set up by tasks that never run
         // 3. Firing IRQ causes crash to 0xE12FFF1C (uninitialized handler)
         //
-        // The scheduler wait loop at 0x1000097C calls wait_for_event (0x100277C0)
-        // which blocks until task state changes. Task state lives in RAM somewhere,
-        // not in hw_accel (which is only used during init).
-        //
-        // Possible solutions:
-        // 1. Find task state RAM address and modify it directly
-        // 2. Implement I2C device responses - tasks may be waiting for PMU/codec
-        // 3. Find where dispatch tables should be and initialize them manually
+        // Now trying later (10000 cycles) after scheduler has run
 
         return cycles;
     }

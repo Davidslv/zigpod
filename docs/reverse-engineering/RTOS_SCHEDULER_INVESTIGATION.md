@@ -444,6 +444,105 @@ before reaching the scheduler. Need to investigate early boot I2C sequence.
 
 ---
 
+## Session 5: Scheduler Mutex and Filesystem Discovery (2025-01-12)
+
+### Objective
+
+Deep dive into scheduler mechanics to understand why tasks never become ready.
+
+### Scheduler Mutex Analysis
+
+**Function 0x1025B348** - Test-and-Set Mutex:
+```asm
+0x1025B348: LDR R1, [R0]      ; Load mutex value
+0x1025B34C: CMP R1, #0        ; Is it free (zero)?
+0x1025B350: MOVEQ R1, #1      ; If free, set to locked
+0x1025B354: STREQ R1, [R0]    ; Store back
+0x1025B358: MOVEQ R0, #1      ; Return 1 (acquired)
+0x1025B35C: MOVNE R0, #0      ; Return 0 (failed)
+0x1025B360: MOV PC, LR        ; Return
+```
+
+**Key Insight:** Mutex acquisition checks `value == 0`, NOT just bit 0.
+
+**Scheduler Flow at 0x102778C0:**
+1. Load R4 from PC+0x34 = 0x1081D850 (scheduler data structure)
+2. Load R0 = [0x1081D858] (skip flag)
+3. TST R0, #0x1 - if bit 0 set, skip task selection
+4. If not set, try to acquire mutex at 0x1081D858
+5. Call task selection at 0x10127E18
+6. Task selection also checks [0x1081D860]
+
+**Updated schedulerKickstart():**
+- Changed from clearing bit 0 to completely zeroing both addresses
+- This allows mutex acquisition to succeed
+
+### IRQ Chicken-and-Egg Problem
+
+**Observation:** Enabling IRQ and firing timer1 causes crash to 0xE12FFF1C.
+
+**Reason:** This address looks like a BX instruction opcode being executed as a PC address. The IRQ handler tries to dispatch to uninitialized function pointers.
+
+**IRQ Handler Flow:**
+1. Exception to 0x00000018
+2. LDR PC, [PC, #0x18] loads from literal pool
+3. Jumps to 0x10000818 (EA000058 = B 0x10000980)
+4. 0x10000980 eventually calls through dispatch table
+5. Dispatch table not initialized → jumps to garbage
+
+### CRITICAL DISCOVERY: Filesystem Access
+
+**Major Breakthrough:** The firmware is actively trying to read FAT32 directory entries!
+
+**Evidence from trace:**
+```
+DIR_ENTRY[0x11006F14]: first_byte=0x00('.'), val=0x00000000
+DIR_ENTRY[0x11006F34]: first_byte=0x00('.'), val=0x00000000
+LFN_START READ at 0x11006F54: val=0x00000000
+ATTR READ at 0x11006F5C: val=0x00000000
+CHECKSUM READ at 0x11006F60: val=0x00000000
+SHORT_ENTRY READ at 0x11006F74: val=0x00000000
+DIR_ENTRY[0x11006F94]: first_byte=0x00('.'), val=0x00000000
+```
+
+**Interpretation:**
+- Address range 0x11006Fxx is disk buffer/flash emulation
+- Firmware is scanning FAT32 directory entries
+- All entries return 0x00 (empty/no files)
+- The firmware is stuck in a loop looking for expected files
+
+**Expected iPod Directory Structure:**
+- `/iPod_Control/` - Main iPod directory
+- `/iPod_Control/iTunes/` - iTunes database files
+- `/iPod_Control/Music/` - Music files (Fxx/yyyy.mp3)
+- `/iPod_Control/Device/` - Device info
+- Various system files (iTunesDB, iTunesSD, etc.)
+
+### Root Cause Identified
+
+**The firmware is NOT stuck in scheduler wait loop due to RTOS mechanics.**
+
+**The REAL issue:** The firmware is trying to read the iPod filesystem and finding nothing. It's in a loop scanning directory entries, all of which are empty.
+
+### Solution Path
+
+1. **Create proper FAT32 filesystem** with expected iPod structure
+2. **Populate required files**: iTunesDB, device info, etc.
+3. **Mount filesystem image** in emulator at appropriate addresses
+4. Or: **Patch firmware** to skip disk checks
+
+### Code Changes
+
+**bus.zig - schedulerKickstart():**
+- Now completely zeros mutex values instead of just clearing bit 0
+- This allows mutex acquisition to succeed
+
+**core.zig:**
+- Disabled timer IRQ kickstart (causes crash without initialized handlers)
+- Added debug logging at 50k cycles
+
+---
+
 ## Next Steps
 
 1. [x] Add hw_accel access tracing to emulator

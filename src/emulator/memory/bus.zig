@@ -1023,15 +1023,16 @@ pub const MemoryBus = struct {
         }
     }
 
-    /// Scheduler Skip Flag Kickstart
-    /// Multiple scheduler checkpoints check different flags:
-    /// - 0x1081D858: Main scheduler mutex/skip flag (bit 0)
-    /// - 0x1081D860: Task selection skip flag (bit 0)
-    /// Clear both to allow full task selection to proceed.
+    /// Scheduler Mutex Kickstart
+    /// The scheduler uses test-and-set mutexes at these addresses:
+    /// - 0x1081D858: Main scheduler mutex (must be 0 to acquire)
+    /// - 0x1081D860: Task selection mutex (must be 0 to acquire)
+    /// The mutex function at 0x1025B348 checks if value == 0, not just bit 0.
+    /// We must completely zero these to allow mutex acquisition.
     pub fn schedulerKickstart(self: *Self) void {
-        // Clear flag at 0x1081D858 (main scheduler)
-        const sched_flag1: u32 = 0x1081D858;
-        const offset1 = sched_flag1 - SDRAM_START;
+        // Zero mutex at 0x1081D858 (main scheduler)
+        const sched_mutex1: u32 = 0x1081D858;
+        const offset1 = sched_mutex1 - SDRAM_START;
 
         if (offset1 + 3 < self.sdram.len) {
             const current1 = @as(u32, self.sdram[offset1]) |
@@ -1039,20 +1040,21 @@ pub const MemoryBus = struct {
                 (@as(u32, self.sdram[offset1 + 2]) << 16) |
                 (@as(u32, self.sdram[offset1 + 3]) << 24);
 
-            const new_val1: u32 = current1 & ~@as(u32, 0x1);
-            self.sdram[offset1] = @truncate(new_val1);
-            self.sdram[offset1 + 1] = @truncate(new_val1 >> 8);
-            self.sdram[offset1 + 2] = @truncate(new_val1 >> 16);
-            self.sdram[offset1 + 3] = @truncate(new_val1 >> 24);
+            // Completely zero the mutex (not just clear bit 0)
+            const new_val1: u32 = 0;
+            self.sdram[offset1] = 0;
+            self.sdram[offset1 + 1] = 0;
+            self.sdram[offset1 + 2] = 0;
+            self.sdram[offset1 + 3] = 0;
 
             if (current1 != new_val1) {
                 std.debug.print("SCHED KICKSTART [0x1081D858]: 0x{X:0>8} -> 0x{X:0>8}\n", .{ current1, new_val1 });
             }
         }
 
-        // Clear flag at 0x1081D860 (task selection)
-        const sched_flag2: u32 = 0x1081D860;
-        const offset2 = sched_flag2 - SDRAM_START;
+        // Zero mutex at 0x1081D860 (task selection)
+        const sched_mutex2: u32 = 0x1081D860;
+        const offset2 = sched_mutex2 - SDRAM_START;
 
         if (offset2 + 3 < self.sdram.len) {
             const current2 = @as(u32, self.sdram[offset2]) |
@@ -1060,11 +1062,12 @@ pub const MemoryBus = struct {
                 (@as(u32, self.sdram[offset2 + 2]) << 16) |
                 (@as(u32, self.sdram[offset2 + 3]) << 24);
 
-            const new_val2: u32 = current2 & ~@as(u32, 0x1);
-            self.sdram[offset2] = @truncate(new_val2);
-            self.sdram[offset2 + 1] = @truncate(new_val2 >> 8);
-            self.sdram[offset2 + 2] = @truncate(new_val2 >> 16);
-            self.sdram[offset2 + 3] = @truncate(new_val2 >> 24);
+            // Completely zero the mutex
+            const new_val2: u32 = 0;
+            self.sdram[offset2] = 0;
+            self.sdram[offset2 + 1] = 0;
+            self.sdram[offset2 + 2] = 0;
+            self.sdram[offset2 + 3] = 0;
 
             if (current2 != new_val2) {
                 std.debug.print("SCHED KICKSTART [0x1081D860]: 0x{X:0>8} -> 0x{X:0>8}\n", .{ current2, new_val2 });
