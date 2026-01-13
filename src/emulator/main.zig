@@ -223,17 +223,27 @@ pub fn main() !void {
 
     // Load firmware if provided (loaded as boot ROM at address 0)
     var firmware: ?[]u8 = null;
+    var firmware_data: ?[]const u8 = null;
     if (firmware_path) |path| {
         print("Loading firmware: {s}\n", .{path});
         firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
-        print("Loaded {d} bytes\n", .{firmware.?.len});
+
+        // Check for iPod bootloader header ("ipvd" signature at offset 4)
+        var fw = firmware.?;
+        if (fw.len >= 8 and fw[4] == 'i' and fw[5] == 'p' and fw[6] == 'v' and fw[7] == 'd') {
+            print("Detected iPod bootloader header, skipping 8-byte header\n", .{});
+            firmware_data = fw[8..];
+        } else {
+            firmware_data = fw;
+        }
+        print("Loaded {d} bytes\n", .{firmware_data.?.len});
     }
     defer if (firmware) |fw| allocator.free(fw);
 
     var emu = try Emulator.init(allocator, .{
         .sdram_size = sdram_mb * 1024 * 1024,
         .cpu_freq_mhz = 80,
-        .boot_rom = firmware,
+        .boot_rom = firmware_data,
         .enable_cop = enable_cop,
     });
 
@@ -286,18 +296,30 @@ pub fn main() !void {
     if (iram_firmware_path) |path| {
         print("Loading IRAM firmware: {s}\n", .{path});
         iram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 96 * 1024); // IRAM is 96KB
-        print("Loaded {d} bytes at IRAM (0x40000000)\n", .{iram_firmware.?.len});
-        emu.loadIram(iram_firmware.?);
+
+        // Check for iPod bootloader header ("ipvd" signature at offset 4)
+        var fw_data = iram_firmware.?;
+        if (fw_data.len >= 8 and fw_data[4] == 'i' and fw_data[5] == 'p' and fw_data[6] == 'v' and fw_data[7] == 'd') {
+            print("Detected iPod bootloader header, skipping 8-byte header\n", .{});
+            fw_data = fw_data[8..];
+        }
+
+        print("Loaded {d} bytes at IRAM (0x40000000)\n", .{fw_data.len});
+        emu.loadIram(fw_data);
 
         // BOOTLOADER PATCH: The Rockbox bootloader contains a self-copy routine that
-        // expects to run from ROM and copy itself to IRAM. The jump target at offset 0x2D4
-        // is 0x40000024 which creates an infinite loop when loaded directly to IRAM.
-        // Patch it to 0x4000002C (the instruction after the LDR PC) to skip the loop.
-        const patch_addr: u32 = 0x400002D4;
-        const original = emu.bus.read32(patch_addr);
-        if (original == 0x40000024) {
-            emu.bus.write32(patch_addr, 0x4000002C);
-            print("BOOTLOADER PATCH: Patched [0x{X:0>8}] from 0x{X:0>8} to 0x4000002C\n", .{ patch_addr, original });
+        // expects to run from ROM and copy itself to IRAM. When loaded directly to IRAM,
+        // it copies itself over itself, then jumps via LDR PC at offset 0x28 which loads
+        // from [0x2D4] = 0x40000024 (back into the copy loop).
+        //
+        // We can't patch the data at 0x2D4 because the copy loop overwrites it.
+        // Instead, NOP the LDR PC instruction at 0x28 so execution falls through
+        // to the real boot code at 0x2C.
+        const ldr_pc_addr: u32 = 0x40000028;
+        const ldr_pc_instr = emu.bus.read32(ldr_pc_addr);
+        if (ldr_pc_instr == 0xE59FF2A4) { // LDR PC, [PC, #0x2A4]
+            emu.bus.write32(ldr_pc_addr, 0xE1A00000); // NOP
+            print("BOOTLOADER PATCH: NOP'd LDR PC at 0x{X:0>8} (was 0x{X:0>8})\n", .{ ldr_pc_addr, ldr_pc_instr });
         }
     }
     defer if (iram_firmware) |fw| allocator.free(fw);

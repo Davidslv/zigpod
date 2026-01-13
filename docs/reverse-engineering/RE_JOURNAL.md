@@ -297,6 +297,92 @@ Loading original firmware...
 
 ---
 
+### 2026-01-13: ipvd Header Bug Fixed - Bootloader Now Progresses
+
+**Goal**: Fix bootloader being stuck at 0x40000028 in infinite loop
+
+**Root Cause Identified**:
+
+When using `--firmware` flag to load the bootloader, the 8-byte ipvd header was NOT being stripped. This caused the bootloader's self-copy loop to copy the header bytes into IRAM, corrupting the memory layout.
+
+**The Bug**:
+1. `--load-iram` path correctly strips ipvd header (lines 290-294 in main.zig)
+2. `--firmware` path was loading the entire file including header (line 228)
+3. Boot ROM copies firmware to IRAM including the 8 header bytes
+4. IRAM 0x40000028 now contains wrong instruction (LDR PC with wrong target)
+5. CPU jumps to 0x40000024 = BHI -0x14 (copy loop instruction)
+6. If HI flag set, infinite loop
+
+**The Fix**:
+Added ipvd header detection and stripping in main.zig for the `--firmware` code path:
+```zig
+if (fw.len >= 8 and fw[4] == 'i' and fw[5] == 'p' and fw[6] == 'v' and fw[7] == 'd') {
+    print("Detected iPod bootloader header, skipping 8-byte header\n", .{});
+    firmware_data = fw[8..];
+}
+```
+
+**Before Fix**:
+```
+BOOT TRACE: cycle 200000 PC=0x40000028 R0=0x0000CB14
+BOOT TRACE: cycle 300000 PC=0x40000028 R0=0x0000CB14
+... (stuck forever)
+```
+
+**After Fix**:
+```
+Detected iPod bootloader header, skipping 8-byte header
+Loaded 51988 bytes
+BOOT: Reached post-copy code at 0x2C (cycle 116991)
+ATA: READ LBA=0 (remaining=1)
+ATA: READ LBA=1 (remaining=1)
+... (bootloader progresses, reads disk, etc.)
+```
+
+**Current State After Fix**:
+
+1. Bootloader now correctly copies itself to IRAM
+2. Main execution starts, LCD initialized
+3. ATA/disk access working - reads MBR, FAT32 boot sector, directory entries
+4. Partition info correctly populated:
+   - `part[0]: start=0x00000001, size=0x0001FFFF, type=0x0000000B (FAT32)`
+5. Auto-boot path reached (checking for button, then attempting load)
+6. **NEW ISSUE**: Auto-boot function at 0x40004680 returns 0 (failure)
+
+**Why Auto-Boot Fails** (under investigation):
+- rockbox.ipod exists in disk image at cluster 0x37D4 (~765KB)
+- Directory entries are being read (LBA 2098-2103)
+- LFN entries with checksums visible in traces
+- Function returns 0 → "Can't load rockbox.ipod"
+- Likely a FAT32 parsing or file search issue
+
+**Files Changed**:
+- `src/emulator/main.zig`: Fixed ipvd header stripping for --firmware mode
+- `src/emulator/core.zig`: Added tracing for load_firmware function at 0x40004680
+
+**Key Technical Discovery**:
+
+The bootloader's memory layout after copy:
+| IRAM Address | Purpose |
+|--------------|---------|
+| 0x40000000 | First code instruction (MSR CPSR_c, #0xD3) |
+| 0x40000024 | End of copy loop (BHI -0x14) |
+| 0x40000028 | LDR PC, [PC, #0x2A4] → jump to 0x400000C0 |
+| 0x4000002C | Post-copy initialization |
+| 0x400000C0 | Main bootloader code |
+| 0x40004680 | load_firmware function (auto-boot) |
+| 0x400009BC | Button check function |
+| 0x40009668 | Delay wrapper function |
+| 0x40000B1C | Delay loop (timer polling) |
+
+**Next Steps**:
+1. Add more tracing inside load_firmware (0x40004680)
+2. Trace file search logic to see why rockbox.ipod not found
+3. Check if LFN checksum verification is failing
+4. Verify FAT cluster chain reading works correctly
+
+---
+
 ## Key Memory Regions
 
 | Address | Size | Purpose |

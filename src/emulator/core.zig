@@ -138,6 +138,9 @@ pub const Emulator = struct {
     /// Total cycles executed
     total_cycles: u64,
 
+    /// Debug: count timer wait loop iterations
+    timer_loop_count: u64,
+
     /// Flag to track if we've fired the RTOS kickstart interrupt
     /// This is a workaround to break out of the scheduler loop
     rtos_kickstart_fired: bool,
@@ -211,6 +214,7 @@ pub const Emulator = struct {
             .config = config,
             .running = false,
             .total_cycles = 0,
+            .timer_loop_count = 0,
             .rtos_kickstart_fired = false,
             .button_injected = false,
             .button_released = false,
@@ -341,6 +345,161 @@ pub const Emulator = struct {
     pub fn step(self: *Self) u32 {
         var cpu_bus = self.createCpuBus();
 
+        // Boot phase tracing
+        const pc = self.cpu.getPc();
+        if (self.total_cycles < 1_000_000 and self.total_cycles % 100_000 == 0) {
+            std.debug.print("BOOT TRACE: cycle {} PC=0x{X:0>8} R0=0x{X:0>8}\n", .{
+                self.total_cycles, pc, self.cpu.getReg(0),
+            });
+        }
+        // Periodic trace to understand where we're spending time
+        if (self.total_cycles % 10_000_000 == 0 and self.total_cycles > 90_000_000) {
+            std.debug.print("PERIODIC: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.total_cycles, pc, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(14),
+            });
+        }
+        // Key address tracing
+        if (pc == 0x4000002C) {
+            std.debug.print("BOOT: Reached post-copy code at 0x2C (cycle {})\n", .{self.total_cycles});
+        }
+        // Trace calls to the delay wrapper at 0x40009668
+        if (pc == 0x40009668) {
+            std.debug.print("DELAY_WRAPPER_CALL: cycle={} LR=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(14) });
+        }
+        // Trace delay wrapper return (after delay, checking R0)
+        if (pc == 0x40009680) { // POP {PC} in wrapper
+            std.debug.print("DELAY_WRAPPER_RETURN: cycle={} R0=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        // Trace at 0xAB0 (CMP R0, #1) and 0xAB4 (BNE)
+        if (pc == 0x40000AB0) {
+            std.debug.print("CMP_R0_1: cycle={} R0=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        if (pc == 0x40000AB8) { // After BNE - if we get here, branch was not taken
+            std.debug.print("AFTER_BNE_NOT_TAKEN: cycle={} R0=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        if (pc == 0x40000B00) { // BNE target - if we get here, branch was taken
+            std.debug.print("BNE_TARGET: cycle={} R0=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        // Trace exit from delay loop - branch at 0xB2C
+        if (pc == 0x40000B2C) {
+            std.debug.print("DELAY_LOOP_EXIT: cycle={} target=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(2) });
+        }
+        // Trace entry to error halt at 0xB600
+        if (pc == 0x4000B600) {
+            std.debug.print("HALT_0xB600: cycle={} LR=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(14) });
+        }
+        // Trace potential auto-boot path at 0xA70
+        if (pc == 0x40000A70) {
+            std.debug.print("AUTO_BOOT_PATH: cycle={} R0=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        // Trace return from auto-boot function call at 0xA88 -> 0xA8C
+        if (pc == 0x40000A8C) {
+            std.debug.print("AUTO_BOOT_FUNC_RET: cycle={} R0=0x{X:0>8} (firmware load result?)\n", .{
+                self.total_cycles, self.cpu.getReg(0)
+            });
+        }
+        // Trace entry to the load_firmware function at 0x40004680
+        if (pc == 0x40004680) {
+            std.debug.print("LOAD_FIRMWARE_ENTRY: cycle={} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(14)
+            });
+        }
+        // Trace common return points in load_firmware
+        if (pc >= 0x40004680 and pc <= 0x40004800) {
+            // Look for BX LR or similar return patterns
+            const instr = self.bus.read32(pc);
+            // BX LR = 0xE12FFF1E, POP {PC} = 0xE8BD..80
+            if (instr == 0xE12FFF1E or (instr & 0xFFFF8000) == 0xE8BD8000) {
+                std.debug.print("LOAD_FIRMWARE_RETURN: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} instr=0x{X:0>8}\n", .{
+                    self.total_cycles, pc, self.cpu.getReg(0), instr
+                });
+            }
+        }
+        // Force button check to return 0 (no button) at 0x400009D4 (BX LR)
+        // Only patch when we're actually in the button check function (called from 0xA40)
+        // This is a workaround for incorrect GPIO layout - the bootloader reads
+        // GPIO_ENABLE at 0x6000D030 which our GPIO peripheral returns as 0
+        if (pc == 0x400009D4) {
+            const lr = self.cpu.getReg(14);
+            // Only patch when returning to the specific call site that checks for button
+            if (lr >= 0x40000A40 and lr <= 0x40000A48) {
+                self.cpu.setReg(0, 0); // Force R0 = 0 (no button pressed)
+                std.debug.print("BUTTON_CHECK_FIX: Forcing R0=0 at cycle {}, LR=0x{X:0>8}\n", .{ self.total_cycles, lr });
+            }
+        }
+        // Trace button check function call at 0xA3C-0xA40
+        if (pc == 0x40000A3C) { // Just before BX R5
+            std.debug.print("BUTTON_CHECK_CALL: cycle={} R5=0x{X:0>8} (button check func addr)\n", .{ self.total_cycles, self.cpu.getReg(5) });
+        }
+        if (pc == 0x40000A44) { // CMP R0, #0 after button check
+            std.debug.print("BUTTON_CHECK: cycle={} R0=0x{X:0>8} (0=no button)\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        // Trace branch target after delay loop (branch always goes to 0xA34)
+        if (pc == 0x40000A34) {
+            std.debug.print("OUTER_LOOP: cycle={} R0=0x{X:0>8} R4=0x{X:0>8} (CMP R4,R0)\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(4)
+            });
+        }
+        // Trace branch target when R4 == R0 at 0xA34 (exit condition)
+        if (pc == 0x40000A9C) {
+            std.debug.print("OUTER_LOOP_EXIT: cycle={}\n", .{self.total_cycles});
+        }
+        if (pc == 0x400000A4 and self.total_cycles < 500_000) {
+            std.debug.print("BOOT: Reached main() call at 0xA4 (cycle {})\n", .{self.total_cycles});
+        }
+        // Trace when execution enters SDRAM (0x10000000-0x12000000)
+        if (pc >= 0x10000000 and pc < 0x12000000) {
+            std.debug.print("SDRAM EXEC: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.total_cycles, pc, self.cpu.getReg(0), self.cpu.getReg(14),
+            });
+        }
+        // Trace when PC is in the checksum loop
+        if (pc == 0x4000061C) {
+            if (self.total_cycles % 10000000 == 0) { // Sample every 10M cycles
+                const r2 = self.cpu.getReg(2); // counter
+                const r7 = self.cpu.getReg(7); // limit
+                const r4 = self.cpu.getReg(4); // checksum accumulator
+                std.debug.print("CHECKSUM: c={} R2(cnt)=0x{X:0>8} R7(limit)=0x{X:0>8} R4(sum)=0x{X:0>8} progress={d}%\n", .{
+                    self.total_cycles, r2, r7, r4,
+                    if (r7 > 0) (r2 * 100) / r7 else 0,
+                });
+            }
+        }
+        // DELAY ACCELERATION: When in delay loop at 0x40000B1C, skip ahead
+        // The delay loop structure is:
+        //   0x40000B18: MOV R1, R6           ; setup (once before loop)
+        //   0x40000B1C: LDR R3, [R1, #0x10]  ; R3 = timer
+        //   0x40000B20: RSB R3, R2, R3       ; R3 = timer - target
+        //   0x40000B24: CMP R3, #0
+        //   0x40000B28: BLT 0x40000B1C       ; loop back if R3 < 0
+        // We detect entry at 0x40000B1C, read target from R2, and advance timer
+        if (pc == 0x40000B1C) {
+            const target = self.cpu.getReg(2);
+            const current = self.timer.usec_timer;
+            self.timer_loop_count += 1;
+            // Debug: Print state every 1M loops
+            if (self.timer_loop_count % 1000000 == 0) {
+                std.debug.print("DELAY_LOOP: count={} target=0x{X:0>8} current=0x{X:0>8} R1=0x{X:0>8}\n", .{
+                    self.timer_loop_count, target, current, self.cpu.getReg(1),
+                });
+            }
+            // If timer hasn't reached target, advance it
+            // Note: Handle wrap-around correctly - check if delta is small (< 0x80000000)
+            const delta = target -% current; // wrapping subtraction
+            if (delta > 0 and delta < 0x80000000) {
+                const needed = delta + 1; // +1 to ensure we pass target
+                self.timer.usec_timer = target +% 1;
+                // Also advance total_cycles to account for the time
+                const skip_cycles = needed * 80; // 80 cycles per microsecond
+                self.total_cycles += skip_cycles;
+                std.debug.print("DELAY_SKIP: target=0x{X:0>8} skipped {} us ({} cycles) LR=0x{X:0>8}\n", .{ target, needed, skip_cycles, self.cpu.getReg(14) });
+            } else if (self.timer_loop_count < 10) {
+                // Debug: Print first few no-skip cases
+                std.debug.print("DELAY_NO_SKIP: count={} target=0x{X:0>8} current=0x{X:0>8} delta=0x{X:0>8}\n", .{
+                    self.timer_loop_count, target, current, delta,
+                });
+            }
+        }
 
         // Update CPU IRQ/FIQ lines from interrupt controller
         self.cpu.setIrqLine(self.int_ctrl.hasPendingIrq());
@@ -349,6 +508,21 @@ pub const Emulator = struct {
         // Execute CPU instruction
         const cycles = self.cpu.step(&cpu_bus);
         self.total_cycles += cycles;
+
+        // Debug: Check if boot ROM address 0 was read - print CPU state
+        if (self.bus.debug_boot_rom_addr0_read) {
+            self.bus.debug_boot_rom_addr0_read = false;
+            const new_pc = self.cpu.getPc();
+            const prev_pc = if (new_pc >= 4) new_pc - 4 else 0; // Approximation of instruction that did the read
+            const r0 = self.cpu.getReg(0);
+            const r1 = self.cpu.getReg(1);
+            const r2 = self.cpu.getReg(2);
+            const r3 = self.cpu.getReg(3);
+            const lr = self.cpu.getReg(14);
+            std.debug.print("BOOT_ROM_READ_0: cycle={} prev_PC=0x{X:0>8} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.total_cycles, prev_pc, r0, r1, r2, r3, lr,
+            });
+        }
 
         // Execute COP if enabled and not sleeping
         if (self.cop) |*cop| {
@@ -389,7 +563,9 @@ pub const Emulator = struct {
             self.bus.enableKickstart();
             // Enable I2C tracing
             self.i2c_ctrl.enableTracing();
-            std.debug.print("RTOS KICKSTART: Enabled at cycle {} (tracing + kickstart)\n", .{self.total_cycles});
+            // Set button event immediately to wake scheduler when it starts polling
+            self.bus.setButtonEvent();
+            std.debug.print("RTOS KICKSTART: Enabled at cycle {} (tracing + kickstart + button event)\n", .{self.total_cycles});
         }
 
         // Scheduler Kickstart: Clear the scheduler skip flag at 0x1081D858
