@@ -222,6 +222,81 @@ SHORT_ENTRY READ at 0x11006F74
 
 ---
 
+### 2026-01-13: Full Boot Chain Working!
+
+**Goal**: Get Apple firmware or Rockbox visually running
+
+**MAJOR BREAKTHROUGH**: Complete boot chain now operational!
+
+1. **Two-Partition iPod Disk Layout Created**:
+   - Partition 0: type 0x00 (firmware), sectors 1-2047
+   - Partition 1: type 0x0C (FAT32 LBA), sectors 2048-262143
+   - This matches real iPod partition structure expected by Rockbox bootloader
+
+2. **Partition Detection Fixed**:
+   - Before: "Partition 1: 0x0B 0 sectors" (type correct, size wrong)
+   - After: "Partition 1: 0x0C 260096 sectors" ✓
+   - Root cause: pinfo[0] had data, but bootloader reads pinfo[1]
+
+3. **Apple Firmware Extracted and Formatted**:
+   - Extracted from firmware/ipod_firmware.bin (raw partition dump)
+   - Found ARM vectors at offset 0x5000
+   - "portalplayer" signature at offset 0x5020
+   - Created proper .ipod format: 8-byte header (checksum + "ipvd") + firmware data
+   - Saved as apple_os.ipod (~6MB)
+
+4. **File System Working**:
+   - FAT32 mounting successful
+   - Bootloader finds apple_os.ipod in both / and /.rockbox/
+   - ~12,000 ATA sector reads to load 6MB firmware file
+
+5. **SDL2 Display Working**:
+   - Built emulator with `-Dsdl2=true`
+   - 320x240 LCD rendered at 2x scale (640x480 window)
+   - Shows boot messages in real-time
+
+**Current Display Output**:
+```
+Rockbox boot loader
+Version: v4.0
+IPOD version: 0x00000000
+iFlash Solo CF Adapter
+Partition 1: 0x0C 260096 sectors
+Loading original firmware...
+[Loading...]
+```
+
+**Boot Flow Achieved**:
+1. Rockbox bootloader starts at 0x10000000
+2. Relocates to IRAM (0x40000000)
+3. Initializes LCD, ATA
+4. Detects partition table
+5. Opens apple_os.ipod from FAT32
+6. Loads 6MB firmware into memory
+7. Verifies checksum and "ipvd" model ID
+8. Jumps to Apple firmware entry point
+
+**Current State**:
+- Apple firmware IS executing (100% CPU)
+- LCD still shows bootloader text (firmware hasn't initialized display yet)
+- Firmware likely stuck in RTOS scheduler (same as direct boot attempt)
+
+**Files Created**:
+- `firmware/rockbox/ipod_disk.img` - 128MB disk image with proper iPod layout
+- `firmware/rockbox/apple_os.ipod` - Extracted Apple firmware with .ipod header
+
+**Key Technical Details**:
+| Item | Value |
+|------|-------|
+| Disk image size | 128MB (262144 sectors) |
+| FAT32 partition start | LBA 2048 |
+| FAT32 partition size | 260096 sectors |
+| apple_os.ipod size | 6,270,984 bytes |
+| Model ID in header | "ipvd" |
+| Checksum | 0x27962293 |
+
+---
+
 ## Key Memory Regions
 
 | Address | Size | Purpose |
