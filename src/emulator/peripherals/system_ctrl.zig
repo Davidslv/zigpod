@@ -288,7 +288,7 @@ pub const SystemController = struct {
 
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
-        const value = switch (offset) {
+        return switch (offset) {
             REG_CHIP_ID => CHIP_ID_PP5021C,
             REG_DEV_RS => self.dev_rs,
             REG_DEV_RS2 => self.dev_rs2,
@@ -302,10 +302,11 @@ pub const SystemController = struct {
             REG_DEV_INIT2 => self.dev_init2,
             REG_CACHE_CTL => self.cache_ctl,
             REG_CPU_CTL => self.cpu_ctl,
-            REG_COP_CTL => self.cop_ctl,
+            // COP_CTL: Always return bit 31 = 1 (COP sleeping) since we don't emulate COP
+            // Rockbox polls this bit waiting for COP to be in sleep state before proceeding
+            REG_COP_CTL => self.cop_ctl | 0x80000000,
             else => 0,
         };
-        return value;
     }
 
     /// Read PROC_ID - returns different value for CPU vs COP
@@ -374,25 +375,22 @@ pub const SystemController = struct {
             REG_CACHE_CTL => self.cache_ctl = value,
             REG_CPU_CTL => self.cpu_ctl = value,
             REG_COP_CTL => {
-                const old = self.cop_ctl;
-                self.cop_ctl = value;
-
-                // PROC_SLEEP bit (bit 31)
+                // COP_CTL handles coprocessor sleep/wake state
+                // Bit 31 (PROC_SLEEP) indicates COP is sleeping
+                // Writing 0 to bit 31 is a wake request
+                // Since we don't emulate COP, we just track the state
                 const PROC_SLEEP: u32 = 0x80000000;
+                const old = self.cop_ctl;
 
-                // Check for wake request (clearing PROC_SLEEP)
-                if ((old & PROC_SLEEP) != 0 and (value & PROC_SLEEP) == 0) {
-                    // Wake COP: sleeping -> waking
+                // Store non-sleep bits, preserve sleep bit (read forces it to 1 anyway)
+                self.cop_ctl = (value & ~PROC_SLEEP) | (self.cop_ctl & PROC_SLEEP);
+
+                // Handle wake request (clearing PROC_SLEEP)
+                const wake_request = (value & PROC_SLEEP) == 0 and (old & PROC_SLEEP) != 0;
+                if (wake_request) {
+                    self.cop_ctl &= ~PROC_SLEEP;
                     if (self.cop_state == .sleeping) {
                         self.cop_state = .waking;
-                    }
-                }
-
-                // Check for sleep request (setting PROC_SLEEP)
-                if ((old & PROC_SLEEP) == 0 and (value & PROC_SLEEP) != 0) {
-                    // Sleep COP: running/waking -> sleeping
-                    if (self.cop_state == .running or self.cop_state == .waking) {
-                        self.cop_state = .sleeping;
                     }
                 }
             },

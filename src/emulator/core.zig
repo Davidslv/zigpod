@@ -149,6 +149,9 @@ pub const Emulator = struct {
     button_injected: bool,
     button_released: bool,
 
+    /// Flag for firmware filename patch (apple_os.ipod -> rockbox.ipod)
+    filename_patched: bool,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -218,6 +221,7 @@ pub const Emulator = struct {
             .rtos_kickstart_fired = false,
             .button_injected = false,
             .button_released = false,
+            .filename_patched = false,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -352,6 +356,26 @@ pub const Emulator = struct {
                 self.total_cycles, pc, self.cpu.getReg(0),
             });
         }
+
+        // Patch "apple_os.ipod" to "rockbox.ipod" after bootloader relocates to IRAM
+        // The filename string is at IRAM 0x4000BEFC
+        if (!self.filename_patched and pc >= 0x40000000 and pc < 0x40020000 and self.total_cycles > 100_000) {
+            // Check if "apple" exists at 0x4000BEFC
+            const addr: u32 = 0x4000BEFC;
+            if (self.bus.read8(addr) == 'a' and self.bus.read8(addr + 1) == 'p' and
+                self.bus.read8(addr + 2) == 'p' and self.bus.read8(addr + 3) == 'l' and
+                self.bus.read8(addr + 4) == 'e') {
+                // Patch "apple_os.ipod" to "rockbox.ipod"
+                // Both are 13 chars so it fits perfectly
+                const new_name = "rockbox.ipod";
+                for (new_name, 0..) |c, i| {
+                    self.bus.write8(addr + @as(u32, @intCast(i)), c);
+                }
+                self.bus.write8(addr + new_name.len, 0); // null terminator
+                self.filename_patched = true;
+                std.debug.print("FILENAME PATCHED: Changed apple_os.ipod to rockbox.ipod at 0x{X:0>8}\n", .{addr});
+            }
+        }
         // Periodic trace to understand where we're spending time
         if (self.total_cycles % 10_000_000 == 0 and self.total_cycles > 90_000_000) {
             std.debug.print("PERIODIC: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} LR=0x{X:0>8}\n", .{
@@ -391,6 +415,44 @@ pub const Emulator = struct {
         // Trace potential auto-boot path at 0xA70
         if (pc == 0x40000A70) {
             std.debug.print("AUTO_BOOT_PATH: cycle={} R0=0x{X:0>8}\n", .{ self.total_cycles, self.cpu.getReg(0) });
+        }
+        // Trace file load function at 0x40000444 (constructs "/.rockbox/%s" path)
+        if (pc == 0x40000444) {
+            std.debug.print("FILE_LOAD_FUNC: cycle={} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8}\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2)
+            });
+            // R1 should be the filename (e.g., "rockbox.ipod")
+            const filename_addr = self.cpu.getReg(1);
+            if (filename_addr >= 0x40000000 and filename_addr < 0x40020000) {
+                var buf: [64]u8 = undefined;
+                var i: usize = 0;
+                while (i < 63) : (i += 1) {
+                    const c = self.bus.read8(filename_addr + @as(u32, @intCast(i)));
+                    if (c == 0) break;
+                    buf[i] = c;
+                }
+                std.debug.print("  FILENAME (R1): \"{s}\"\n", .{buf[0..i]});
+            }
+        }
+        // Trace open() at 0x40002174
+        if (pc == 0x40002174) {
+            std.debug.print("OPEN_CALL: cycle={} R0=0x{X:0>8} R1=0x{X:0>8}\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(1)
+            });
+            // R0 should be the path
+            const path_addr = self.cpu.getReg(0);
+            const is_valid = (path_addr >= 0x40000000 and path_addr < 0x40020000) or
+                            (path_addr >= 0x10000000 and path_addr < 0x12000000);
+            if (is_valid) {
+                var buf: [128]u8 = undefined;
+                var i: usize = 0;
+                while (i < 127) : (i += 1) {
+                    const c = self.bus.read8(path_addr + @as(u32, @intCast(i)));
+                    if (c == 0) break;
+                    buf[i] = c;
+                }
+                std.debug.print("  OPEN PATH: \"{s}\"\n", .{buf[0..i]});
+            }
         }
         // Trace return from auto-boot function call at 0xA88 -> 0xA8C
         if (pc == 0x40000A8C) {
@@ -490,15 +552,14 @@ pub const Emulator = struct {
             }
         }
         // Force button check to return 0 (no button) at 0x400009D4 (BX LR)
+        // This makes the bootloader load apple_os.ipod (which we patch to rockbox.ipod)
         // Only patch when we're actually in the button check function (called from 0xA40)
-        // This is a workaround for incorrect GPIO layout - the bootloader reads
-        // GPIO_ENABLE at 0x6000D030 which our GPIO peripheral returns as 0
         if (pc == 0x400009D4) {
             const lr = self.cpu.getReg(14);
             // Only patch when returning to the specific call site that checks for button
             if (lr >= 0x40000A40 and lr <= 0x40000A48) {
-                self.cpu.setReg(0, 0); // Force R0 = 0 (no button pressed)
-                std.debug.print("BUTTON_CHECK_FIX: Forcing R0=0 at cycle {}, LR=0x{X:0>8}\n", .{ self.total_cycles, lr });
+                self.cpu.setReg(0, 0); // Force R0 = 0 (no button pressed) -> loads apple_os.ipod
+                std.debug.print("BUTTON_CHECK_FIX: Forcing R0=0 (no button) at cycle {}, LR=0x{X:0>8}\n", .{ self.total_cycles, lr });
             }
         }
         // Trace button check function call at 0xA3C-0xA40
