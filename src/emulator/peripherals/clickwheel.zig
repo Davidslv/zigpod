@@ -201,46 +201,36 @@ pub const ClickWheel = struct {
     /// Format for iPod Video (read by opto_keypad_read):
     /// - Bits 0-9: Echo back command identifier (0x23a)
     /// - Bits 10-15: Reserved
-    /// - Bits 16-20: Button states (0 = not pressed, 1 = pressed for software)
+    /// - Bits 16-20: Button states (ACTIVE LOW: 1 = NOT pressed, 0 = pressed)
     /// - Bits 21-30: Wheel position / other data
     /// - Bit 31: Valid packet flag
     ///
-    /// opto_keypad_read does: result = (packet << 11) >> 27 ^ 0x1F
-    /// For no buttons pressed, we want result bits to be SET (non-zero) so
-    /// that checks like (state & 0x10) == 0 return FALSE.
+    /// opto_keypad_read does: result = (packet << 11) >> 27
+    /// The bootloader checks: if ((state & 0x10) == 0) return BUTTON_MENU
+    /// So a 0 bit means button IS pressed, 1 bit means NOT pressed.
     ///
-    /// So we need: ((packet << 11) >> 27) ^ 0x1F to have bits SET when no buttons
-    /// This means (packet << 11) >> 27 should have bits CLEAR (0) when no buttons
-    /// So bits 16-20 in packet should be 0 when no buttons pressed
+    /// For no buttons pressed: bits 16-20 must all be 1 (0x1F)
+    /// state = (0x801F023a << 11) >> 27 = 0x1F (all buttons released)
     fn buildPacket(self: *const Self) u32 {
         // opto_keypad_read expects (value & 0x8000FFFF) == 0x8000023a for valid packet
-        // and extracts button state from bits 16-20 via (value << 11) >> 27, then XORs with 0x1F
+        // and extracts button state from bits 16-20 via (value << 11) >> 27
 
-        // Start with base pattern that opto_keypad_read expects
-        var packet: u32 = 0x8000023a; // Valid bit + echo pattern (bits 16-20 = 0 by default)
+        // Start with base pattern + all buttons NOT pressed (bits 16-20 = 0x1F)
+        var packet: u32 = 0x801F023a; // Valid bit + echo pattern + no buttons pressed
 
-        // Button mapping (active HIGH in packet - 1 means pressed):
-        // After extraction and XOR, a SET bit means NOT pressed
-        // So for correct behavior: packet bits 16-20 = 0 when no buttons pressed
-        // When pressed: set the corresponding bit
-
+        // Button mapping (ACTIVE LOW - CLEAR bit when button IS pressed):
         // Bit 16 (0x01 after shift): SELECT
         // Bit 17 (0x02 after shift): RIGHT
         // Bit 18 (0x04 after shift): LEFT
         // Bit 19 (0x08 after shift): PLAY
         // Bit 20 (0x10 after shift): MENU
 
-        var buttons: u32 = 0; // Default: no buttons pressed (all 0)
-
-        // If buttons are pressed, SET corresponding bits
-        if ((self.buttons & Button.select.mask()) != 0) buttons |= 0x01;
-        if ((self.buttons & Button.next.mask()) != 0) buttons |= 0x02; // RIGHT
-        if ((self.buttons & Button.prev.mask()) != 0) buttons |= 0x04; // LEFT
-        if ((self.buttons & Button.play.mask()) != 0) buttons |= 0x08;
-        if ((self.buttons & Button.menu.mask()) != 0) buttons |= 0x10;
-
-        // Place button state in bits 16-20
-        packet |= (buttons << 16);
+        // Clear bits for buttons that ARE pressed
+        if ((self.buttons & Button.select.mask()) != 0) packet &= ~(@as(u32, 0x01) << 16);
+        if ((self.buttons & Button.next.mask()) != 0) packet &= ~(@as(u32, 0x02) << 16); // RIGHT
+        if ((self.buttons & Button.prev.mask()) != 0) packet &= ~(@as(u32, 0x04) << 16); // LEFT
+        if ((self.buttons & Button.play.mask()) != 0) packet &= ~(@as(u32, 0x08) << 16);
+        if ((self.buttons & Button.menu.mask()) != 0) packet &= ~(@as(u32, 0x10) << 16);
 
         return packet;
     }
@@ -366,22 +356,30 @@ test "wheel wrap-around" {
     try std.testing.expectEqual(@as(u7, 4), wheel.wheel_pos);
 }
 
-test "data packet format" {
+test "data packet format - opto_keypad_read" {
     var wheel = ClickWheel.init();
 
-    // Set some state
+    // Initially no buttons pressed - verify opto_keypad_read returns 0x1F
+    const no_buttons = wheel.read(ClickWheel.REG_DATA);
+    const state_none = (no_buttons << 11) >> 27;
+    try std.testing.expectEqual(@as(u32, 0x1F), state_none); // All bits set = no buttons
+
+    // Press MENU button
     wheel.pressButton(.menu);
-    wheel.touchWheel(48);
+    const menu_data = wheel.read(ClickWheel.REG_DATA);
+    const state_menu = (menu_data << 11) >> 27;
+    // MENU is bit 4 (0x10) - should be CLEAR when pressed
+    try std.testing.expect((state_menu & 0x10) == 0); // MENU pressed
+    try std.testing.expect((state_menu & 0x08) != 0); // PLAY not pressed
+    try std.testing.expect((state_menu & 0x04) != 0); // LEFT not pressed
 
-    // Read data register
-    const data = wheel.read(ClickWheel.REG_DATA);
-    const packet: WheelPacket = @bitCast(data);
-
-    try std.testing.expectEqual(@as(u8, 0x1A), packet.packet_type);
-    try std.testing.expect((packet.buttons & Button.menu.mask()) != 0);
-    try std.testing.expectEqual(@as(u7, 48), packet.wheel_pos);
-    try std.testing.expect(packet.wheel_touched);
-    try std.testing.expect(packet.valid);
+    // Release MENU, press PLAY
+    wheel.releaseButton(.menu);
+    wheel.pressButton(.play);
+    const play_data = wheel.read(ClickWheel.REG_DATA);
+    const state_play = (play_data << 11) >> 27;
+    try std.testing.expect((state_play & 0x10) != 0); // MENU not pressed
+    try std.testing.expect((state_play & 0x08) == 0); // PLAY pressed
 }
 
 test "status register" {

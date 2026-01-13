@@ -363,7 +363,8 @@ pub const Emulator = struct {
 
         // Patch "apple_os.ipod" to "rockbox.ipod" after bootloader relocates to IRAM
         // The filename string is at IRAM 0x4000BEFC
-        if (!self.filename_patched and pc >= 0x40000000 and pc < 0x40020000 and self.total_cycles > 100_000) {
+        // NOTE: We re-apply this patch periodically because Rockbox may overwrite IRAM during startup
+        if (pc >= 0x40000000 and pc < 0x40020000 and self.total_cycles > 100_000) {
             // Check if "apple" exists at 0x4000BEFC
             const addr: u32 = 0x4000BEFC;
             if (self.bus.read8(addr) == 'a' and self.bus.read8(addr + 1) == 'p' and
@@ -603,6 +604,22 @@ pub const Emulator = struct {
                 // Skip the CPU/COP sync code by jumping to 0x100001C8 (after MOV PC, #bootloader)
                 self.cpu.setReg(15, 0x100001C8);
                 return 1;
+            }
+        }
+        // COP SYNC FIX #2: After the first sync skip, Rockbox has many COP polling loops
+        // in the 0x10000200-0x100002FF range. These all read COP_CTL (0x60007004) in a tight
+        // loop waiting for COP to signal ready. Detect the pattern and skip each loop.
+        // Pattern: 3-instruction loop at 8-byte aligned addresses ending in BLT/BNE back
+        if (self.rockbox_restart_count > 1 and pc >= 0x10000200 and pc < 0x10000300) {
+            // Detected loop start addresses (found empirically):
+            // 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8
+            const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8 };
+            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002D4 };
+            for (loop_starts, 0..) |start, i| {
+                if (pc == start) {
+                    self.cpu.setReg(15, loop_exits[i]);
+                    return 1;
+                }
             }
         }
         // Trace when PC is in the checksum loop
