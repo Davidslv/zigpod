@@ -403,6 +403,80 @@ pub const Emulator = struct {
             std.debug.print("LOAD_FIRMWARE_ENTRY: cycle={} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} LR=0x{X:0>8}\n", .{
                 self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(14)
             });
+            // Print the path string at R2 (should be the firmware path)
+            const path_addr = self.cpu.getReg(2);
+            if ((path_addr >= 0x40000000 and path_addr < 0x40020000) or
+                (path_addr >= 0x10000000 and path_addr < 0x12000000)) {
+                var path_buf: [128]u8 = undefined;
+                var i: usize = 0;
+                while (i < 127) : (i += 1) {
+                    const c = self.bus.read8(path_addr + @as(u32, @intCast(i)));
+                    if (c == 0) break;
+                    path_buf[i] = c;
+                }
+                std.debug.print("  FIRMWARE PATH (R2): \"{s}\"\n", .{path_buf[0..i]});
+            }
+        }
+        // Trace the inner function at 0x400045D0 which does the actual work
+        if (pc == 0x400045D0) {
+            std.debug.print("LOAD_FW_INNER: cycle={} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3)
+            });
+            // Also dump what's at R2 to see if it's a path or display string
+            const r2_addr = self.cpu.getReg(2);
+            if (r2_addr >= 0x10000000 and r2_addr < 0x12000000) {
+                var buf: [64]u8 = undefined;
+                var j: usize = 0;
+                while (j < 63) : (j += 1) {
+                    const c = self.bus.read8(r2_addr + @as(u32, @intCast(j)));
+                    if (c == 0 or c < 32 or c > 126) break;
+                    buf[j] = c;
+                }
+                std.debug.print("  R2 CONTENT: \"{s}\"\n", .{buf[0..j]});
+            }
+        }
+        // Trace the comparison result at 0x400045FC (CMP R5, #0 - checking if R2 was null)
+        if (pc == 0x400045FC) {
+            std.debug.print("LOAD_FW_CMP: cycle={} R0=0x{X:0>8} R5=0x{X:0>8} (R5==0 means early return)\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(5)
+            });
+        }
+        // Trace what the function reads from 0x4000BC64 (disk mounted flag?)
+        if (pc == 0x400045EC) {
+            const ptr = self.cpu.getReg(3);
+            const value = self.bus.read32(ptr);
+            std.debug.print("LOAD_FW_DISK_STATE: [0x{X:0>8}]=0x{X:0>8} (disk state?)\n", .{ ptr, value });
+        }
+        // Trace the open_file call at 0x40004618 (BX R4 where R4=0x4000A260)
+        if (pc == 0x40004618) {
+            std.debug.print("LOAD_FW_OPEN_FILE: cycle={} R0=0x{X:0>8} (path) R1=0x{X:0>8} R2=0x{X:0>8} R4=0x{X:0>8}\n", .{
+                self.total_cycles, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(4)
+            });
+            // Try to read the path string (from IRAM or SDRAM)
+            const path_addr = self.cpu.getReg(0);
+            const is_iram = path_addr >= 0x40000000 and path_addr < 0x40020000;
+            const is_sdram = path_addr >= 0x10000000 and path_addr < 0x12000000;
+            if (is_iram or is_sdram) {
+                var path_buf: [128]u8 = undefined;
+                var i: usize = 0;
+                while (i < 127) : (i += 1) {
+                    const c = self.bus.read8(path_addr + @as(u32, @intCast(i)));
+                    if (c == 0) break;
+                    path_buf[i] = c;
+                }
+                path_buf[i] = 0;
+                std.debug.print("  PATH STRING: \"{s}\"\n", .{path_buf[0..i]});
+            }
+        }
+        // Trace return from open_file
+        if (pc == 0x4000461C) {
+            std.debug.print("LOAD_FW_OPEN_FILE_RET: R0=0x{X:0>8} (fd or -1)\n", .{ self.cpu.getReg(0) });
+        }
+        // Trace the final call at 0x40004660 before return
+        if (pc == 0x40004660) {
+            std.debug.print("LOAD_FW_FINAL_CALL: R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
+                self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3)
+            });
         }
         // Trace common return points in load_firmware
         if (pc >= 0x40004680 and pc <= 0x40004800) {

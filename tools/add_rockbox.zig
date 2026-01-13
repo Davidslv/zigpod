@@ -126,9 +126,29 @@ pub fn main() !void {
     const file = try std.fs.cwd().openFile(disk_path, .{ .mode = .read_write });
     defer file.close();
 
+    // Read MBR to find FAT32 partition
+    var mbr: [SECTOR_SIZE]u8 = undefined;
+    try file.seekTo(0);
+    _ = try file.readAll(&mbr);
+
+    // Find FAT32 partition (type 0x0B, 0x0C, or 0x1C)
+    var partition_start_sector: u32 = 1; // Default fallback
+    for (0..4) |i| {
+        const entry_offset = 0x1BE + i * 16;
+        const part_type = mbr[entry_offset + 4];
+        if (part_type == 0x0B or part_type == 0x0C or part_type == 0x1C) {
+            partition_start_sector = @as(u32, mbr[entry_offset + 8]) |
+                (@as(u32, mbr[entry_offset + 9]) << 8) |
+                (@as(u32, mbr[entry_offset + 10]) << 16) |
+                (@as(u32, mbr[entry_offset + 11]) << 24);
+            std.debug.print("Found FAT32 partition at sector {}\n", .{partition_start_sector});
+            break;
+        }
+    }
+
     // Read boot sector to get filesystem parameters
     var boot_sector: [SECTOR_SIZE]u8 = undefined;
-    const partition_start: u64 = 1 * SECTOR_SIZE;  // Partition starts at sector 1
+    const partition_start: u64 = @as(u64, partition_start_sector) * SECTOR_SIZE;
 
     try file.seekTo(partition_start);
     _ = try file.readAll(&boot_sector);
@@ -141,8 +161,8 @@ pub fn main() !void {
     const sectors_per_cluster = boot.sectors_per_cluster;
     const root_cluster = boot.root_cluster;
 
-    const fat1_sector = 1 + reserved_sectors;  // Partition start + reserved
-    const data_start_sector = 1 + reserved_sectors + (num_fats * fat_size);
+    const fat1_sector = partition_start_sector + reserved_sectors;  // Partition start + reserved
+    const data_start_sector = partition_start_sector + reserved_sectors + (num_fats * fat_size);
 
     std.debug.print("FAT32 Parameters:\n", .{});
     std.debug.print("  Reserved sectors: {}\n", .{reserved_sectors});

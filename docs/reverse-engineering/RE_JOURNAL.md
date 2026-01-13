@@ -437,6 +437,129 @@ The bootloader's memory layout after copy:
 
 Task state encoding: 00=inactive, 01=sleeping, 10=waiting, 11=ready
 
+## 2026-01-13: Rockbox Bootloader File Loading Issue - CRITICAL DOCUMENTATION
+
+**STATUS: BLOCKING - Next agent MUST read this section**
+
+### Current State
+
+The Rockbox bootloader boots successfully, detects partitions correctly, but FAILS to load rockbox.ipod. The bootloader falls back to "Loading original firmware..." because rockbox.ipod loading fails silently.
+
+### Verified Working
+
+1. **Disk Image**: `ipod_proper.img` (128MB) with correct two-partition layout:
+   - Partition 0: type 0x00 (firmware), LBA 1-2047
+   - Partition 1: type 0x0C (FAT32), LBA 2048-262143
+
+2. **FAT32 Structure** (all verified correct):
+   - Boot sector at sector 2048
+   - Reserved sectors: 32
+   - FAT size: 2032 sectors per FAT
+   - FAT1 at sector 2080, FAT2 at sector 4112
+   - Data start at sector 6144 (cluster 2)
+   - Root cluster: 2
+
+3. **Directory Structure**:
+   - Root dir (sector 6144): Volume label "IPOD" + .rockbox dir (cluster 3)
+   - .rockbox dir (sector 6145): "." + ".." + rockbox.ipod (cluster 4, size 774012)
+
+4. **rockbox.ipod File**:
+   - Correctly placed at cluster 4 (sector 6146)
+   - FAT chain: 4→5→6→7→...→1515→EOC (correct for 774012 bytes)
+   - Header: checksum 0x04D7ABD6, model "ipvd" (iPod Video) ✓
+   - File from: `firmware/rockbox/ipodvideo/.rockbox/rockbox.ipod`
+
+5. **ATA Reads Observed**:
+   - LBA 0 ✓ (MBR)
+   - LBA 2048, 2049 ✓ (FAT32 boot sector, FSInfo)
+   - LBA 6144 ✓ (root directory)
+   - LBA 6145 ✓ (.rockbox directory)
+   - **LBA 6146+ NEVER READ** ← THIS IS THE PROBLEM
+
+### The Mystery
+
+The bootloader:
+1. Finds partition 1 with correct type (0x0C) and size (260096 sectors)
+2. Reads root directory, finds .rockbox
+3. Reads .rockbox directory, which contains valid rockbox.ipod entry
+4. **NEVER attempts to read rockbox.ipod data (cluster 4, sector 6146)**
+
+### Possible Causes (Uninvestigated)
+
+1. **LFN parsing failure**: The bootloader may reject the LFN due to some subtle format issue
+2. **Short name mismatch**: "ROCKBO~1IPO" may not match bootloader's expected format
+3. **Case sensitivity**: Bootloader may expect lowercase "rockbox.ipod"
+4. **File attribute issue**: ATTR_ARCHIVE (0x20) may need to be different
+5. **FAT parsing issue**: Bootloader may fail when reading FAT to follow cluster chain
+6. **Hidden firmware bug**: Possible emulator issue with how ATA data is returned for directory sectors
+
+### Key Addresses in Bootloader
+
+| Address | Function |
+|---------|----------|
+| 0x40004680 | load_firmware entry (wrapper) |
+| 0x400045D0 | load_firmware inner function |
+| 0x40004618 | open_file call (BX R4) |
+| 0x4000461C | Return from open_file |
+| 0x40003A3C | open function pointer |
+| 0x4000BE6C | Path string buffer (empty when traced!) |
+| 0x4000BFC4 | "rockbox.ipod" filename in bootloader data |
+
+### Critical Observation
+
+When tracing LOAD_FW_OPEN_FILE at PC=0x40004618:
+- R0 (path) = 0x4000BE6C → contains **SPACES**, not the expected path
+- This means the path string is never being populated before open() is called
+- The bootloader's path construction (sprintf "/.rockbox/%s", "rockbox.ipod") may be failing
+
+### Files Modified
+
+- `tools/add_rockbox.zig`: Fixed to detect FAT32 partition from MBR
+- `src/emulator/core.zig`: Extensive tracing for load_firmware debugging
+- `ipod_proper.img`: Correctly structured disk image with rockbox.ipod
+
+### Commands to Reproduce
+
+```bash
+# Build emulator
+zig build -p zig-out
+
+# Run with tracing
+./zig-out/bin/zigpod-emulator --firmware firmware/bootloader-ipodvideo.ipod \
+  --headless --debug --cycles 20000000 ipod_proper.img 2>&1 | \
+  grep -E "(LBA=|Partition|rockbox|SDRAM EXEC)"
+
+# Verify disk structure
+python3 -c "
+import struct
+with open('ipod_proper.img', 'rb') as f:
+    f.seek(6145 * 512 + 0x60)
+    entry = f.read(32)
+    print('rockbox.ipod entry:', entry[:11], 'cluster:',
+          struct.unpack('<H', entry[26:28])[0],
+          'size:', struct.unpack('<I', entry[28:32])[0])
+"
+```
+
+### Next Steps for Next Agent
+
+1. **TRACE PATH CONSTRUCTION**: Find where "/.rockbox/rockbox.ipod" path string is built
+   - Look for sprintf/snprintf calls before 0x40004618
+   - Find the format string "/.rockbox/%s" usage in bootloader
+
+2. **CHECK open() IMPLEMENTATION**: The emulator may need to actually implement file open
+   - Currently ATA returns raw sectors
+   - The bootloader handles FAT32 itself
+   - Maybe the bootloader's open() logic has a bug in emulated environment
+
+3. **COMPARE WITH REAL HARDWARE**: If possible, trace what sectors real hardware reads
+   - The bootloader should read sector 6146 after 6145 if file is found
+
+4. **CHECK ATA DATA RETURN**: Verify that sector 6145 (.rockbox dir) data is correctly
+   returned to the CPU via ATA data port reads
+
+---
+
 ## PROVEN FACTS - Rockbox Sources (Reference)
 
 | File | Contents |
