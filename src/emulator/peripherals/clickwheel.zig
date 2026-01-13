@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const bus = @import("../memory/bus.zig");
+const interrupt_ctrl = @import("interrupt_ctrl.zig");
 
 /// Click wheel buttons
 pub const Button = enum(u3) {
@@ -86,6 +87,9 @@ pub const ClickWheel = struct {
     /// Accumulated wheel delta
     wheel_delta: i8,
 
+    /// Interrupt controller for serial0 interrupt
+    int_ctrl: ?*interrupt_ctrl.InterruptController,
+
     const Self = @This();
 
     /// Register offsets
@@ -108,19 +112,35 @@ pub const ClickWheel = struct {
             .data_available = false,
             .prev_wheel_pos = 0,
             .wheel_delta = 0,
+            .int_ctrl = null,
         };
+    }
+
+    /// Set interrupt controller for serial0 interrupts
+    pub fn setInterruptController(self: *Self, ctrl: *interrupt_ctrl.InterruptController) void {
+        self.int_ctrl = ctrl;
+    }
+
+    /// Fire serial0 interrupt to notify firmware of data
+    fn fireInterrupt(self: *Self) void {
+        if (self.int_ctrl) |ctrl| {
+            ctrl.assertInterrupt(.serial0);
+            std.debug.print("CLICKWHEEL: Fired serial0 interrupt\n", .{});
+        }
     }
 
     /// Press a button
     pub fn pressButton(self: *Self, button: Button) void {
         self.buttons |= button.mask();
         self.data_available = true;
+        self.fireInterrupt();
     }
 
     /// Release a button
     pub fn releaseButton(self: *Self, button: Button) void {
         self.buttons &= ~button.mask();
         self.data_available = true;
+        self.fireInterrupt();
     }
 
     /// Set button state directly

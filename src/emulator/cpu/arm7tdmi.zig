@@ -54,6 +54,9 @@ pub const Arm7tdmi = struct {
     /// Pending FIQ that will be taken after current instruction
     fiq_pending: bool,
 
+    /// Debug: count IRQ instructions for tracing
+    irq_trace_count: u32,
+
     const Self = @This();
 
     /// Initialize CPU in reset state
@@ -66,6 +69,7 @@ pub const Arm7tdmi = struct {
             .fiq_line = false,
             .irq_pending = false,
             .fiq_pending = false,
+            .irq_trace_count = 0,
         };
     }
 
@@ -95,6 +99,11 @@ pub const Arm7tdmi = struct {
         // Handle IRQ
         if (self.irq_pending) {
             self.irq_pending = false;
+            std.debug.print("IRQ ENTRY: PC=0x{X:0>8}, LR will be 0x{X:0>8}, entering IRQ mode\n", .{
+                self.regs.r[15],
+                self.regs.r[15] -% 4, // LR is PC - 4 for IRQ
+            });
+            self.irq_trace_count = 0; // Reset trace counter for new IRQ
             const cycles = exceptions.enterException(&self.regs, .irq);
             self.total_cycles += cycles;
             return cycles;
@@ -115,6 +124,20 @@ pub const Arm7tdmi = struct {
         // Fetch 32-bit instruction from PC
         const pc = self.regs.r[15];
         const instruction = bus.read32(pc);
+
+        // Trace IRQ handler instructions (first 50)
+        if (self.regs.cpsr.getMode() == .irq and self.irq_trace_count < 50) {
+            self.irq_trace_count += 1;
+            std.debug.print("IRQ[{}]: PC=0x{X:0>8} instr=0x{X:0>8} R0=0x{X:0>8} R1=0x{X:0>8} SP=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.irq_trace_count,
+                pc,
+                instruction,
+                self.regs.r[0],
+                self.regs.r[1],
+                self.regs.r[13],
+                self.regs.r[14],
+            });
+        }
 
         // Advance PC before execution (ARM prefetch behavior)
         self.regs.r[15] = pc +% 4;

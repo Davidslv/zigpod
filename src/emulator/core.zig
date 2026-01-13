@@ -142,6 +142,10 @@ pub const Emulator = struct {
     /// This is a workaround to break out of the scheduler loop
     rtos_kickstart_fired: bool,
 
+    /// Flags for button injection in headless mode
+    button_injected: bool,
+    button_released: bool,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -208,6 +212,8 @@ pub const Emulator = struct {
             .running = false,
             .total_cycles = 0,
             .rtos_kickstart_fired = false,
+            .button_injected = false,
+            .button_released = false,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -237,6 +243,7 @@ pub const Emulator = struct {
         self.ata_ctrl.setInterruptController(&self.int_ctrl);
         self.i2s_ctrl.setInterruptController(&self.int_ctrl);
         self.dma_ctrl.setInterruptController(&self.int_ctrl);
+        self.wheel.setInterruptController(&self.int_ctrl);
 
         // Connect I2S to I2C codec for volume control
         self.i2s_ctrl.setCodec(&self.i2c_ctrl);
@@ -254,6 +261,11 @@ pub const Emulator = struct {
         self.bus.registerPeripheral(.clickwheel, self.wheel.createHandler());
         self.bus.registerPeripheral(.lcd, self.lcd_ctrl.createHandler());
         self.bus.registerPeripheral(.lcd_bridge, self.lcd_bridge.createHandler());
+
+        // NOTE: Don't press any button at boot - let bootloader auto-boot
+        // With MENU pressed, it shows a menu. Without any button, it should
+        // try to load Rockbox first (if present), then Apple firmware.
+        // self.wheel.pressButton(.menu);
 
         // Initialize GPIO defaults for iPod hardware:
         // GPIO A bit 5 = hold switch (1 = not held, 0 = held)
@@ -329,6 +341,7 @@ pub const Emulator = struct {
     pub fn step(self: *Self) u32 {
         var cpu_bus = self.createCpuBus();
 
+
         // Update CPU IRQ/FIQ lines from interrupt controller
         self.cpu.setIrqLine(self.int_ctrl.hasPendingIrq());
         self.cpu.setFiqLine(self.int_ctrl.hasPendingFiq());
@@ -388,29 +401,89 @@ pub const Emulator = struct {
             self.bus.schedulerKickstart();
         }
 
-        // TCB Kickstart: Try modifying task state directly in RAM
-        // The task state at 0x108701CC should be initialized by then
-        if (self.total_cycles >= 5_000 and self.total_cycles < 5_100) {
+        // TCB Kickstart: Continuously modify task state while scheduler is active
+        // The scheduler at 0x400095BC reads task states from memory
+        // Try modifying task state every 1M cycles to wake up tasks
+        if (self.total_cycles >= 50_000_000 and self.total_cycles % 1_000_000 == 0) {
             self.bus.tcbKickstart();
         }
 
-        // Timer IRQ kickstart: DISABLED - crashes because IRQ dispatch tables not initialized
-        // The firmware needs tasks to run first to set up IRQ handlers, but tasks are sleeping.
-        // Chicken-and-egg problem: tasks need IRQs to wake up, IRQs need tasks to set up handlers.
+        // Button Press Injection for headless mode:
+        // The Rockbox bootloader shows a menu and waits for button input.
+        // NOTE: The bootloader doesn't have proper IRQ handlers - the IRAM vectors
+        // contain boot init code that would wipe memory if triggered.
+        // The bootloader might use polling instead, so we just set data_available.
         //
-        // if (self.total_cycles >= 10_000 and self.total_cycles < 10_100) {
-        //     self.cpu.enableIrq();
+        // For proper interrupt-based input, we'd need the bootloader to set up
+        // its own exception vectors, which it may not do.
+        if (self.total_cycles >= 100_000_000 and self.total_cycles < 105_000_000) {
+            if (!self.button_injected) {
+                self.button_injected = true;
+                // Dump IRAM exception vectors to understand what handlers are set up
+                std.debug.print("\n=== IRAM Exception Vectors at {} cycles ===\n", .{self.total_cycles});
+                const vector_offsets = [_]u32{ 0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C };
+                const vector_names = [_][]const u8{ "Reset", "Undef", "SWI", "PrefetchAbort", "DataAbort", "Reserved", "IRQ", "FIQ" };
+                for (vector_offsets, 0..) |offset, i| {
+                    const addr = 0x40000000 + offset;
+                    const instr = self.bus.read32(addr);
+                    std.debug.print("  0x{X:0>8} ({s:15}): 0x{X:0>8}\n", .{ addr, vector_names[i], instr });
+                }
+                // Also check int controller state
+                std.debug.print("=== Interrupt Controller State ===\n", .{});
+                std.debug.print("  CPU enable mask: 0x{X:0>8}\n", .{self.int_ctrl.getEnable()});
+                std.debug.print("  Raw status:      0x{X:0>8}\n", .{self.int_ctrl.raw_status});
+                std.debug.print("  Forced status:   0x{X:0>8}\n", .{self.int_ctrl.forced_status});
+                std.debug.print("=======================================\n\n", .{});
+
+                // Dump scheduler loop code
+                std.debug.print("=== Scheduler Loop Code (0x400095B0-0x400095D0) ===\n", .{});
+                var addr: u32 = 0x400095B0;
+                while (addr <= 0x400095D0) : (addr += 4) {
+                    const instr = self.bus.read32(addr);
+                    std.debug.print("  0x{X:0>8}: 0x{X:0>8}\n", .{ addr, instr });
+                }
+                std.debug.print("=======================================\n\n", .{});
+
+                // Also dump the LCD-related loop at 0x400092B0
+                std.debug.print("=== New Loop Code (0x400092A0-0x400092D0) ===\n", .{});
+                addr = 0x400092A0;
+                while (addr <= 0x400092D0) : (addr += 4) {
+                    const instr = self.bus.read32(addr);
+                    std.debug.print("  0x{X:0>8}: 0x{X:0>8}\n", .{ addr, instr });
+                }
+                std.debug.print("=======================================\n\n", .{});
+
+                // Just set the scheduler wake event without pressing any button
+                // This should make the bootloader proceed with auto-boot
+                // (loading Rockbox if present, or Apple firmware otherwise)
+                self.bus.setButtonEvent();
+                std.debug.print("SCHEDULER WAKE: Set at cycle {} (no button pressed - auto-boot mode)\n", .{self.total_cycles});
+            }
+        } else if (self.total_cycles >= 105_000_000 and self.button_injected and !self.button_released) {
+            self.button_released = true;
+            self.wheel.releaseButton(.select);
+            std.debug.print("BUTTON INJECT: Released SELECT at cycle {}\n", .{self.total_cycles});
+        }
+
+        // Timer kickstart DISABLED - IRQ handler doesn't return properly
+        // // Enable timer at ~90M cycles for a single interrupt, then disable
+        // if (self.total_cycles >= 90_000_000 and self.total_cycles < 90_000_100 and !self.timer.timer1.isEnabled()) {
+        //     const timer_config: u32 = (1 << 31) | 1_000;
+        //     self.timer.timer1.setConfig(timer_config);
         //     self.int_ctrl.forceEnableCpuInterrupt(.timer1);
-        //     self.int_ctrl.assertInterrupt(.timer1);
         // }
 
-        // Debug: Log PC and registers periodically when stuck
-        if (self.total_cycles >= 50_000 and self.total_cycles < 50_003) {
-            std.debug.print("DEBUG @ {}: PC=0x{X:0>8}, Mode={s}, IRQ_disabled={}\n", .{
+        // Debug: Log PC, timer, and IRQ state periodically
+        if (self.total_cycles >= 80_000_000 and self.total_cycles % 5_000_000 == 0 and self.total_cycles < 150_000_000) {
+            std.debug.print("DEBUG @ {}: PC=0x{X:0>8}, Mode={s}, IRQ_disabled={}, Timer1_enabled={}, IRQ_pending={}, R0=0x{X:0>8}, R2=0x{X:0>8}\n", .{
                 self.total_cycles,
                 self.cpu.regs.r[15],
                 @tagName(self.cpu.regs.cpsr.getMode() orelse .user),
                 self.cpu.regs.cpsr.irq_disable,
+                self.timer.timer1.isEnabled(),
+                self.int_ctrl.hasPendingIrq(),
+                self.cpu.regs.r[0],
+                self.cpu.regs.r[2],
             });
         }
 

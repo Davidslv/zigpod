@@ -288,7 +288,7 @@ pub const SystemController = struct {
 
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
-        return switch (offset) {
+        const value = switch (offset) {
             REG_CHIP_ID => CHIP_ID_PP5021C,
             REG_DEV_RS => self.dev_rs,
             REG_DEV_RS2 => self.dev_rs2,
@@ -305,6 +305,7 @@ pub const SystemController = struct {
             REG_COP_CTL => self.cop_ctl,
             else => 0,
         };
+        return value;
     }
 
     /// Read PROC_ID - returns different value for CPU vs COP

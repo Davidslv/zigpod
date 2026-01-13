@@ -38,7 +38,11 @@ pub const Interrupt = enum(u5) {
     mailbox = 4,
     // 5-9 reserved
     i2s = 10,
-    // 11-22 reserved
+    // 11 reserved
+    serial0 = 12, // Click wheel / keypad serial
+    serial1 = 13,
+    i2c = 14,
+    // 15-22 reserved
     ide = 23,
     // 24-25 reserved
     dma = 26,

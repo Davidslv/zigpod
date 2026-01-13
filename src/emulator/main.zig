@@ -288,6 +288,17 @@ pub fn main() !void {
         iram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 96 * 1024); // IRAM is 96KB
         print("Loaded {d} bytes at IRAM (0x40000000)\n", .{iram_firmware.?.len});
         emu.loadIram(iram_firmware.?);
+
+        // BOOTLOADER PATCH: The Rockbox bootloader contains a self-copy routine that
+        // expects to run from ROM and copy itself to IRAM. The jump target at offset 0x2D4
+        // is 0x40000024 which creates an infinite loop when loaded directly to IRAM.
+        // Patch it to 0x4000002C (the instruction after the LDR PC) to skip the loop.
+        const patch_addr: u32 = 0x400002D4;
+        const original = emu.bus.read32(patch_addr);
+        if (original == 0x40000024) {
+            emu.bus.write32(patch_addr, 0x4000002C);
+            print("BOOTLOADER PATCH: Patched [0x{X:0>8}] from 0x{X:0>8} to 0x4000002C\n", .{ patch_addr, original });
+        }
     }
     defer if (iram_firmware) |fw| allocator.free(fw);
 

@@ -124,6 +124,7 @@ pub const LcdController = struct {
     /// Register offsets
     const REG_DATA32: u32 = 0x00000;
     const REG_WR_ADDR32: u32 = 0x10000;
+    const REG_STATUS: u32 = 0x20000; // BCM status register - bit 0 = ready
     const REG_CONTROL: u32 = 0x30000;
 
     pub fn init() Self {
@@ -217,10 +218,14 @@ pub const LcdController = struct {
 
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
-        return switch (offset) {
+        // BCM decodes only bits 16-18 for register selection
+        const bcm_reg = offset & 0x70000;
+        return switch (bcm_reg) {
+            REG_WR_ADDR32 => self.write_addr,
+            // Status register: bit 0 = ready, always indicate ready
+            REG_STATUS => 0x01,
             // Control register: bit 1 = ready, always indicate ready for now
             REG_CONTROL => self.control | 0x02,
-            REG_WR_ADDR32 => self.write_addr,
             else => 0,
         };
     }

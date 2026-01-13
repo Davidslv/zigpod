@@ -129,6 +129,10 @@ pub const MemoryBus = struct {
     kickstart_enabled: bool,
     kickstart_read_count: u32,
 
+    /// Button event pending - set when button pressed, causes DEV_INIT+0x28 to return bit 7 set
+    /// This wakes the Rockbox scheduler which polls [0x70000028] for bit 7
+    button_event_pending: bool,
+
     /// Debug: count of LCD bridge writes
     lcd_bridge_write_count: u32,
 
@@ -362,6 +366,7 @@ pub const MemoryBus = struct {
             .hw_accel_write_count = 0,
             .kickstart_enabled = false,
             .kickstart_read_count = 0,
+            .button_event_pending = false,
             .lcd_bridge_write_count = 0,
             .sdram_write_count = 0,
             .iram_write_count = 0,
@@ -423,6 +428,7 @@ pub const MemoryBus = struct {
             .hw_accel_write_count = 0,
             .kickstart_enabled = false,
             .kickstart_read_count = 0,
+            .button_event_pending = false,
             .lcd_bridge_write_count = 0,
             .sdram_write_count = 0,
             .iram_write_count = 0,
@@ -983,6 +989,17 @@ pub const MemoryBus = struct {
         self.kickstart_enabled = true;
     }
 
+    /// Set button event pending flag - wakes Rockbox scheduler
+    /// The scheduler polls DEV_INIT+0x28 (0x70000028) for bit 7
+    pub fn setButtonEvent(self: *Self) void {
+        self.button_event_pending = true;
+    }
+
+    /// Clear button event pending flag
+    pub fn clearButtonEvent(self: *Self) void {
+        self.button_event_pending = false;
+    }
+
     /// Direct write to hw_accel region (used for RTOS kickstart)
     pub fn writeKickstart(self: *Self, addr: u32, value: u32) void {
         _ = addr;
@@ -1196,39 +1213,40 @@ pub const MemoryBus = struct {
                 (@as(u32, self.boot_rom[offset + 3]) << 24);
         }
 
-        // Exception vector stubs - trampoline to firmware vectors at 0x10000800
+        // Exception vector stubs - trampoline to IRAM vectors at 0x40000000
         // ARM B instruction can't reach 256MB, so use LDR PC, [PC, #offset]
+        // Boot ROM emulation copies handlers to IRAM+0x00 (helpers) and IRAM+0x08 (SWI+)
         // Each vector: LDR PC, [PC, #0x18] loads from literal pool at vector + 0x20
         // Layout:
-        //   0x00: LDR PC, [PC, #0x18] -> loads from 0x20 (Reset vector = 0x10000800)
-        //   0x04: LDR PC, [PC, #0x18] -> loads from 0x24 (Undefined = 0x10000804)
-        //   0x08: LDR PC, [PC, #0x18] -> loads from 0x28 (SWI = 0x10000808)
-        //   0x0C: LDR PC, [PC, #0x18] -> loads from 0x2C (Prefetch = 0x1000080C)
-        //   0x10: LDR PC, [PC, #0x18] -> loads from 0x30 (Data = 0x10000810)
-        //   0x14: LDR PC, [PC, #0x18] -> loads from 0x34 (Reserved = 0x10000814)
-        //   0x18: LDR PC, [PC, #0x18] -> loads from 0x38 (IRQ = 0x10000818)
-        //   0x1C: LDR PC, [PC, #0x18] -> loads from 0x3C (FIQ = 0x1000081C)
-        //   0x20-0x3C: Literal pool with firmware vector addresses
+        //   0x00: LDR PC, [PC, #0x18] -> loads from 0x20 (Reset vector = 0x40000000)
+        //   0x04: LDR PC, [PC, #0x18] -> loads from 0x24 (Undefined = 0x40000004)
+        //   0x08: LDR PC, [PC, #0x18] -> loads from 0x28 (SWI = 0x40000008)
+        //   0x0C: LDR PC, [PC, #0x18] -> loads from 0x2C (Prefetch = 0x4000000C)
+        //   0x10: LDR PC, [PC, #0x18] -> loads from 0x30 (Data = 0x40000010)
+        //   0x14: LDR PC, [PC, #0x18] -> loads from 0x34 (Reserved = 0x40000014)
+        //   0x18: LDR PC, [PC, #0x18] -> loads from 0x38 (IRQ = 0x40000018)
+        //   0x1C: LDR PC, [PC, #0x18] -> loads from 0x3C (FIQ = 0x4000001C)
+        //   0x20-0x3C: Literal pool with low IRAM vector addresses
         return switch (addr) {
             // Exception vector trampolines
-            0x00000000 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Reset -> 0x10000800
-            0x00000004 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Undefined -> 0x10000804
-            0x00000008 => 0xE59FF018, // LDR PC, [PC, #0x18] ; SWI -> 0x10000808
-            0x0000000C => 0xE59FF018, // LDR PC, [PC, #0x18] ; Prefetch Abort -> 0x1000080C
-            0x00000010 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Data Abort -> 0x10000810
-            0x00000014 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Reserved -> 0x10000814
-            0x00000018 => 0xE59FF018, // LDR PC, [PC, #0x18] ; IRQ -> 0x10000818
-            0x0000001C => 0xE59FF018, // LDR PC, [PC, #0x18] ; FIQ -> 0x1000081C
+            0x00000000 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Reset -> 0x40000000
+            0x00000004 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Undefined -> 0x40000004
+            0x00000008 => 0xE59FF018, // LDR PC, [PC, #0x18] ; SWI -> 0x40000008
+            0x0000000C => 0xE59FF018, // LDR PC, [PC, #0x18] ; Prefetch Abort -> 0x4000000C
+            0x00000010 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Data Abort -> 0x40000010
+            0x00000014 => 0xE59FF018, // LDR PC, [PC, #0x18] ; Reserved -> 0x40000014
+            0x00000018 => 0xE59FF018, // LDR PC, [PC, #0x18] ; IRQ -> 0x40000018
+            0x0000001C => 0xE59FF018, // LDR PC, [PC, #0x18] ; FIQ -> 0x4000001C
 
-            // Literal pool for exception vectors (firmware at 0x10000800 + vector offset)
-            0x00000020 => 0x10000800, // Reset handler
-            0x00000024 => 0x10000804, // Undefined handler
-            0x00000028 => 0x10000808, // SWI handler
-            0x0000002C => 0x1000080C, // Prefetch Abort handler
-            0x00000030 => 0x10000810, // Data Abort handler
-            0x00000034 => 0x10000814, // Reserved handler
-            0x00000038 => 0x10000818, // IRQ handler
-            0x0000003C => 0x1000081C, // FIQ handler
+            // Literal pool for exception vectors (low IRAM where handlers are copied)
+            0x00000020 => 0x40000000, // Reset handler
+            0x00000024 => 0x40000004, // Undefined handler
+            0x00000028 => 0x40000008, // SWI handler
+            0x0000002C => 0x4000000C, // Prefetch Abort handler
+            0x00000030 => 0x40000010, // Data Abort handler
+            0x00000034 => 0x40000014, // Reserved handler
+            0x00000038 => 0x40000018, // IRQ handler
+            0x0000003C => 0x4000001C, // FIQ handler
 
             // Boot ROM stub for Apple firmware - calls function at 0xF000F00C and continues
             // Apple firmware writes callback address to 0xF000F00C before jumping to ROM
@@ -1396,6 +1414,9 @@ pub const MemoryBus = struct {
                 0x14 => 0xFFFFFFFF, // DEV_INIT1+4
                 0x20 => 0xFFFFFFFF, // DEV_INIT2: All devices enabled
                 0x24 => 0xFFFFFFFF, // DEV_INIT2+4
+                // Rockbox scheduler polls this register for bit 7 (0x80) to wake up
+                // Set bit 7 when button_event_pending to wake the scheduler
+                0x28 => if (self.button_event_pending) @as(u32, 0x80) else @as(u32, 0x00),
                 0x30 => 0x80000000, // Unknown status register - bit 31 = ready
                 0x34 => 0x00000000, // DEV_TIMING1
                 0x38 => 0x00000000, // XMB_NOR_CFG
