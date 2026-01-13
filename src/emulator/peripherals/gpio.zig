@@ -178,9 +178,20 @@ pub const GpioController = struct {
             else => 0,
         };
 
-        // Debug: trace GPIO A input reads (hold switch check)
-        if (port_idx == 0 and reg_offset == REG_INPUT_VAL) {
-            std.debug.print("GPIO A INPUT_VAL read: 0x{X:0>8} (ext={X:0>8}, out_en={X:0>8})\n", .{ value, port.external_input, port.output_en });
+        // Debug: trace ALL GPIO A reads (to find button_hold() behavior)
+        if (port_idx == 0) {
+            const reg_name = switch (reg_offset) {
+                REG_ENABLE => "ENABLE",
+                REG_INT_EN => "INT_EN",
+                REG_INT_LEV => "INT_LEV",
+                REG_INT_CLR => "INT_CLR",
+                REG_OUTPUT_EN => "OUTPUT_EN",
+                REG_OUTPUT_VAL => "OUTPUT_VAL",
+                REG_INPUT_VAL => "INPUT_VAL",
+                REG_INT_STAT => "INT_STAT",
+                else => "UNKNOWN",
+            };
+            std.debug.print("GPIO_A_READ: reg={s}(0x{X:0>2}) val=0x{X:0>8} (ext={X:0>8}, out_en={X:0>8})\n", .{ reg_name, reg_offset, value, port.external_input, port.output_en });
         }
 
         return value;

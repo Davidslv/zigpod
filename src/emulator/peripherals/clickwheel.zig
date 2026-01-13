@@ -257,6 +257,17 @@ pub const ClickWheel = struct {
         // Debug: trace click wheel reads
         if (offset == REG_STATUS or offset == REG_DATA) {
             std.debug.print("ClickWheel read offset=0x{X:0>2}: 0x{X:0>8} (avail={})\n", .{ offset, value, self.data_available });
+            if (offset == REG_DATA) {
+                // Show what opto_keypad_read() would extract: (value << 11) >> 27
+                const state = (value << 11) >> 27;
+                std.debug.print("  -> opto_keypad_read state: 0x{X:0>2} (MENU={}, PLAY={}, LEFT={}, RIGHT={})\n", .{
+                    state,
+                    (state & 0x10) == 0, // MENU pressed if bit 4 CLEAR
+                    (state & 0x08) == 0, // PLAY pressed if bit 3 CLEAR
+                    (state & 0x04) == 0, // LEFT pressed if bit 2 CLEAR
+                    (state & 0x02) == 0, // RIGHT pressed if bit 1 CLEAR
+                });
+            }
         }
 
         return value;

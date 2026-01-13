@@ -361,7 +361,52 @@ pub const Emulator = struct {
             });
         }
 
+        // BOOT PATH DEBUG: Trace the exact decision point
+        // Found via disassembly:
+        //   0x40000D64: CMP R5, #2    - check btn == BUTTON_MENU
+        //   0x40000D70: CMP R6, #0    - check button_was_held
+        //   0x40000D78: CMP R3, #0    - combined check
+        //   0x40000D7C: BEQ 0x40000E44 - branch to "Loading Rockbox" if r3==0
+        //   0x40000D80: LDR R0, "Loading original firmware..."
+        //
+        // R5 = btn (from key_pressed())
+        // R6 = button_was_held (from button_hold() called early)
+        if (pc == 0x40000D64) {
+            std.debug.print("BOOT_DECISION: At CMP R5, #2 - R5 (btn) = 0x{X:0>8}, R6 (button_was_held) = 0x{X:0>8}\n", .{
+                self.cpu.getReg(5), self.cpu.getReg(6),
+            });
+        }
+        if (pc == 0x40000D7C) {
+            const will_branch = if (self.cpu.getReg(3) == 0) "will" else "will NOT";
+            std.debug.print("BOOT_DECISION: At BEQ branch - R3 (combined) = 0x{X:0>8}, {s} branch to Rockbox path\n", .{
+                self.cpu.getReg(3), will_branch,
+            });
+        }
+        if (pc == 0x40000D80) {
+            std.debug.print("BOOT_DECISION: TAKING 'Loading original firmware' PATH\n", .{});
+        }
+        if (pc == 0x40000E44) {
+            std.debug.print("BOOT_DECISION: At 'Loading Rockbox' path entry point\n", .{});
+        }
+
+        // BOOT PATH FIX: Patch the boot decision branch to always take Rockbox path
+        // At 0x40000D7C: BEQ to "Loading Rockbox" path (instruction 0x0A000030)
+        // Change to unconditional B (instruction 0xEA000030) to bypass button_was_held check
+        // Re-apply whenever we see the original instruction (bootloader may be reloaded on restart)
+        if (pc >= 0x40000000 and pc < 0x40000100 and self.total_cycles > 50_000) {
+            const branch_addr: u32 = 0x40000D7C;
+            const current_instr = self.bus.read32(branch_addr);
+            // Check if it's the BEQ instruction we want to patch
+            if (current_instr == 0x0A000030) {
+                // Change BEQ (condition 0) to B (condition 14 = always)
+                // 0x0A000030 -> 0xEA000030
+                self.bus.write32(branch_addr, 0xEA000030);
+                std.debug.print("BOOT PATH PATCHED: Changed BEQ to B at 0x{X:0>8} (0x0A000030 -> 0xEA000030)\n", .{branch_addr});
+            }
+        }
+
         // Patch "apple_os.ipod" to "rockbox.ipod" after bootloader relocates to IRAM
+        // NOTE: This patch is now backup only - the boot path patch above should make this unnecessary
         // The filename string is at IRAM 0x4000BEFC
         // NOTE: We re-apply this patch periodically because Rockbox may overwrite IRAM during startup
         if (pc >= 0x40000000 and pc < 0x40020000 and self.total_cycles > 100_000) {
@@ -595,26 +640,29 @@ pub const Emulator = struct {
         }
         // COP SYNC FIX: PP5021C has dual ARM cores (CPU + COP) that need to synchronize
         // at startup. Since we only emulate CPU, Rockbox's crt0 startup enters an infinite
-        // loop waiting for COP. This fix detects the restart and skips past the sync code.
+        // loop waiting for COP. This fix detects the restart and skips past ALL sync code.
         // When PC enters Rockbox at 0x10000000 from bootloader (LR=0x400000AC), count restarts.
         if (pc == 0x10000000 and self.cpu.getReg(14) == 0x400000AC and self.total_cycles > 10_000_000) {
             self.rockbox_restart_count += 1;
+            std.debug.print("COP_SYNC: Entry at 0x10000000, restart_count={} cycle={}\n", .{ self.rockbox_restart_count, self.total_cycles });
             if (self.rockbox_restart_count > 1) {
                 // This is a restart - Rockbox has already run through once
-                // Skip the CPU/COP sync code by jumping to 0x100001C8 (after MOV PC, #bootloader)
-                self.cpu.setReg(15, 0x100001C8);
+                // Skip ALL the CPU/COP sync code by jumping directly to 0x10000400
+                // (far past all the COP polling loops)
+                std.debug.print("COP_SYNC: Skipping directly to 0x10000400\n", .{});
+                self.cpu.setReg(15, 0x10000400);
                 return 1;
             }
         }
         // COP SYNC FIX #2: After the first sync skip, Rockbox has many COP polling loops
-        // in the 0x10000200-0x100002FF range. These all read COP_CTL (0x60007004) in a tight
-        // loop waiting for COP to signal ready. Detect the pattern and skip each loop.
-        // Pattern: 3-instruction loop at 8-byte aligned addresses ending in BLT/BNE back
-        if (self.rockbox_restart_count > 1 and pc >= 0x10000200 and pc < 0x10000300) {
+        // that read COP_CTL (0x60007004) in a tight loop waiting for COP to signal ready.
+        // Detect the pattern and skip each loop.
+        if (self.rockbox_restart_count > 1 and pc >= 0x10000200 and pc < 0x10000400) {
             // Detected loop start addresses (found empirically):
             // 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8
-            const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8 };
-            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002D4 };
+            // 0x10000320 (additional loop found after 0x10000300)
+            const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8, 0x10000320 };
+            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002D4, 0x1000032C };
             for (loop_starts, 0..) |start, i| {
                 if (pc == start) {
                     self.cpu.setReg(15, loop_exits[i]);

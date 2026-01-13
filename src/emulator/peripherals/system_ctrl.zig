@@ -302,9 +302,13 @@ pub const SystemController = struct {
             REG_DEV_INIT2 => self.dev_init2,
             REG_CACHE_CTL => self.cache_ctl,
             REG_CPU_CTL => self.cpu_ctl,
-            // COP_CTL: Always return bit 31 = 1 (COP sleeping) since we don't emulate COP
-            // Rockbox polls this bit waiting for COP to be in sleep state before proceeding
-            REG_COP_CTL => self.cop_ctl | 0x80000000,
+            // COP_CTL: Return a value that indicates COP is in a "ready" state
+            // We emulate COP as always being in sync/ready state:
+            // - Bit 31 = 1 (sleeping/idle)
+            // - Bit 30 = 1 (wake acknowledged)
+            // - Bits 16-9 = all 1s (various ready flags)
+            // This should satisfy all COP sync checks in Rockbox crt0.S
+            REG_COP_CTL => 0xC000FE00 | (self.cop_ctl & 0x1FF),
             else => 0,
         };
     }

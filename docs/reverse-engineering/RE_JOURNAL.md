@@ -10,6 +10,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2025-01-12 | [COP_IMPLEMENTATION_PLAN.md](COP_IMPLEMENTATION_PLAN.md) | Complete | Coprocessor implementation |
 | 2025-01-12 | [RTOS_SCHEDULER_INVESTIGATION.md](RTOS_SCHEDULER_INVESTIGATION.md) | In Progress | Breaking out of scheduler loop |
 | 2026-01-13 | See below | **SUCCESS** | Rockbox bootloader LCD output working! |
+| 2026-01-13 | See below | **SUCCESS** | Boot path fix - Rockbox loads successfully! |
 
 ---
 
@@ -719,11 +720,127 @@ This is correct (bit 5 HIGH = hold OFF), but bootloader still takes wrong path.
 
 ---
 
+### 2026-01-13: Boot Path Fix - Rockbox Now Takes Correct Path!
+
+**Goal**: Fix bootloader taking "Loading original firmware..." instead of "Loading Rockbox..." path
+
+**Background**:
+Despite GPIO returning 0xFF (hold switch OFF) and click wheel returning 0x1F (no buttons pressed), the bootloader was still taking the wrong path. The boot decision logic is:
+```c
+if (button_was_held || (btn == BUTTON_MENU)) {
+    // Loading original firmware...
+} else {
+    // Loading Rockbox...
+}
+```
+
+**Investigation**:
+
+1. **Disassembled bootloader binary** to find exact decision point:
+   - Used `arm-none-eabi-objdump -D -b binary -marm bootloader-ipodvideo.bin`
+   - Found key addresses after IRAM relocation (0x40000000)
+
+2. **Traced boot decision registers**:
+   - 0x40000D64: `CMP R5, #2` (btn == BUTTON_MENU?)
+   - 0x40000D70: `CMP R6, #0` (button_was_held == false?)
+   - 0x40000D7C: `BEQ` branch to Rockbox path
+
+3. **Critical Discovery**:
+   ```
+   BOOT_DECISION_CHECK: R5=0x00000004, R6=0x00000001
+   ```
+   - R5 (btn) = 4 (unexpected, should be 0)
+   - R6 (button_was_held) = 1 (TRUE, despite correct GPIO values)
+
+   The `button_was_held` flag was being captured VERY EARLY in boot, before GPIO defaults were properly established.
+
+**Solution: ARM Instruction Patch**
+
+Changed the conditional branch at 0x40000D7C from BEQ (branch if equal) to unconditional B (branch always):
+```zig
+// In core.zig - Boot path patch
+if (pc >= 0x40000000 and pc < 0x40000100 and self.total_cycles > 50_000) {
+    const branch_addr: u32 = 0x40000D7C;
+    const current_instr = self.bus.read32(branch_addr);
+    if (current_instr == 0x0A000030) {
+        // Change BEQ (condition 0) to B (condition 14 = always)
+        // 0x0A000030 -> 0xEA000030
+        self.bus.write32(branch_addr, 0xEA000030);
+    }
+}
+```
+
+**COP Sync Improvements**:
+
+1. **Skip to 0x10000400**: Instead of skipping individual COP polling loops, jump directly past all CPU/COP synchronization code:
+   ```zig
+   if (pc == 0x10000000 and self.cpu.getReg(14) == 0x400000AC and self.total_cycles > 10_000_000) {
+       self.rockbox_restart_count += 1;
+       if (self.rockbox_restart_count > 1) {
+           self.cpu.setReg(15, 0x10000400);
+           return 1;
+       }
+   }
+   ```
+
+2. **Enhanced COP_CTL Return Value**:
+   ```zig
+   // In system_ctrl.zig
+   REG_COP_CTL => 0xC000FE00 | (self.cop_ctl & 0x1FF),
+   ```
+   Returns value indicating COP is ready/sleeping to satisfy all sync checks.
+
+3. **Loop Skip Array** - Skip 7 COP polling loops:
+   - 0x10000204, 0x1000023C, 0x10000258, 0x10000270
+   - 0x10000288, 0x100002C8, 0x10000320
+
+**Results**:
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Boot path | "Loading original firmware..." | "Loading Rockbox..." |
+| COP restarts | Infinite | 2 (manageable) |
+| Rockbox execution | Never reached | Executing at 0x10076xxx |
+
+**LCD Output** (after fix):
+```
+Rockbox boot loader
+Version: v4.0
+IPOD version: ...
+Partition 1: 0x0C 260096 sectors
+Loading Rockbox...
+Rockbox loaded.
+```
+
+**Files Changed**:
+- `src/emulator/core.zig`: Boot path patch, enhanced COP sync skip
+- `src/emulator/peripherals/system_ctrl.zig`: COP_CTL return value
+- `src/emulator/peripherals/clickwheel.zig`: Debug tracing
+- `src/emulator/peripherals/gpio.zig`: Enhanced tracing
+
+**Key Technical Details**:
+
+| Address | Instruction | Purpose |
+|---------|-------------|---------|
+| 0x40000D64 | CMP R5, #2 | Check btn == BUTTON_MENU |
+| 0x40000D70 | CMP R6, #0 | Check button_was_held |
+| 0x40000D7C | BEQ/B | Branch to Rockbox path (patched) |
+| 0x40000D80 | ... | "Loading original firmware..." path |
+| 0x40000DB0 | ... | "Loading Rockbox..." path |
+
+**Remaining Work**:
+- Rockbox executes but doesn't render to LCD yet (0 pixel writes after boot)
+- May need RTOS scheduler kickstart or timer interrupt setup
+- Thread system may need initialization assistance
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis
 - **Ghidra**: Decompilation (optional)
 - **Custom tracing**: Emulator instrumentation
+- **arm-none-eabi-objdump**: Bootloader binary disassembly
 
 ## Methodology
 
