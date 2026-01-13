@@ -159,6 +159,69 @@ SHORT_ENTRY READ at 0x11006F74
 
 ---
 
+### 2026-01-13: Partition Detection Deep Dive
+
+**Goal**: Understand why bootloader shows "Partition 1: 0x0B 0 sectors" (correct type, wrong size)
+
+**Key Discovery: MBR Data Lost During Self-Relocation**
+
+1. **ATA Returns Correct Data**:
+   ```
+   ATA s0 key words: @1BE=FE80, @1C0=FFFF, @1C2=FE0B, @1FE=AA55
+   ```
+   - Type: 0x0B (FAT32) ✓
+   - Boot signature: 0xAA55 ✓
+   - All partition fields correct
+
+2. **MBR Written to IRAM**:
+   - First ATA write: `0x4000E7FC = 0x009058EB` (EB 58 90 00 = MBR jump)
+   - 128 total IRAM writes tracked (512 bytes = 1 sector)
+
+3. **MBR Overwritten by Bootloader Self-Relocation**:
+   - Memory at 0x4000E7FC after execution: ALL ZEROS
+   - Boot signature at 0x4000E9FA: 0xFFFF (should be 0xAA55)
+   - Partition table at 0x4000E9BA: garbage data
+   - **ROOT CAUSE**: Rockbox bootloader copies itself from SDRAM to IRAM,
+     overwriting the MBR sector buffer that was stored in IRAM
+
+4. **pinfo Struct Layout** (from Rockbox disk.h):
+   ```c
+   struct partinfo {
+       sector_t start;    // LBA start
+       sector_t size;     // sector count
+       unsigned char type;
+   };
+   ```
+   - sector_t is 32-bit (unsigned long) on ARM without LBA48
+   - Each entry is 12-16 bytes (with padding)
+
+5. **Bootloader Reads from pinfo**:
+   - Reads 0x11001A64 for partition size → gets 0
+   - Reads 0x11001A68 for partition type → gets 1 (not 0x0B!)
+   - pinfo array is at ~0x11001A50, each entry 16 bytes
+   - pinfo[1] is at 0x11001A60, pinfo[1].size at 0x11001A64
+
+6. **Why Type Shows 0x0B Correctly**:
+   - Bootloader likely reads type directly from MBR in memory
+   - But MBR in IRAM was overwritten
+   - May be reading from a second copy or from register
+
+**Verified Facts**:
+| Fact | Evidence |
+|------|----------|
+| ATA returns correct partition data | Debug output shows correct words |
+| MBR initially written to 0x4000E7FC | First ATA write captured |
+| MBR later overwritten | Memory dump shows zeros/garbage |
+| pinfo at 0x11001A50 with 16-byte entries | Read addresses match layout |
+| Bootloader self-relocates to IRAM | Overwrites MBR buffer |
+
+**Next Steps**:
+1. Either store MBR in SDRAM instead of IRAM
+2. Or ensure bootloader preserves MBR before self-relocation
+3. Or patch bootloader to read partition data before relocation
+
+---
+
 ## Key Memory Regions
 
 | Address | Size | Purpose |

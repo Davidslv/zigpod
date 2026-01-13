@@ -591,6 +591,110 @@ pub fn main() !void {
         emu.bus.debug_mbr_value_last_addr,
         emu.bus.debug_mbr_value_last_val,
     });
+
+    // Dump MBR partition table area in IRAM (at 0x4000E7FC + 0x1BE = 0x4000E9BA)
+    print("=== MBR Partition Table in IRAM ===\n", .{});
+    const mbr_base: u32 = 0x4000E7FC;
+    const part_table_offset: u32 = 0x1BE;
+    const part1_addr = mbr_base + part_table_offset;
+    print("  MBR base: 0x{X:0>8}, Part1 at: 0x{X:0>8}\n", .{ mbr_base, part1_addr });
+    print("  Partition 1 raw bytes: ", .{});
+    var pb: u32 = 0;
+    while (pb < 16) : (pb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(part1_addr + pb)});
+    }
+    print("\n", .{});
+    // Decode partition entry
+    const p1_boot = emu.bus.read8(part1_addr + 0);
+    const p1_type = emu.bus.read8(part1_addr + 4);
+    const p1_lba = emu.bus.read32(part1_addr + 8);
+    const p1_size = emu.bus.read32(part1_addr + 12);
+    print("  Partition 1: boot=0x{X:0>2}, type=0x{X:0>2}, lba=0x{X:0>8}, size=0x{X:0>8}\n", .{
+        p1_boot, p1_type, p1_lba, p1_size,
+    });
+    // Also dump boot signature area
+    const boot_sig_addr = mbr_base + 0x1FE;
+    print("  Boot signature at 0x{X:0>8}: 0x{X:0>4}\n", .{
+        boot_sig_addr,
+        emu.bus.read16(boot_sig_addr),
+    });
+
+    // Comprehensive search for MBR in IRAM
+    print("=== Searching IRAM for MBR boot signature (0xAA55) ===\n", .{});
+    var mbr_found: u32 = 0;
+    var iram_search: u32 = 0x40000000;
+    while (iram_search < 0x40017FFC) : (iram_search += 2) {
+        const word = emu.bus.read16(iram_search);
+        if (word == 0xAA55) {
+            mbr_found += 1;
+            if (mbr_found <= 5) {
+                // Check if this looks like end of MBR (offset 0x1FE from start)
+                const potential_mbr_start = iram_search - 0x1FE;
+                const first_bytes = emu.bus.read32(potential_mbr_start);
+                print("  0xAA55 at 0x{X:0>8}, potential MBR at 0x{X:0>8} (first bytes: 0x{X:0>8})\n", .{
+                    iram_search, potential_mbr_start, first_bytes,
+                });
+                // Dump partition 1 from potential MBR
+                print("    Part1 (@+0x1BE): ", .{});
+                var pbi: u32 = 0;
+                while (pbi < 16) : (pbi += 1) {
+                    print("{X:0>2} ", .{emu.bus.read8(potential_mbr_start + 0x1BE + pbi)});
+                }
+                print("\n", .{});
+            }
+        }
+    }
+    print("  Total 0xAA55 found in IRAM: {d}\n", .{mbr_found});
+
+    // Dump key regions of supposed MBR location to understand the issue
+    print("=== Memory dump at 0x4000E7FC (supposed MBR) ===\n", .{});
+    print("  First 32 bytes: ", .{});
+    var mb: u32 = 0;
+    while (mb < 32) : (mb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x4000E7FC + mb)});
+    }
+    print("\n", .{});
+    print("  Offset 0x1BE (partition): ", .{});
+    mb = 0;
+    while (mb < 16) : (mb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x4000E7FC + 0x1BE + mb)});
+    }
+    print("\n", .{});
+    print("  Offset 0x1FE (boot sig): ", .{});
+    mb = 0;
+    while (mb < 2) : (mb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x4000E7FC + 0x1FE + mb)});
+    }
+    print("\n", .{});
+
+    // Also search SDRAM for MBR
+    print("=== Searching SDRAM for MBR boot signature (0xAA55) ===\n", .{});
+    var sdram_mbr_found: u32 = 0;
+    var sdram_search: u32 = 0x10000000;
+    while (sdram_search < 0x12000000) : (sdram_search += 2) {
+        const word = emu.bus.read16(sdram_search);
+        if (word == 0xAA55) {
+            sdram_mbr_found += 1;
+            if (sdram_mbr_found <= 5) {
+                const potential_mbr_start = sdram_search - 0x1FE;
+                const first_bytes = emu.bus.read32(potential_mbr_start);
+                print("  0xAA55 at 0x{X:0>8}, potential MBR at 0x{X:0>8} (first bytes: 0x{X:0>8})\n", .{
+                    sdram_search, potential_mbr_start, first_bytes,
+                });
+                // If first bytes are EB 58 90 00, this is likely the MBR
+                if ((first_bytes & 0xFFFF) == 0x58EB) {
+                    print("    ** This looks like a valid MBR! **\n", .{});
+                    print("    Part1 (@+0x1BE): ", .{});
+                    var pbi: u32 = 0;
+                    while (pbi < 16) : (pbi += 1) {
+                        print("{X:0>2} ", .{emu.bus.read8(potential_mbr_start + 0x1BE + pbi)});
+                    }
+                    print("\n", .{});
+                }
+            }
+        }
+    }
+    print("  Total 0xAA55 found in SDRAM: {d}\n", .{sdram_mbr_found});
     print("Region 0x11002xxx writes: {d}, first: 0x{X:0>8} = 0x{X:0>8}\n", .{
         emu.bus.debug_region_writes,
         emu.bus.debug_region_first_addr,
