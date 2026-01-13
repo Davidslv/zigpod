@@ -277,8 +277,21 @@ pub fn main() !void {
     if (sdram_firmware_path) |path| {
         print("Loading SDRAM firmware: {s}\n", .{path});
         sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024); // 16MB max for large firmware
-        print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{sdram_firmware.?.len});
-        emu.loadSdram(0, sdram_firmware.?);
+
+        // Check for iPod firmware header (model identifier at offset 4)
+        // Format: 4 bytes checksum + 4 bytes model ("ipvd", "ipod", etc.) + firmware data
+        var fw_data = sdram_firmware.?;
+        if (fw_data.len >= 8 and (std.mem.eql(u8, fw_data[4..8], "ipvd") or
+            std.mem.eql(u8, fw_data[4..8], "ipod") or
+            std.mem.eql(u8, fw_data[4..8], "ip3g") or
+            std.mem.eql(u8, fw_data[4..8], "ip4g")))
+        {
+            print("Detected iPod firmware header, skipping 8-byte header\n", .{});
+            fw_data = fw_data[8..];
+        }
+
+        print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{fw_data.len});
+        emu.loadSdram(0, fw_data);
 
         // For Apple firmware (osos.bin), emulate Boot ROM initialization:
         // Copy SWI handler and other code from firmware to IRAM

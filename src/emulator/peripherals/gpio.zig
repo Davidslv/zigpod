@@ -106,6 +106,16 @@ pub const GpioController = struct {
         for (&gpio.ports) |*port| {
             port.* = GpioPort.init();
         }
+
+        // Set default GPIO states for iPod hardware:
+        // - GPIOA bit 5 (0x20) HIGH = hold switch OFF
+        // - GPIOA all bits HIGH = no buttons pressed (active low)
+        // - GPIOB similar defaults for other hardware signals
+        gpio.ports[0].external_input = 0xFF; // GPIOA: all high (no buttons, hold OFF)
+        gpio.ports[1].external_input = 0xFF; // GPIOB: all high
+        gpio.ports[0].updateInputs();
+        gpio.ports[1].updateInputs();
+
         return gpio;
     }
 
