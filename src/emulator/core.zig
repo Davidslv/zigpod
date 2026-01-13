@@ -152,6 +152,9 @@ pub const Emulator = struct {
     /// Flag for firmware filename patch (apple_os.ipod -> rockbox.ipod)
     filename_patched: bool,
 
+    /// Counter for Rockbox restart attempts (for COP sync fix)
+    rockbox_restart_count: u32,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -222,6 +225,7 @@ pub const Emulator = struct {
             .button_injected = false,
             .button_released = false,
             .filename_patched = false,
+            .rockbox_restart_count = 0,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -587,6 +591,19 @@ pub const Emulator = struct {
             std.debug.print("SDRAM EXEC: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
                 self.total_cycles, pc, self.cpu.getReg(0), self.cpu.getReg(14),
             });
+        }
+        // COP SYNC FIX: PP5021C has dual ARM cores (CPU + COP) that need to synchronize
+        // at startup. Since we only emulate CPU, Rockbox's crt0 startup enters an infinite
+        // loop waiting for COP. This fix detects the restart and skips past the sync code.
+        // When PC enters Rockbox at 0x10000000 from bootloader (LR=0x400000AC), count restarts.
+        if (pc == 0x10000000 and self.cpu.getReg(14) == 0x400000AC and self.total_cycles > 10_000_000) {
+            self.rockbox_restart_count += 1;
+            if (self.rockbox_restart_count > 1) {
+                // This is a restart - Rockbox has already run through once
+                // Skip the CPU/COP sync code by jumping to 0x100001C8 (after MOV PC, #bootloader)
+                self.cpu.setReg(15, 0x100001C8);
+                return 1;
+            }
         }
         // Trace when PC is in the checksum loop
         if (pc == 0x4000061C) {

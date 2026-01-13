@@ -196,6 +196,11 @@ pub const MemoryBus = struct {
     /// Track reads where attr byte (offset 0x0B) == 0x0F
     debug_lfn_attr_read_count: u32,
 
+    /// Debug: track boot ROM reads at address 0
+    debug_boot_rom_addr0_read: bool,
+    debug_boot_rom_read_count: u32,
+    debug_hw_accel_read_count: u32,
+
     /// Debug: track peripheral access counts for Apple firmware analysis
     debug_timer_accesses: u32,
     debug_gpio_accesses: u32,
@@ -468,6 +473,9 @@ pub const MemoryBus = struct {
             .debug_sector_read_addrs = [_]u32{0} ** 32,
             .debug_sector_read_vals = [_]u32{0} ** 32,
             .debug_lfn_attr_read_count = 0,
+            .debug_boot_rom_addr0_read = false,
+            .debug_boot_rom_read_count = 0,
+            .debug_hw_accel_read_count = 0,
             .debug_timer_accesses = 0,
             .debug_gpio_accesses = 0,
             .debug_i2c_accesses = 0,
@@ -735,6 +743,11 @@ pub const MemoryBus = struct {
 
     /// Write 32-bit value
     pub fn write32(self: *Self, addr: u32, value: u32) void {
+        // Debug: track writes containing boot ROM value (disabled)
+        // if (value == 0xE59FF018) {
+        //     std.debug.print("WRITE BOOT_ROM_VAL: addr=0x{X:0>8} value=0xE59FF018\n", .{addr});
+        // }
+
         // Translate Apple firmware encoded addresses (0x04xxxxxx → 0x10xxxxxx)
         const translated_addr = translateAddress(addr);
         const region = getRegion(translated_addr);
@@ -898,8 +911,18 @@ pub const MemoryBus = struct {
     }
 
     // Flash controller read/write (stores return address for boot ROM)
+    // NOTE: Rockbox firmware calls 0xF000F000 directly (BX to this address)
+    // expecting it to be executable code. We return "BX LR" instructions
+    // at the base addresses to act as a simple return stub.
     fn readFlashCtrl(self: *const Self, addr: u32) u32 {
         const offset = (addr - FLASH_CTRL_START) >> 2;
+
+        // Return "BX LR" (0xE12FFF1E) at offset 0 and 4 to act as return stubs
+        // when firmware tries to execute code at 0xF000F000
+        if (offset == 0 or offset == 1) {
+            return 0xE12FFF1E; // BX LR - return to caller
+        }
+
         if (offset < 64) {
             return self.flash_ctrl_regs[offset];
         }
@@ -1191,8 +1214,14 @@ pub const MemoryBus = struct {
         }
     }
 
-    fn readRom(self: *const Self, addr: u32) u32 {
+    fn readRom(self: *Self, addr: u32) u32 {
         const offset = addr - ROM_START;
+
+        // Debug: track boot ROM reads at address 0
+        if (addr == 0x00000000) {
+            self.debug_boot_rom_addr0_read = true;
+            self.debug_boot_rom_read_count += 1;
+        }
 
         // Check if this word was written by firmware (low memory RAM overlay)
         if (offset + 3 < 1024) {
@@ -1416,7 +1445,17 @@ pub const MemoryBus = struct {
                 0x24 => 0xFFFFFFFF, // DEV_INIT2+4
                 // Rockbox scheduler polls this register for bit 7 (0x80) to wake up
                 // Set bit 7 when button_event_pending to wake the scheduler
-                0x28 => if (self.button_event_pending) @as(u32, 0x80) else @as(u32, 0x00),
+                0x28 => blk: {
+                    const result = if (self.button_event_pending) @as(u32, 0x80) else @as(u32, 0x00);
+                    // Debug: trace this read
+                    if (self.debug_hw_accel_read_count < 5) {
+                        self.debug_hw_accel_read_count += 1;
+                        std.debug.print("DEV_INIT_0x28 READ: button_event_pending={} returning=0x{X:0>2}\n", .{
+                            self.button_event_pending, result,
+                        });
+                    }
+                    break :blk result;
+                },
                 0x30 => 0x80000000, // Unknown status register - bit 31 = ready
                 0x34 => 0x00000000, // DEV_TIMING1
                 0x38 => 0x00000000, // XMB_NOR_CFG
