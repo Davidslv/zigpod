@@ -145,14 +145,39 @@ xxd ipod_proper.img | head -50
 
 ---
 
+## CRITICAL: Documentation Requirements
+
+### Primary Documents
+
+| Document | Purpose | When to Use |
+|----------|---------|-------------|
+| **This file (MASTER_PLAN.md)** | High-level plan and progress | Read first, update when phases complete |
+| **[RE_JOURNAL.md](reverse-engineering/RE_JOURNAL.md)** | Detailed technical findings | Read for context, update with ALL discoveries |
+
+### RE_JOURNAL.md is the Knowledge Base
+
+**EVERY agent MUST**:
+1. **READ** `docs/reverse-engineering/RE_JOURNAL.md` before starting work
+2. **UPDATE** it with any new technical discoveries (addresses, register values, behaviors)
+3. **CHECK** it before investigating something - it may already be documented
+
+The journal contains:
+- Proven facts about hardware registers
+- Memory map details
+- Boot sequence analysis
+- Previous debugging sessions and their findings
+
+---
+
 ## RULES FOR ALL AGENTS
 
 1. **Read this plan first** before doing any work
-2. **Do not re-verify working components** - trust the table above
-3. **Focus on the blocking issue** - don't get sidetracked
-4. **Document findings** in RE_JOURNAL.md with dates
-5. **Commit often** with clear messages
-6. **Update this plan** when phases complete or new blockers found
+2. **Read RE_JOURNAL.md** for detailed technical context
+3. **Do not re-verify working components** - trust the documentation
+4. **Focus on the blocking issue** - don't get sidetracked
+5. **Document ALL findings** in RE_JOURNAL.md with dates
+6. **Commit often** with clear messages
+7. **Update this plan** when phases complete or new blockers found
 
 ---
 
