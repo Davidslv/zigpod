@@ -645,14 +645,69 @@ pub const Emulator = struct {
         if (pc == 0x10000000 and self.cpu.getReg(14) == 0x400000AC and self.total_cycles > 10_000_000) {
             self.rockbox_restart_count += 1;
             std.debug.print("COP_SYNC: Entry at 0x10000000, restart_count={} cycle={}\n", .{ self.rockbox_restart_count, self.total_cycles });
-            if (self.rockbox_restart_count > 1) {
-                // This is a restart - Rockbox has already run through once
-                // Skip ALL the CPU/COP sync code by jumping directly to 0x10000400
-                // (far past all the COP polling loops)
-                std.debug.print("COP_SYNC: Skipping directly to 0x10000400\n", .{});
-                self.cpu.setReg(15, 0x10000400);
-                return 1;
+            // Don't skip on restart - let it run through normally but skip COP polling loops below
+        }
+
+        // Trace PROC_ID check at 0x10000110-0x10000118
+        if (pc == 0x10000110) {
+            std.debug.print("PROC_ID_CHECK: R0=0x{X:0>8} (0x55=CPU, 0xAA=COP)\n", .{self.cpu.getReg(0)});
+        }
+        if (pc == 0x10000118) {
+            const path_name: []const u8 = if (self.cpu.getReg(0) == 0x55) "CPU" else "COP";
+            std.debug.print("PROC_ID_BRANCH: Taking {s} path\n", .{path_name});
+        }
+
+        // Skip the IRAM remapping jump at 0x100001AC
+        // The MOV PC, #0x40000000 jumps to remapping code which returns to bootloader
+        // Since we don't need memory remapping in emulation, skip to 0x100001B0
+        if (pc == 0x100001AC and self.rockbox_restart_count > 0) {
+            std.debug.print("SKIP_IRAM_REMAP: Skipping MOV PC,#0x40000000 to continue at 0x100001B0\n", .{});
+            self.cpu.setReg(15, 0x100001B0);
+            return 1;
+        }
+
+        // Fix BX R1 at 0x100001BC - R1 contains post-remap address 0x000001C4
+        // Without memory remapping, we need to jump to SDRAM address 0x100001C4 instead
+        if (pc == 0x100001BC) {
+            const r1 = self.cpu.getReg(1);
+            if (r1 == 0x000001C4) {
+                std.debug.print("FIX_BX_R1: Fixing jump from 0x000001C4 to 0x100001C4\n", .{});
+                self.cpu.setReg(1, 0x100001C4);
             }
+        }
+
+        // Skip second COP polling loop at 0x100001EC (after remapping)
+        // Loop: LDR R3,[R4] / TST R3,#0x80000000 / BEQ (loop)
+        if (pc == 0x100001EC) {
+            std.debug.print("SKIP_COP_POLL_2: Skipping second COP polling loop\n", .{});
+            self.cpu.setReg(15, 0x100001F8);
+            return 1;
+        }
+
+        // Trace jump at 0x100002D4 - LDR PC, [PC, #204]
+        // This should jump to main() but the address at 0x100003A8 is wrong (0x03E804DC)
+        // Skip this complex crt0 and directly call a known safe continuation
+        if (pc == 0x100002D4) {
+            const jump_target = self.bus.read32(0x100003A8);
+            std.debug.print("MAIN_JUMP: At 0x100002D4, target from mem = 0x{X:0>8}\n", .{jump_target});
+            // The startup code is too complex with invalid addresses.
+            // For now, let's just report the issue and continue to bootloader.
+        }
+
+        // COP polling loop at 0x10000148 - CPU waits for COP to sleep
+        // The loop is: LDR R1,[R2] / TST R1,#0x80000000 / BEQ (loop)
+        // We need bit 31 set in COP_STATUS for the loop to exit
+        if (pc == 0x10000148) {
+            // Note: 0x1004 is the offset from sys_ctrl base 0x60006000 for COP_CTL at 0x60007004
+            const cop_status = self.sys_ctrl.read(0x1004);
+            std.debug.print("COP_POLL_LOOP: Reading COP_STATUS=0x{X:0>8}, bit31={}\n", .{
+                cop_status, (cop_status & 0x80000000) != 0,
+            });
+            // Skip the loop by jumping to the instruction after the BEQ at 0x10000150
+            // The BEQ is at 0x10000150, so the exit is at 0x10000154
+            std.debug.print("COP_POLL_LOOP: Skipping to 0x10000154\n", .{});
+            self.cpu.setReg(15, 0x10000154);
+            return 1;
         }
         // COP SYNC FIX #2: After the first sync skip, Rockbox has many COP polling loops
         // that read COP_CTL (0x60007004) in a tight loop waiting for COP to signal ready.

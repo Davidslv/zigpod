@@ -835,6 +835,83 @@ Rockbox loaded.
 
 ---
 
+### 2026-01-13: Rockbox Startup Code Deep Dive
+
+**Goal**: Understand why Rockbox doesn't render to LCD after loading
+
+**Problem**: After "Rockbox loaded.", the firmware executes but produces 0 LCD pixel writes and eventually returns to the bootloader.
+
+**Investigation Findings**:
+
+1. **Complex Multi-Stage Startup**
+
+   Rockbox crt0-pp.S has extensive CPU/COP synchronization code with multiple stages:
+   - 0x10000148: First COP polling loop (waiting for COP to sleep)
+   - 0x100001AC: Jump to IRAM for memory remapping
+   - 0x100001BC: BX R1 with post-remap address
+   - 0x100001EC: Second COP polling loop
+   - 0x10000288-0x10000290: BSS clear loop (11+ million cycles)
+   - 0x100002D4: Jump to main() via pointer at 0x100003A8
+
+2. **COP Polling Loops**
+
+   We successfully skip these by detecting the loop PC and jumping past:
+   ```zig
+   if (pc == 0x10000148) { self.cpu.setReg(15, 0x10000154); return 1; }
+   if (pc == 0x100001EC) { self.cpu.setReg(15, 0x100001F8); return 1; }
+   ```
+
+3. **Memory Remapping Issue**
+
+   At 0x100001AC, the code jumps to IRAM (0x40000000) to perform memory remapping:
+   ```asm
+   mov pc, #0x40000000  ; Jump to remapping code in IRAM
+   ```
+
+   The IRAM code uses LR (0x400000AC) which is the bootloader, causing restarts.
+   We skip this jump but then face another issue:
+
+4. **Post-Remap Address Problem**
+
+   At 0x100001BC, `BX R1` where R1 = 0x000001C4 (a post-remap low address).
+   Without actual remapping, this is invalid. We fix it:
+   ```zig
+   if (pc == 0x100001BC && r1 == 0x000001C4) {
+       self.cpu.setReg(1, 0x100001C4);  // Fix to SDRAM address
+   }
+   ```
+
+5. **Invalid main() Address**
+
+   At 0x100002D4, the code does `LDR PC, [0x100003A8]` to jump to main().
+   The value at 0x100003A8 is **0x03E804DC** which is invalid:
+   - Not in SDRAM range (0x10000000-0x12000000)
+   - Not in IRAM range (0x40000000)
+   - ~65MB offset, larger than 750KB binary
+
+   This appears to be a linker-generated address that assumes memory remapping occurred.
+
+**Current Status**:
+
+The Rockbox startup is deeply tied to PP5021C memory remapping:
+- SDRAM at 0x10000000 gets remapped after init
+- Constant pool addresses assume post-remap layout
+- Without actual remapping, addresses like 0x03E804DC don't resolve correctly
+
+**Fixes Applied** (partial, startup still fails):
+- Skip first COP poll at 0x10000148
+- Skip IRAM remapping jump at 0x100001AC
+- Fix post-remap BX at 0x100001BC (0x000001C4 → 0x100001C4)
+- Skip second COP poll at 0x100001EC
+
+**Next Steps**:
+1. Investigate PP5021C memory remapping mechanism (MMAP registers)
+2. Potentially emulate memory remapping effects
+3. Or find alternative entry point bypassing crt0 complexity
+4. Consider running Rockbox bootloader UI only (which works) until main firmware issues resolved
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis
