@@ -9,6 +9,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2025-01-12 | [APPLE_FIRMWARE_ANALYSIS.md](APPLE_FIRMWARE_ANALYSIS.md) | Complete | Initial firmware analysis, entry point, RTOS discovery |
 | 2025-01-12 | [COP_IMPLEMENTATION_PLAN.md](COP_IMPLEMENTATION_PLAN.md) | Complete | Coprocessor implementation |
 | 2025-01-12 | [RTOS_SCHEDULER_INVESTIGATION.md](RTOS_SCHEDULER_INVESTIGATION.md) | In Progress | Breaking out of scheduler loop |
+| 2026-01-13 | See below | **SUCCESS** | Rockbox bootloader LCD output working! |
 
 ---
 
@@ -92,6 +93,69 @@ SHORT_ENTRY READ at 0x11006F74
 - `core.zig`: Disabled IRQ kickstart (crashes without proper handlers)
 
 **Commits**: To be committed
+
+---
+
+### 2026-01-13: Rockbox Bootloader Success - LCD Output Working!
+
+**Goal**: Get visual output on LCD by trying alternative firmware
+
+**Background**: Apple firmware stuck in RTOS scheduler loop. Decided to try Rockbox as alternative.
+
+**Key Achievements**:
+
+1. **Downloaded Correct Rockbox Firmware**
+   - Initial download was for iPod 6G Classic (S5L8702) - wrong architecture!
+   - Correct firmware: `rockbox-ipodvideo.zip` and `bootloader-ipodvideo.ipod`
+   - Target: iPod Video 5th Gen (PP5021C) - matches our emulator
+
+2. **Bootloader Structure Discovered**
+   - Header: 8 bytes (checksum + "ipvd" signature)
+   - Self-relocating: copies itself from SDRAM (0x10000000) to IRAM (0x40000000)
+   - PROC_ID check at 0x60000000 (0x55=CPU, 0xAA=COP)
+   - BSS clear: 0x11000000 to 0x110481B0
+   - Stack setup: SP = 0x4000EB14, canary = 0xDEADBEEF
+
+3. **LCD OUTPUT WORKING!**
+   - 76800 pixel writes (320x240 = full screen)
+   - Rockbox bootloader displays:
+     - "Rockbox boot loader"
+     - Version info
+     - "No Rockbox detected" (because file parsing not complete)
+   - PPM framebuffer saved to `/tmp/zigpod_lcd.ppm`
+
+4. **ATA Working**
+   - MBR detected: 0xAA55 signature
+   - FAT32 partition recognized
+   - Reads: MBR, boot sector, FSInfo, root directory
+   - Total ATA commands: ~10, all successful
+
+5. **FAT32 Disk Images Created**
+   - `rockbox_disk.img` - 64MB FAT32 with MBR partition
+   - Contains `.rockbox/rockbox.ipod` and `/rockbox.ipod`
+   - Verified with mtools (mformat, mcopy, mdir)
+
+**Current Issue**:
+- Bootloader reads directory but shows "No Rockbox detected"
+- Reads LBA 0, 2048, 2049, 4098, 4099 then stops
+- File exists at correct location but parsing fails
+- May be due to how emulator returns ATA data or directory parsing
+
+**Files Added**:
+- `firmware/rockbox/` - Rockbox firmware directory
+  - `bootloader-ipodvideo.ipod` - Raw bootloader
+  - `bootloader-ipodvideo.bin` - Stripped ARM binary (no header)
+  - `rockbox-ipodvideo.zip` - Full Rockbox package
+  - `rockbox_disk.img` - 64MB FAT32 disk image
+  - `ipodvideo/.rockbox/` - Extracted Rockbox files
+
+**Timer Access**: 44,758 reads - Rockbox actively using timers!
+**GPIO Access**: 17 reads
+
+**Next Steps**:
+1. Debug ATA data return to ensure correct sector content
+2. Trace bootloader's file search logic
+3. Fix file detection to load full Rockbox firmware
 
 ---
 
