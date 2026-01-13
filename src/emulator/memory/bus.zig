@@ -1512,6 +1512,102 @@ pub const MemoryBus = struct {
         }
     }
 
+    /// Initialize FAT32 directory entries in disk buffer
+    /// The firmware reads directory entries from 0x11006F14+ looking for iPod_Control
+    /// Pre-populate this buffer with valid FAT32 entries to satisfy the firmware.
+    pub fn initFat32DiskBuffer(self: *Self) void {
+        // Buffer starts at 0x11006F14 (SDRAM offset 0x1006F14)
+        const buffer_base: u32 = 0x1006F14;
+
+        // FAT32 directory entry structure (32 bytes each):
+        // [0-10]: Name (8.3 format)
+        // [11]:   Attributes (0x10=dir, 0x08=volume, 0x0F=LFN)
+        // [12-13]: Reserved
+        // [14-15]: Creation time
+        // [16-17]: Creation date
+        // [18-19]: Last access date
+        // [20-21]: First cluster high
+        // [22-23]: Write time
+        // [24-25]: Write date
+        // [26-27]: First cluster low
+        // [28-31]: File size
+
+        // Entry 0 at 0x11006F14: "." (current directory)
+        const dot_entry = [32]u8{
+            '.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', // Name "."
+            0x10, // Directory
+            0x00, 0x00, // Reserved
+            0x00, 0x00, // Create time
+            0x00, 0x00, // Create date
+            0x00, 0x00, // Access date
+            0x00, 0x00, // Cluster high
+            0x00, 0x00, // Write time
+            0x00, 0x00, // Write date
+            0x02, 0x00, // Cluster low (2 = root)
+            0x00, 0x00, 0x00, 0x00, // Size
+        };
+
+        // Entry 1 at 0x11006F34: ".." (parent directory)
+        const dotdot_entry = [32]u8{
+            '.', '.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', // Name ".."
+            0x10, // Directory
+            0x00, 0x00, // Reserved
+            0x00, 0x00, // Create time
+            0x00, 0x00, // Create date
+            0x00, 0x00, // Access date
+            0x00, 0x00, // Cluster high
+            0x00, 0x00, // Write time
+            0x00, 0x00, // Write date
+            0x00, 0x00, // Cluster low (0 = root's parent)
+            0x00, 0x00, 0x00, 0x00, // Size
+        };
+
+        // Entry 2 at 0x11006F54: LFN entry for "iPod_Control" (part 1)
+        // LFN entries have attr=0x0F and store Unicode characters
+        const lfn_entry = [32]u8{
+            0x41, // Sequence (0x40 | 1 = first and last LFN entry)
+            'i', 0x00, 'P', 0x00, 'o', 0x00, 'd', 0x00, '_', 0x00, // First 5 chars Unicode
+            0x0F, // LFN attribute
+            0x00, // Type
+            0xA9, // Checksum (for IPOD_C~1)
+            'C', 0x00, 'o', 0x00, 'n', 0x00, 't', 0x00, 'r', 0x00, 'o', 0x00, // Next 6 chars
+            0x00, 0x00, // Cluster (always 0 for LFN)
+            'l', 0x00, 0xFF, 0xFF, // Last 2 chars + padding
+        };
+
+        // Entry 3 at 0x11006F74: Short name entry "IPOD_C~1"
+        const short_entry = [32]u8{
+            'I', 'P', 'O', 'D', '_', 'C', '~', '1', ' ', ' ', ' ', // Name IPOD_C~1
+            0x10, // Directory
+            0x00, 0x00, // Reserved
+            0x00, 0x00, // Create time
+            0x00, 0x00, // Create date
+            0x00, 0x00, // Access date
+            0x00, 0x00, // Cluster high
+            0x00, 0x00, // Write time
+            0x00, 0x00, // Write date
+            0x03, 0x00, // Cluster low (3)
+            0x00, 0x00, 0x00, 0x00, // Size
+        };
+
+        // Entry 4 at 0x11006F94: End marker (first byte 0x00)
+        const end_entry = [_]u8{0} ** 32;
+
+        // Write entries to SDRAM
+        const entries = [_]*const [32]u8{ &dot_entry, &dotdot_entry, &lfn_entry, &short_entry, &end_entry };
+
+        var entry_offset: u32 = 0;
+        for (entries) |entry| {
+            const dst = buffer_base + entry_offset;
+            if (dst + 32 <= self.sdram.len) {
+                @memcpy(self.sdram[dst .. dst + 32], entry);
+            }
+            entry_offset += 0x20; // 32 bytes per entry
+        }
+
+        std.debug.print("FAT32 DISK BUFFER: Initialized {} directory entries at 0x{X:0>8}\n", .{ entries.len, buffer_base + SDRAM_START });
+    }
+
     /// Debug: Get region name for address
     pub fn getRegionName(addr: u32) []const u8 {
         return switch (getRegion(addr)) {

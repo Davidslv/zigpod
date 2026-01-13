@@ -274,6 +274,10 @@ pub fn main() !void {
         // Copy SWI handler and other code from firmware to IRAM
         // This is what real Boot ROM does before jumping to firmware entry point
         emu.bus.initAppleFirmwareIram();
+
+        // Initialize FAT32 disk buffer with iPod_Control directory
+        // The firmware scans for this directory during boot
+        emu.bus.initFat32DiskBuffer();
     }
     defer if (sdram_firmware) |fw| allocator.free(fw);
 
