@@ -812,9 +812,10 @@ pub const Emulator = struct {
             // Detected loop start addresses (found empirically):
             // 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8
             // 0x10000320 (additional loop found after 0x10000300)
+            // IMPORTANT: 0x2C8 is BSS clear loop, NOT COP poll! It must exit to 0x2D4 (jump to main)
+            // Previous bug: 0x2C8 → 0x2DC skipped PAST the main() jump at 0x2D4!
             const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8, 0x100002DC, 0x10000320 };
-            // Note: 0x100002C8 loop exits to 0x100002DC, and 0x100002DC is ANOTHER loop that exits to 0x100002E8
-            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002DC, 0x100002E8, 0x1000032C };
+            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002D4, 0x100002E8, 0x1000032C };
             for (loop_starts, 0..) |start, i| {
                 if (effective_pc == start) {
                     // Exit to remapped address if MMAP is enabled, otherwise to direct address
