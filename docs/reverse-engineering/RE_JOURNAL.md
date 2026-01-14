@@ -2113,8 +2113,23 @@ REG_CPU_CTL => {
 
 **Remaining Issues**:
 - No LCD output yet (LCD2 bridge not accessed)
-- No ATA disk I/O yet (0xC3xxxxxx registers not accessed)
-- May need more emulation cycles or additional initialization fixes
+- Kernel running but stuck in scheduler loop
+- May need additional initialization fixes
+
+**Update (same day)**: Further testing with longer runs shows:
+- **1530 ATA sector reads** - disk I/O working!
+- **Bootloader successfully reads rockbox.ipod** from FAT filesystem
+- **Checksum verified**: "Checksum: 4D7ABD6" displayed (0x04D7ABD6 = correct)
+- **Kernel main() reached**: PC=0x03E804DC with correct instruction 0xE92D4880
+- **Timer IRQs firing**: IRQ handler at 0x0007C528 being called repeatedly
+- **298 scheduler iterations** (CPU_CTL auto-wakes)
+
+The full boot sequence is now working:
+```
+Bootloader -> FAT filesystem -> rockbox.ipod -> checksum verify -> crt0 copy -> main()
+```
+
+Still no LCD because kernel is stuck in scheduler waiting for something.
 
 **Files Changed**:
 - `src/emulator/peripherals/system_ctrl.zig`: Added CPU_CTL auto-wake logic
