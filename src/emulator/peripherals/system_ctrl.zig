@@ -344,25 +344,30 @@ pub const SystemController = struct {
                 const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
 
                 // Context-aware COP_CTL responses:
-                // 1. Boot ROM at 0x140: polls waiting for COP SLEEPING (bit 31 = 1)
-                // 2. Kernel wake_core: loops until COP AWAKE (bit 31 = 0)
                 //
-                // Strategy: Use read count and wake_count to determine phase:
-                // - Before any wake writes (cop_wake_count == 0): Return SLEEPING
-                //   (Boot ROM expects COP to have completed init and be sleeping)
-                // - After wake writes (cop_wake_count > 0): Return AWAKE
-                //   (Kernel wake_core expects COP to respond)
+                // CRT0 startup: COP is expected to complete init and go to sleep
+                // - Returns SLEEPING (bit 31 = 1) after brief AWAKE period
+                //
+                // Kernel operation: COP is expected to be awake and responsive
+                // - After kernel_init_complete, return AWAKE (bit 31 = 0)
+                //
+                // The transition happens when kernel enables Timer1 (detected externally)
                 var result: u32 = ready_flags;
                 var sleep_state: []const u8 = "SLEEPING";
 
-                if (self.cop_wake_count == 0) {
-                    // Boot ROM phase: COP has "completed init" and is sleeping
-                    result = ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
-                    sleep_state = "SLEEPING";
-                } else {
-                    // Kernel phase: COP "responds" to wake request immediately
+                if (self.kernel_init_complete) {
+                    // Kernel phase: COP should appear awake and responsive
                     result = ready_flags; // bit 31 = 0 (awake)
                     sleep_state = "AWAKE";
+                } else if (self.cop_wake_ack_countdown > 0) {
+                    // COP is "busy" processing wake request during startup
+                    self.cop_wake_ack_countdown -= 1;
+                    result = ready_flags; // bit 31 = 0 (awake/busy)
+                    sleep_state = "AWAKE";
+                } else {
+                    // CRT0 startup: COP has "finished" and is sleeping
+                    result = ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+                    sleep_state = "SLEEPING";
                 }
 
                 // Debug: trace ALL COP_CTL reads during initial investigation

@@ -164,6 +164,15 @@ pub const Emulator = struct {
     /// Flag: Timer1 enabled by emulator to fix kernel initialization
     timer1_enabled_by_emulator: bool,
 
+    /// Flag: main() has been entered (for tracing)
+    main_entered: bool,
+
+    /// Counter for main() trace (first N instructions)
+    main_trace_count: u32,
+
+    /// Flag: .init copy loop has started
+    init_copy_started: bool,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -238,6 +247,9 @@ pub const Emulator = struct {
             .cop_wake_skip_count = 0,
             .wake_loop_iterations = 0,
             .timer1_enabled_by_emulator = false,
+            .main_entered = false,
+            .main_trace_count = 0,
+            .init_copy_started = false,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -718,12 +730,12 @@ pub const Emulator = struct {
 
             // Manually configure MMAP to map 0x00000000+ to SDRAM 0x10000000+
             // This is what the IRAM remapping code would do:
-            // - MMAP0_LOGICAL = 0x00003E00 (32MB mask) or 0x00003C00 (64MB)
-            // - MMAP0_PHYSICAL = 0x00000F84 (permissions: read/write/data/code)
-            self.bus.mmap_logical[0] = 0x00003E00;
-            self.bus.mmap_physical[0] = 0x00000F84;
+            // - MMAP0_LOGICAL = 0x00003C00 (64MB mask) - required for .init at 0x03E8xxxx
+            // - MMAP0_PHYSICAL = 0x10000F84 (base 0x10000000 + permissions: read/write/data/code)
+            self.bus.mmap_logical[0] = 0x00003C00; // 64MB mask (0x03FFFFFF)
+            self.bus.mmap_physical[0] = 0x10000F84; // SDRAM base + permissions
             self.bus.mmap_enabled = true;
-            std.debug.print("MMAP: Manually configured - 0x00000000-0x00FFFFFF -> 0x10000000 (SDRAM)\n", .{});
+            std.debug.print("MMAP: Manually configured - 0x00000000-0x03FFFFFF -> 0x10000000 (64MB SDRAM)\n", .{});
 
             self.cpu.setReg(15, 0x100001B0);
             return 1;
@@ -781,49 +793,45 @@ pub const Emulator = struct {
         // COP SYNC FIX #2: After the first sync skip, Rockbox has many COP polling loops
         // that read COP_CTL (0x60007004) in a tight loop waiting for COP to signal ready.
         // Detect the pattern and skip each loop.
-        // When MMAP is enabled, PC can be in several ranges:
-        // - 0x00000xxx-0x00FFFFxx: maps to 0x10000xxx (remapped SDRAM)
-        // - 0x03E8xxxx-0x03EFxxxx: maps to 0x100xxxxx (Rockbox trampolines)
-        // - 0x08000xxx-0x0Bxxxxxxx: maps to 0x10000xxx (Rockbox code linked at 0x08000000)
-        // - 0x10000xxx: direct SDRAM access
+        // When MMAP is enabled, virtual addresses 0x00000000-0x03FFFFFF are remapped to
+        // physical SDRAM at 0x10000000-0x13FFFFFF. Translation is simple: phys = virt + 0x10000000
         var effective_pc: u32 = pc;
         if (self.bus.mmap_enabled) {
-            if (pc < 0x01000000) {
+            // If PC is in the mapped virtual range (0-64MB), translate to physical SDRAM
+            if (pc < 0x04000000) {
                 effective_pc = pc + 0x10000000;
-            } else if (pc >= 0x03E80000 and pc < 0x04000000) {
-                effective_pc = (pc - 0x03E80000) + 0x10000000;
-            } else if (pc >= 0x08000000 and pc < 0x10000000) {
-                // Rockbox is linked to run at 0x08000000, maps to SDRAM 0x10000000
-                effective_pc = (pc - 0x08000000) + 0x10000000;
             }
         }
 
-        // COP polling loop at 0x1F4 (post-MMAP) - waits for bit 31 = 1 (sleeping)
-        // RE-ENABLED: Multiple loop types exist, need to skip all
-        if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled and effective_pc == 0x100001F4) {
-            const exit_addr: u32 = if (pc < 0x01000000) 0x200 else 0x10000200;
-            std.debug.print("COP_POLL_SKIP_1F4: PC=0x{X:0>8} -> exit 0x{X:0>8}\n", .{ pc, exit_addr });
-            self.cpu.setReg(15, exit_addr);
-            return 1;
-        }
+        // COP polling loops at 0x140-0x148 and 0x1EC-0x1F4 are handled by
+        // COP_CTL read returning SLEEPING (bit 31 = 1) which breaks the loop naturally.
+        // No explicit skip needed here anymore.
 
-        // RE-ENABLED: Some loops expect AWAKE, some expect SLEEPING - can't satisfy all
-        if (self.rockbox_restart_count >= 1 and effective_pc >= 0x10000200 and effective_pc < 0x10000400) {
-            // Detected loop start addresses (found empirically):
-            // 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8
-            // 0x10000320 (additional loop found after 0x10000300)
-            // IMPORTANT: 0x2C8 is BSS clear loop, NOT COP poll! It must exit to 0x2D4 (jump to main)
-            // Previous bug: 0x2C8 → 0x2DC skipped PAST the main() jump at 0x2D4!
-            const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8, 0x100002DC, 0x10000320 };
-            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002D4, 0x100002E8, 0x1000032C };
-            for (loop_starts, 0..) |start, i| {
-                if (effective_pc == start) {
-                    // Exit to remapped address if MMAP is enabled, otherwise to direct address
-                    const exit_addr = if (self.bus.mmap_enabled and pc < 0x01000000) loop_exits[i] - 0x10000000 else loop_exits[i];
-                    std.debug.print("COP_POLL_SKIP: PC=0x{X:0>8} -> exit 0x{X:0>8}\n", .{ pc, exit_addr });
-                    self.cpu.setReg(15, exit_addr);
-                    return 1;
-                }
+        // COP polling loops in Rockbox crt0 that read COP_CTL (0x60007004)
+        // These loops wait for COP to signal ready, which never happens in single-core emulation
+        // IMPORTANT: Only skip ACTUAL COP_CTL polling loops, not data copy/BSS loops!
+        //
+        // Actual COP polling loops (identified by TST instruction on COP_CTL read):
+        // - 0x140-0x148: First COP sync (boot ROM wait for COP sleeping)
+        // - 0x1EC-0x1F4: Second COP sync (kernel wait for COP ready)
+        //
+        // NOT COP loops (these are data copy/init loops - DO NOT SKIP):
+        // - 0x188-0x194: Copy MMAP setup code to IRAM
+        // - 0x204-0x210: Copy to IRAM (iram content)
+        // - 0x220-0x22C: Copy to IRAM (more content)
+        // - 0x23C-0x248: .init section copy (main() and other INIT_ATTR code!)
+        // - 0x258-0x260, 0x270-0x278: BSS zeroing
+        // - 0x288-0x290, 0x2C8-0x2D0: Stack filling
+        //
+        // We skip the first COP poll at 0x140-0x148 by returning SLEEPING from COP_CTL read
+        // The second at 0x1EC-0x1F4 also uses COP_CTL read result
+
+        // Trace CRT0 progress to verify init loops are running
+        if (effective_pc >= 0x10000180 and effective_pc < 0x10000260 and self.total_cycles < 200000) {
+            if (self.total_cycles % 1000 == 0) {
+                std.debug.print("CRT0_LOOP: PC=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8} R4=0x{X:0>8} R5=0x{X:0>8}\n", .{
+                    pc, self.cpu.getReg(2), self.cpu.getReg(3), self.cpu.getReg(4), self.cpu.getReg(5),
+                });
             }
         }
 
@@ -980,6 +988,162 @@ pub const Emulator = struct {
                 });
             }
         }
+
+        // TRACE the stack fill loop at 0x2C8-0x2D0 to debug why it's stuck
+        if ((effective_pc == 0x100002C8 or effective_pc == 0x100002D0 or pc == 0x2C8 or pc == 0x2D0) and self.total_cycles > 1000000) {
+            const sp = self.cpu.getReg(13);
+            const r2 = self.cpu.getReg(2);
+            const r4 = self.cpu.getReg(4);
+            if (self.total_cycles % 100000 < 10) { // Print first 10 of every 100k cycles
+                std.debug.print("STACK_FILL_LOOP: PC=0x{X:0>8} SP=0x{X:0>8} R2=0x{X:0>8} R4=0x{X:0>8}\n", .{
+                    pc, sp, r2, r4,
+                });
+            }
+        }
+
+        // TRACE the jump-to-main instruction at 0x2D4
+        if (effective_pc == 0x100002D4 or pc == 0x2D4) {
+            // This instruction is: ldr pc, [pc, #204] which loads from 0x3A8
+            const load_addr = 0x100003A8; // PC+8+204 = 0x2DC+0xCC = 0x3A8, with MMAP prefix
+            const main_addr = self.bus.read32(load_addr);
+            std.debug.print("JUMP_TO_MAIN: PC=0x{X:0>8} loading from 0x{X:0>8} = 0x{X:0>8}\n", .{
+                pc, load_addr, main_addr,
+            });
+        }
+
+        // ROCKBOX BINARY FIX: The rockbox_raw.bin has a 3KB zero gap (0x420-0x101F) where
+        // main() at 0x4DC should be. The crt0 startup jumps to 0x03E804DC (SDRAM 0x100004DC)
+        // but that address contains zeros. Execution would slide through zeros until hitting
+        // code at 0x10001020, but with garbage register values.
+        //
+        // NOTE: The "zero gap" issue was caused by incorrect MMAP translation.
+        // With correct MMAP: virtual 0x03E804DC -> physical 0x13E804DC (in SDRAM at ~65MB offset)
+        // The .init section is copied from _initcopy (~0xAB3CC) to _initstart (0x03E80000 virtual)
+        // So main() should be at physical 0x13E804DC after the copy.
+        // This workaround should no longer be needed, but keep it for debugging.
+        if (self.rockbox_restart_count >= 1 and effective_pc >= 0x10000420 and effective_pc < 0x10001020) {
+            const instr = self.bus.read32(effective_pc);
+            if (instr == 0x00000000) {
+                std.debug.print("ROCKBOX_ZERO_GAP: PC=0x{X:0>8} (effective=0x{X:0>8}) is in zero region\n", .{ pc, effective_pc });
+                // Don't skip - let it continue to debug why we're here
+            }
+        }
+
+        // Trace when entering the .init copy loop
+        if (effective_pc == 0x1000023C and !self.init_copy_started) {
+            self.init_copy_started = true;
+            const main_phys: u32 = 0x13E804DC;
+            const main_val = self.bus.read32(main_phys);
+            const src_val = self.bus.read32(0x100AB8B4); // main() in source
+            std.debug.print("INIT_COPY_START: main() dst=0x{X:0>8} (val=0x{X:0>8}), src=0x{X:0>8} (val=0x{X:0>8})\n", .{
+                main_phys, main_val, @as(u32, 0x100AB8B4), src_val,
+            });
+        }
+
+        // Trace .init section copy loop (crt0 lines 240-248)
+        // Source: _initcopy (literal at ~0x378) ~= 0x000AB3CC -> physical 0x100AB3CC
+        // Dest: _initstart (literal at ~0x370) ~= 0x03E80000 -> physical 0x13E80000
+        // The loop is at offset ~0x230-0x240 in crt0
+        if (effective_pc >= 0x10000230 and effective_pc <= 0x10000250) {
+            const r2 = self.cpu.getReg(2); // _initstart (destination)
+            const r3 = self.cpu.getReg(3); // _initend
+            const r4 = self.cpu.getReg(4); // _initcopy (source)
+            if (self.total_cycles % 100000 == 0) {
+                std.debug.print("INIT_COPY_LOOP: PC=0x{X:0>8} R2(dst)=0x{X:0>8} R3(end)=0x{X:0>8} R4(src)=0x{X:0>8}\n", .{
+                    effective_pc, r2, r3, r4,
+                });
+            }
+            // Check if copy is done (R2 >= R3)
+            if (r2 >= r3 and !self.main_entered) {
+                const main_phys: u32 = 0x13E804DC;
+                const main_val = self.bus.read32(main_phys);
+                std.debug.print("INIT_COPY_DONE: R2=0x{X:0>8} >= R3=0x{X:0>8}, main() at 0x{X:0>8} = 0x{X:0>8}\n", .{
+                    r2, r3, main_phys, main_val,
+                });
+            }
+        }
+
+        // KERNEL INIT PATH TRACING: Track if execution reaches key functions
+        // These addresses are in the kernel init call chain:
+        // - 0x7C144: tick_start() - enables Timer1
+        // - 0x6976C, 0x697A4: callers of tick_start()
+        // - 0x69734: kernel_init caller function entry
+        // - 0x66DF8: higher level caller
+        const kernel_init_addrs = [_]u32{ 0x7C144, 0x6976C, 0x697A4, 0x69734, 0x66DF8 };
+        const kernel_init_names = [_][]const u8{ "tick_start", "tick_start_caller1", "tick_start_caller2", "kernel_init_fn", "higher_caller" };
+        for (kernel_init_addrs, 0..) |addr, i| {
+            if (effective_pc == 0x10000000 + addr or pc == addr) {
+                std.debug.print("KERNEL_PATH: Reached {s}() at 0x{X:0>8} (PC=0x{X:0>8}) LR=0x{X:0>8}\n", .{
+                    kernel_init_names[i], addr, pc, self.cpu.getReg(14),
+                });
+            }
+        }
+
+        // Also trace main() entry - loaded from 0x3A8 which contains 0x03E804DC
+        // With correct MMAP: virtual 0x03E804DC -> physical 0x13E804DC
+        // main() is in .init section which gets copied from _initcopy (~0xAB3CC) to ENDAUDIOADDR (0x03E80000)
+        if (effective_pc == 0x13E804DC or pc == 0x03E804DC) {
+            const instr = self.bus.read32(effective_pc);
+            std.debug.print("KERNEL_PATH: Reached main() entry at PC=0x{X:0>8} (effective=0x{X:0>8}) instr=0x{X:0>8}\n", .{ pc, effective_pc, instr });
+        }
+
+        // Trace first 20 instructions after main() entry
+        if (self.main_entered and self.main_trace_count < 20) {
+            const instr = self.bus.read32(effective_pc);
+            std.debug.print("MAIN_TRACE[{d}]: PC=0x{X:0>8} (eff=0x{X:0>8}) instr=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.main_trace_count, pc, effective_pc, instr, self.cpu.getReg(14),
+            });
+            self.main_trace_count += 1;
+        }
+        if (effective_pc == 0x13E804DC or pc == 0x03E804DC) {
+            self.main_entered = true;
+            self.main_trace_count = 0;
+        }
+
+        // TASK SEARCH LOOP at 0x1040: Trace to understand what's happening
+        // This is where execution is stuck - searching task list
+        if (effective_pc == 0x10001040 and self.total_cycles % 500000 == 0) {
+            const r0 = self.cpu.getReg(0);
+            const r1 = self.cpu.getReg(1);
+            const r2 = self.cpu.getReg(2);
+            const r3 = self.cpu.getReg(3);
+            const r6 = self.cpu.getReg(6);
+            const lr = self.cpu.getReg(14);
+            std.debug.print("TASK_SEARCH: R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8} R6=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                r0, r1, r2, r3, r6, lr,
+            });
+        }
+
+        // Trace task search function entry at 0x1020
+        if (effective_pc == 0x10001020) {
+            const r0 = self.cpu.getReg(0);
+            const r1 = self.cpu.getReg(1);
+            const r2 = self.cpu.getReg(2);
+            const lr = self.cpu.getReg(14);
+            std.debug.print("TASK_SEARCH_ENTRY: R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                r0, r1, r2, lr,
+            });
+            // Read R1[16] to see what task array pointer is being used
+            const r1_val = r1;
+            if (r1_val < 0x40010000) { // Only read if it's a valid IRAM/ROM address
+                const task_array_ptr = self.bus.read32(r1_val + 0x10);
+                const index = self.bus.read32(r2);
+                std.debug.print("TASK_SEARCH_ENTRY: R1[16]=0x{X:0>8} *R2=0x{X:0>8}\n", .{
+                    task_array_ptr, index,
+                });
+            }
+        }
+
+        // Trace the caller setup at 0x1250 (mov r0, sl before call)
+        if (effective_pc == 0x10001250) {
+            const r4 = self.cpu.getReg(4);
+            const sl = self.cpu.getReg(10);
+            const lr = self.cpu.getReg(14);
+            std.debug.print("TASK_CALL_SETUP: R4=0x{X:0>8} SL=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                r4, sl, lr,
+            });
+        }
+
         // DELAY ACCELERATION: When in delay loop at 0x40000B1C, skip ahead
         // The delay loop structure is:
         //   0x40000B18: MOV R1, R6           ; setup (once before loop)

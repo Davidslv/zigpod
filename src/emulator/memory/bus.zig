@@ -228,6 +228,7 @@ pub const MemoryBus = struct {
     debug_int_ctrl_accesses: u32,
     debug_mailbox_accesses: u32,
     debug_dev_init_accesses: u32,
+    cop_ctl_bus_read_count: u32,
 
     /// Debug: track which device_init offsets are being accessed
     debug_dev_init_offset_counts: [32]u32, // Histogram of accesses to offsets 0x00-0x7C (32 dwords)
@@ -250,6 +251,17 @@ pub const MemoryBus = struct {
     /// Debug: count writes to loadbuffer region (0x10000000-0x100C0000)
     debug_loadbuffer_write_count: u64,
 
+    /// KERNEL INIT DETECTION: Track IRQ vector writes
+    /// When a valid handler is written to 0x40000018 (IRAM) or 0x10000018 (SDRAM),
+    /// this indicates kernel init has installed interrupt handlers
+    irq_vector_installed: bool,
+    irq_vector_value: u32,
+    irq_vector_addr: u32,
+
+    /// KERNEL INIT DETECTION: Track Timer1 enable by firmware
+    /// When firmware enables Timer1, kernel init is progressing
+    timer1_enabled_by_firmware: bool,
+
     const Self = @This();
 
     /// Boot ROM range
@@ -259,7 +271,7 @@ pub const MemoryBus = struct {
 
     /// SDRAM range
     const SDRAM_START: u32 = 0x10000000;
-    const SDRAM_END: u32 = 0x11FFFFFF; // 32MB, extends to 0x13FFFFFF for 64MB
+    const SDRAM_END: u32 = 0x13FFFFFF; // 64MB maximum (actual size set at runtime)
 
     /// LCD range
     const LCD_START: u32 = 0x30000000;
@@ -374,57 +386,48 @@ pub const MemoryBus = struct {
     }
 
     /// Apply PP5021C MMAP translation
-    /// When MMAP is enabled, addresses 0x00000000-0x00FFFFFF are remapped to SDRAM (0x10000000)
-    /// This is used by Rockbox to place exception vectors at address 0x00000000
+    /// When MMAP is enabled, virtual addresses 0x00000000-0x03FFFFFF are remapped to
+    /// physical SDRAM at 0x10000000-0x13FFFFFF.
+    ///
+    /// PP5021C MMAP format:
+    /// - LOGICAL register: size mask (0x3C00 = 64MB)
+    /// - PHYSICAL register: physical base (high 20 bits) + permission bits (bits 8-11)
+    ///
+    /// Translation: physical_addr = virtual_addr + (physical_base & 0xFFFFF000)
     fn applyMmap(self: *const Self, addr: u32) u32 {
         if (!self.mmap_enabled) {
             return addr;
         }
 
-        // Check each MMAP entry to see if it applies to this address
-        // For now, we implement a simplified version that handles Rockbox's typical use case:
-        // MMAP0 remaps 0x00000000-0x00FFFFFF to SDRAM at 0x10000000
+        // Check each MMAP entry
         for (self.mmap_logical, self.mmap_physical, 0..) |logical, physical, i| {
-            // Skip entries without permission bits
+            // Skip entries without permission bits (bits 8-11)
             if ((physical & 0x0F00) == 0) {
                 continue;
             }
 
-            // The logical register contains a mask value (e.g., 0x00003C00 or 0x00003E00)
-            // Bit 10 (0x0400) = 64MB, Bit 9 (0x0200) = 32MB granularity
-            // For simplicity, if MMAP entry 0 is configured, remap low addresses to SDRAM
+            // Extract physical base (upper bits, masked to remove permission bits)
+            const physical_base = physical & 0xFFFFF000;
 
-            if (i == 0) {
-                // MMAP0: Check if address is in low memory that should be remapped to SDRAM
-                // Rockbox uses addresses 0x00000000-0x0FFFFFFF for remapped SDRAM
-                // The firmware is linked at 0x08000000, so addresses 0x08xxxxxx need translation
-                if (addr < 0x10000000) {
-                    // For addresses like 0x03E914B4, subtract 0x03E80000 to get offset
-                    // This accounts for Rockbox's link address within SDRAM
-                    var translated: u32 = SDRAM_START + addr;
+            // The logical register contains size mask bits
+            // Bit 13 (0x2000) = 32MB, Bit 12 (0x1000) = 16MB granularity
+            // For PP5021C iPod: 0x3C00 = 64MB region (bits 12-13 set)
+            const size_mask: u32 = switch (logical & 0x3C00) {
+                0x3C00 => 0x03FFFFFF, // 64MB
+                0x3800 => 0x01FFFFFF, // 32MB
+                0x3000 => 0x00FFFFFF, // 16MB
+                else => 0x03FFFFFF,   // Default to 64MB
+            };
 
-                    // Handle Rockbox's trampolines at 0x03E8xxxx-0x03EFxxxx
-                    // These are linked at (SDRAM_START - 0x10000000 + 0x03E80000) = 0x03E80000
-                    // Actual physical address = addr - 0x03E80000 + 0x10000000
-                    if (addr >= 0x03E80000 and addr < 0x04000000) {
-                        translated = (addr - 0x03E80000) + SDRAM_START;
-                    }
+            _ = i; // Entry index for debugging
 
-                    // Handle Rockbox's main code linked at 0x08000000
-                    // Rockbox is linked to run at 0x08000000, maps to SDRAM 0x10000000
-                    if (addr >= 0x08000000 and addr < 0x10000000) {
-                        translated = (addr - 0x08000000) + SDRAM_START;
-                    }
-
-                    // Only log first few translations to avoid spam
-                    if (self.debug_sdram_data_read_count < 5) {
-                        std.debug.print("MMAP: 0x{X:0>8} -> 0x{X:0>8} (SDRAM)\n", .{ addr, translated });
-                    }
-                    return translated;
-                }
+            // Check if address is within the mapped region (0 to size_mask)
+            if (addr <= size_mask) {
+                // Simple translation: add physical base to virtual address
+                const translated = physical_base + addr;
+                // MMAP tracing disabled - too verbose during copy loops
+                return translated;
             }
-
-            _ = logical; // For future use with more complex MMAP configurations
         }
 
         return addr;
@@ -522,6 +525,7 @@ pub const MemoryBus = struct {
             .debug_int_ctrl_accesses = 0,
             .debug_mailbox_accesses = 0,
             .debug_dev_init_accesses = 0,
+            .cop_ctl_bus_read_count = 0,
             .debug_dev_init_offset_counts = [_]u32{0} ** 32,
             .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
             .debug_fw_write_sum = 0,
@@ -627,6 +631,7 @@ pub const MemoryBus = struct {
             .debug_int_ctrl_accesses = 0,
             .debug_mailbox_accesses = 0,
             .debug_dev_init_accesses = 0,
+            .cop_ctl_bus_read_count = 0,
             .debug_dev_init_offset_counts = [_]u32{0} ** 32,
             .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
             .debug_fw_write_sum = 0,
@@ -638,6 +643,10 @@ pub const MemoryBus = struct {
             .debug_sdram_data_read_vals = [_]u32{0} ** 64,
             .debug_sdram_page_reads = [_]u32{0} ** 256,
             .debug_loadbuffer_write_count = 0,
+            .irq_vector_installed = false,
+            .irq_vector_value = 0,
+            .irq_vector_addr = 0,
+            .timer1_enabled_by_firmware = false,
         };
     }
 
@@ -749,6 +758,14 @@ pub const MemoryBus = struct {
         // Track reads from part[0] area (0x11001A30-0x11001A3C)
         if (addr >= 0x11001A30 and addr < 0x11001A3C) {
             self.debug_part0_reads += 1;
+        }
+
+        // Debug: trace COP_CTL reads at address level
+        if (addr == 0x60007004) {
+            self.cop_ctl_bus_read_count += 1;
+            if (self.cop_ctl_bus_read_count <= 50) {
+                std.debug.print("BUS_COP_CTL_READ #{}: addr=0x{X:0>8}\n", .{ self.cop_ctl_bus_read_count, addr });
+            }
         }
 
         // Track peripheral access counts for debugging
@@ -1047,6 +1064,16 @@ pub const MemoryBus = struct {
         const region = getRegion(translated_addr);
         self.last_access_addr = translated_addr;
         self.last_access_region = region;
+
+        // DEBUG: Trace .init copy writes (destination range 0x03E8xxxx)
+        if (addr >= 0x03E80000 and addr < 0x03EA0000) {
+            if (self.debug_loadbuffer_write_count < 10) {
+                std.debug.print("INIT_COPY_WRITE: addr=0x{X:0>8} -> translated=0x{X:0>8} value=0x{X:0>8} mmap={} region={}\n", .{
+                    addr, translated_addr, value, self.mmap_enabled, @intFromEnum(region),
+                });
+            }
+            self.debug_loadbuffer_write_count += 1;
+        }
 
         // Debug: track LCD writes
         if (region == .lcd) {
@@ -1404,6 +1431,25 @@ pub const MemoryBus = struct {
     /// Clear button event pending flag
     pub fn clearButtonEvent(self: *Self) void {
         self.button_event_pending = false;
+    }
+
+    /// KERNEL INIT DETECTION: Check if IRQ vector has been installed
+    /// Returns true if a valid IRQ handler has been written to 0x40000018 or 0x10000018
+    pub fn isIrqVectorInstalled(self: *const Self) bool {
+        return self.irq_vector_installed;
+    }
+
+    /// KERNEL INIT DETECTION: Mark Timer1 as enabled by firmware
+    pub fn markTimer1EnabledByFirmware(self: *Self) void {
+        if (!self.timer1_enabled_by_firmware) {
+            self.timer1_enabled_by_firmware = true;
+            std.debug.print("TIMER1_ENABLED: By firmware (kernel init milestone)\n", .{});
+        }
+    }
+
+    /// KERNEL INIT DETECTION: Check if Timer1 was enabled by firmware
+    pub fn isTimer1EnabledByFirmware(self: *const Self) bool {
+        return self.timer1_enabled_by_firmware;
     }
 
     /// Direct write to hw_accel region (used for RTOS kickstart)
@@ -1812,6 +1858,25 @@ pub const MemoryBus = struct {
             self.sdram[offset + 2] = @truncate(value >> 16);
             self.sdram[offset + 3] = @truncate(value >> 24);
             self.sdram_write_count += 1;
+
+            // KERNEL INIT DETECTION: Check for IRQ vector write at 0x10000018
+            // With MMAP enabled, writes to 0x00000018 translate to 0x10000018
+            if (addr == 0x10000018) {
+                const is_branch = (value & 0xFF000000) == 0xEA000000;
+                const is_ldr_pc = (value & 0xFFFF0000) == 0xE59F0000;
+                const is_valid_iram = (value >= 0x40000000 and value < 0x40018000);
+                const is_valid_sdram = (value >= 0x10000000 and value < 0x14000000);
+                const is_valid = is_branch or is_ldr_pc or is_valid_iram or is_valid_sdram;
+
+                if (is_valid and !self.irq_vector_installed) {
+                    self.irq_vector_installed = true;
+                    self.irq_vector_value = value;
+                    self.irq_vector_addr = addr;
+                    std.debug.print("IRQ_VECTOR_INSTALLED: addr=0x{X:0>8} value=0x{X:0>8} (SDRAM via MMAP)\n", .{ addr, value });
+                } else if (!is_valid) {
+                    std.debug.print("IRQ_VECTOR_WRITE: addr=0x{X:0>8} value=0x{X:0>8} (INVALID - not a handler)\n", .{ addr, value });
+                }
+            }
         }
     }
 
@@ -1834,6 +1899,24 @@ pub const MemoryBus = struct {
             self.iram[offset + 2] = @truncate(value >> 16);
             self.iram[offset + 3] = @truncate(value >> 24);
             self.iram_write_count += 1;
+
+            // KERNEL INIT DETECTION: Check for IRQ vector write at 0x40000018
+            // A valid IRQ handler should be a branch instruction (0xEAxxxxxx) or
+            // LDR PC instruction (0xE59Fxxxx), not garbage like 0x84813004
+            if (addr == 0x40000018) {
+                const is_branch = (value & 0xFF000000) == 0xEA000000;
+                const is_ldr_pc = (value & 0xFFFF0000) == 0xE59F0000;
+                const is_valid = is_branch or is_ldr_pc or (value >= 0x40000000 and value < 0x40018000);
+
+                if (is_valid and !self.irq_vector_installed) {
+                    self.irq_vector_installed = true;
+                    self.irq_vector_value = value;
+                    self.irq_vector_addr = addr;
+                    std.debug.print("IRQ_VECTOR_INSTALLED: addr=0x{X:0>8} value=0x{X:0>8} (IRAM)\n", .{ addr, value });
+                } else if (!is_valid) {
+                    std.debug.print("IRQ_VECTOR_WRITE: addr=0x{X:0>8} value=0x{X:0>8} (INVALID - not a handler)\n", .{ addr, value });
+                }
+            }
         }
     }
 
