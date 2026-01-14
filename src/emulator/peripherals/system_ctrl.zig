@@ -343,18 +343,27 @@ pub const SystemController = struct {
                 self.cop_ctl_read_count += 1;
                 const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
 
-                // COP wake acknowledgment logic:
-                // - When countdown > 0: return PROC_SLEEP=0 (COP awake/acknowledged)
-                // - Otherwise: return PROC_SLEEP=1 (COP sleeping)
-                // This simulates COP acknowledging a wake request and going back to sleep
+                // Context-aware COP_CTL responses:
+                // 1. Boot ROM at 0x140: polls waiting for COP SLEEPING (bit 31 = 1)
+                // 2. Kernel wake_core: loops until COP AWAKE (bit 31 = 0)
+                //
+                // Strategy: Use read count and wake_count to determine phase:
+                // - Before any wake writes (cop_wake_count == 0): Return SLEEPING
+                //   (Boot ROM expects COP to have completed init and be sleeping)
+                // - After wake writes (cop_wake_count > 0): Return AWAKE
+                //   (Kernel wake_core expects COP to respond)
                 var result: u32 = ready_flags;
                 var sleep_state: []const u8 = "SLEEPING";
 
-                // EXPERIMENT: Always return COP awake (bit 31 = 0)
-                // This should prevent the system from needing to call wake_core
-                _ = self.cop_wake_ack_countdown; // suppress unused warning
-                result = ready_flags; // bit 31 = 0 (awake)
-                sleep_state = "AWAKE";
+                if (self.cop_wake_count == 0) {
+                    // Boot ROM phase: COP has "completed init" and is sleeping
+                    result = ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+                    sleep_state = "SLEEPING";
+                } else {
+                    // Kernel phase: COP "responds" to wake request immediately
+                    result = ready_flags; // bit 31 = 0 (awake)
+                    sleep_state = "AWAKE";
+                }
 
                 // Debug: trace ALL COP_CTL reads during initial investigation
                 if (self.cop_ctl_read_count <= 100 or self.cop_ctl_read_count % 10000 == 0) {

@@ -904,6 +904,7 @@ pub const Emulator = struct {
                 // COP sync loop skip: The loop at 0x76A4-0x76B0 is an infinite loop waiting for
                 // IRQ/COP response. Without IRQ, we need to simulate a function return.
                 // The function at 0x7694 pushed {R4, LR} - we need to pop them to return properly.
+                // Re-enabled: need to skip the write-only infinite loop
                 if (self.cop_wake_skip_count > 10000) {
                     // Read the saved return address from stack
                     // PUSH {R4, LR} = SP -= 8, then store R4 at SP, LR at SP+4
