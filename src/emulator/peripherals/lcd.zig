@@ -119,7 +119,13 @@ pub const LcdController = struct {
     /// Debug: last unexpected offset written
     debug_last_offset: u32,
 
+    /// Pixels written since last update (for auto-refresh)
+    pixels_since_update: u32,
+
     const Self = @This();
+
+    /// Auto-refresh threshold: trigger update after this many pixels
+    const AUTO_REFRESH_THRESHOLD: u32 = LCD_WIDTH * LCD_HEIGHT;
 
     /// Register offsets
     const REG_DATA32: u32 = 0x00000;
@@ -143,6 +149,7 @@ pub const LcdController = struct {
             .debug_pixel_writes = 0,
             .debug_update_count = 0,
             .debug_last_offset = 0,
+            .pixels_since_update = 0,
         };
 
         // Initialize framebuffer to black
@@ -191,6 +198,7 @@ pub const LcdController = struct {
     pub fn update(self: *Self) void {
         self.update_pending = false;
         self.debug_update_count += 1;
+        self.pixels_since_update = 0; // Reset auto-refresh counter
         if (self.display_callback) |callback| {
             callback(&self.framebuffer);
         }
@@ -256,6 +264,13 @@ pub const LcdController = struct {
                         self.framebuffer[fb_offset + 2] = @truncate(value >> 16);
                         self.framebuffer[fb_offset + 3] = @truncate(value >> 24);
                         self.debug_pixel_writes += 2;
+                        self.pixels_since_update += 2;
+
+                        // Auto-refresh after a full frame of pixels
+                        if (self.pixels_since_update >= AUTO_REFRESH_THRESHOLD) {
+                            self.update();
+                            self.pixels_since_update = 0;
+                        }
                     }
                 }
                 // Auto-increment BCM write address
