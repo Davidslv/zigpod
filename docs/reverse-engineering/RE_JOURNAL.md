@@ -1078,15 +1078,49 @@ Executed 150000000 cycles
 Timers: 45200 accesses
 ```
 
+**Analysis of the wake_core Function**:
+
+The function at 0x769C (wake_core) is designed to NEVER return. It's the COP sleep loop:
+```arm
+769C: push {r4, lr}
+76A0: bl 0x7c620        ; Call CPU/COP init
+76A4: bl 0x7670         ; Call PROC_ID check function
+76A8: ldr r3, =0x60007004
+76AC: mov r0, #0x80000000
+76B0: str r0, [r3]       ; Write to COP_CTL
+76B4: nop
+76B8: b 0x76AC           ; INFINITE LOOP
+```
+
+It's called via a tail-call chain where LR is set to 0x769C before jumping to an init function. The init function eventually returns via `bx lr`, landing at wake_core.
+
+**Key Discovery**:
+- Both CPU and COP paths end up at wake_core via the tail-call chain
+- wake_core has NO CPU/COP check - it unconditionally loops
+- The LR is always 0x769C (self-referential), so returning via LR doesn't help
+
+**Extended MMAP for Trampolines**:
+
+Rockbox uses trampolines at addresses 0x03E8xxxx-0x03EFxxxx. These are SDRAM-relative addresses that need mapping:
+```zig
+// Handle Rockbox's trampolines at 0x03E8xxxx-0x03EFxxxx
+if (addr >= 0x03E80000 and addr < 0x04000000) {
+    translated = (addr - 0x03E80000) + SDRAM_START;
+}
+```
+
+**Current Approach**:
+Skip wake_core entirely at entry (0x769C) and jump to 0x76C4. However, the caller keeps returning to 0x769C creating a loop.
+
 **Next Steps**:
-1. Trace actual COP_CTL write values to understand pattern
-2. Adjust cop_wake_count increment conditions
-3. Or skip at caller level (0x7690) instead of function level
+1. Find the original caller that sets up LR=0x769C
+2. Modify that caller's behavior to skip the COP path for CPU
+3. Or patch the kernel to not call wake_core when running on CPU
 
 **Files Changed**:
-- `src/emulator/core.zig`: COP poll skips, MMAP detection, wake skip (disabled)
-- `src/emulator/peripherals/system_ctrl.zig`: cop_wake_count, COP_CTL read/write handling
-- `src/emulator/memory/bus.zig`: MMAP register emulation
+- `src/emulator/core.zig`: COP poll skips, MMAP detection, wake skip
+- `src/emulator/peripherals/system_ctrl.zig`: COP_CTL always returns sleeping
+- `src/emulator/memory/bus.zig`: Extended MMAP for trampolines (0x03E8xxxx)
 
 ---
 

@@ -306,21 +306,16 @@ pub const SystemController = struct {
             REG_DEV_INIT2 => self.dev_init2,
             REG_CACHE_CTL => self.cache_ctl,
             REG_CPU_CTL => self.cpu_ctl,
-            // COP_CTL: Return a value that indicates COP is in a "ready" state
-            // The behavior differs between boot sync and kernel wake:
-            // - During early boot sync: bit 31 = 1 (sleeping/idle) - bootloader expects this
-            // - After kernel tries to wake COP: bit 31 = 0 (awake) - kernel expects this
-            // We use cop_wake_count to detect when kernel has started waking COP
+            // COP_CTL: Return a value indicating COP is sleeping (bit 31 = 1)
+            // Multiple boot phases poll this register:
+            // - Bootloader sync at 0x148/0x1EC: waits for bit 31 = 1 (sleeping)
+            // - Post-MMAP sync at 0x1F4: waits for bit 31 = 1 (sleeping)
+            // - Kernel wake at 0x769C: waits for bit 31 = 0 (awake)
+            // Since most checks expect sleeping, we always return bit 31 = 1.
+            // The kernel wake loop at 0x769C is handled by COP_WAKE_SKIP in core.zig.
             REG_COP_CTL => blk: {
-                // Base value with ready flags
                 const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
-                // If many wake attempts (kernel is in wake loop), return awake (bit 31 = 0)
-                // Otherwise return sleeping (bit 31 = 1) for bootloader sync
-                if (self.cop_wake_count >= 2) {
-                    break :blk ready_flags; // bit 31 = 0 (awake)
-                } else {
-                    break :blk ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
-                }
+                break :blk ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
             },
             else => 0,
         };

@@ -365,11 +365,21 @@ pub const MemoryBus = struct {
             // For simplicity, if MMAP entry 0 is configured, remap low addresses to SDRAM
 
             if (i == 0) {
-                // MMAP0: Check if address is in low memory (0x00000000-0x00FFFFFF)
-                // that should be remapped to SDRAM
-                if (addr < 0x01000000) {
-                    // Translate to SDRAM address
-                    const translated = SDRAM_START + addr;
+                // MMAP0: Check if address is in low memory that should be remapped to SDRAM
+                // Rockbox uses addresses 0x00000000-0x07FFFFFF for remapped SDRAM
+                // (larger range to accommodate trampolines at 0x03Exxxxx)
+                if (addr < 0x08000000) {
+                    // For addresses like 0x03E914B4, subtract 0x03E80000 to get offset
+                    // This accounts for Rockbox's link address within SDRAM
+                    var translated: u32 = SDRAM_START + addr;
+
+                    // Handle Rockbox's trampolines at 0x03E8xxxx-0x03EFxxxx
+                    // These are linked at (SDRAM_START - 0x10000000 + 0x03E80000) = 0x03E80000
+                    // Actual physical address = addr - 0x03E80000 + 0x10000000
+                    if (addr >= 0x03E80000 and addr < 0x04000000) {
+                        translated = (addr - 0x03E80000) + SDRAM_START;
+                    }
+
                     // Only log first few translations to avoid spam
                     if (self.debug_sdram_data_read_count < 5) {
                         std.debug.print("MMAP: 0x{X:0>8} -> 0x{X:0>8} (SDRAM)\n", .{ addr, translated });
