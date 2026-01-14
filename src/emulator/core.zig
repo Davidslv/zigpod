@@ -170,6 +170,15 @@ pub const Emulator = struct {
     /// Counter for switch_thread skip iterations
     switch_thread_count: u32,
 
+    /// Total cumulative scheduler skips (never resets - for LCD bypass trigger)
+    total_sched_skips: u32,
+
+    /// Flag: LCD bypass test has been done
+    lcd_bypass_done: bool,
+
+    /// Counter for consecutive caller loop escape failures (zero-stack situations)
+    caller_loop_escape_failures: u32,
+
     /// Flag: Timer1 enabled by emulator to fix kernel initialization
     timer1_enabled_by_emulator: bool,
 
@@ -258,6 +267,9 @@ pub const Emulator = struct {
             .sched_skip_count = 0,
             .idle_loop_count = 0,
             .switch_thread_count = 0,
+            .total_sched_skips = 0,
+            .lcd_bypass_done = false,
+            .caller_loop_escape_failures = 0,
             .timer1_enabled_by_emulator = false,
             .main_entered = false,
             .main_trace_count = 0,
@@ -679,9 +691,9 @@ pub const Emulator = struct {
         // When MMAP is enabled, low addresses translate to SDRAM
         if (self.bus.mmap_enabled and pc < 0x01000000 and pc >= 0x000001C0) {
             // Only trace around key addresses to reduce noise
-            if (pc >= 0x000002D0 and pc <= 0x000002F0) {
-                std.debug.print("MMAP EXEC: cycle={} PC=0x{X:0>8} -> 0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
-                    self.total_cycles, pc, pc + 0x10000000, self.cpu.getReg(0), self.cpu.getReg(14),
+            if (pc >= 0x000002C0 and pc <= 0x000002F0) {
+                std.debug.print("MMAP EXEC: cycle={} PC=0x{X:0>8} -> 0x{X:0>8} R2=0x{X:0>8} SP=0x{X:0>8}\n", .{
+                    self.total_cycles, pc, pc + 0x10000000, self.cpu.getReg(2), self.cpu.getReg(13),
                 });
             }
         }
@@ -890,9 +902,10 @@ pub const Emulator = struct {
                 if (self.switch_thread_count > 1000) {
                     const lr = self.cpu.getReg(14);
                     self.sched_skip_count += 1;
+                    self.total_sched_skips += 1; // Cumulative counter for LCD bypass
                     if (self.sched_skip_count <= 5 or self.sched_skip_count % 100 == 0) {
-                        std.debug.print("SWITCH_THREAD_SKIP[{}]: returning to LR=0x{X:0>8}\n", .{
-                            self.sched_skip_count, lr,
+                        std.debug.print("SWITCH_THREAD_SKIP[{}]: returning to LR=0x{X:0>8} (total={})\n", .{
+                            self.sched_skip_count, lr, self.total_sched_skips,
                         });
                     }
                     // Return success - allow caller to continue
@@ -920,9 +933,11 @@ pub const Emulator = struct {
                         const saved_at_32 = self.bus.read32(sp + 32); // Offset for 8th pushed reg
                         const saved_at_4 = self.bus.read32(sp + 4); // Just after SP
 
-                        std.debug.print("CALLER_LOOP_SELF: LR==PC, SP=0x{X:0>8}, stack[4]=0x{X:0>8}, stack[28]=0x{X:0>8}, stack[32]=0x{X:0>8}\n", .{
-                            sp, saved_at_4, saved_at_28, saved_at_32,
-                        });
+                        if (self.caller_loop_escape_failures < 5) {
+                            std.debug.print("CALLER_LOOP_SELF: LR==PC, SP=0x{X:0>8}, stack[4]=0x{X:0>8}, stack[28]=0x{X:0>8}, stack[32]=0x{X:0>8}\n", .{
+                                sp, saved_at_4, saved_at_28, saved_at_32,
+                            });
+                        }
 
                         // Try to find a plausible return address (should be in firmware range)
                         var return_addr: u32 = 0;
@@ -945,13 +960,62 @@ pub const Emulator = struct {
 
                             // Don't fully reset - allow faster escape on repeat
                             self.sched_skip_count = 2;
+                            self.caller_loop_escape_failures = 0;
+                            return 1;
+                        }
+
+                        // No valid return address found - increment failure counter
+                        self.caller_loop_escape_failures += 1;
+
+                        // FALLBACK ESCAPE: After multiple failures with zero stack,
+                        // trigger LCD bypass directly since we can't reach idle loop
+                        if (self.caller_loop_escape_failures >= 10 and !self.lcd_bypass_done) {
+                            std.debug.print("\n*** LCD BYPASS FROM CALLER LOOP ***\n", .{});
+                            std.debug.print("Stuck at 0x7C558 with zero stack after {} failures\n", .{self.caller_loop_escape_failures});
+                            std.debug.print("Total scheduler skips: {}, LCD pixel writes: {}\n", .{
+                                self.total_sched_skips, self.lcd_ctrl.debug_pixel_writes,
+                            });
+
+                            // Fill screen with red using LCD controller directly
+                            const red = lcd.Color.fromRgb(255, 0, 0);
+                            self.lcd_ctrl.clear(red);
+                            self.lcd_ctrl.update();
+
+                            std.debug.print("LCD clear+update called. Pixel writes: {}, Updates: {}\n", .{
+                                self.lcd_ctrl.debug_pixel_writes, self.lcd_ctrl.debug_update_count,
+                            });
+
+                            self.lcd_bypass_done = true;
+                        }
+
+                        // After LCD bypass, try jumping to idle loop directly
+                        if (self.caller_loop_escape_failures >= 15) {
+                            std.debug.print("CALLER_LOOP_FORCE_IDLE: Jumping to idle loop at 0x7C7E0\n", .{});
+
+                            // Clear IRQ mode - switch back to SVC mode
+                            self.cpu.regs.switchMode(.supervisor);
+                            self.cpu.regs.cpsr.irq_disable = false;
+
+                            // Set up reasonable SP for supervisor mode
+                            self.cpu.setReg(13, 0x08001000);
+
+                            // Jump to idle loop
+                            self.cpu.setReg(15, 0x7C7E0);
+
+                            // Clear Timer1 interrupt
+                            self.int_ctrl.clearInterrupt(.timer1);
+
+                            self.caller_loop_escape_failures = 0;
+                            self.sched_skip_count = 0;
                             return 1;
                         }
                     }
 
-                    std.debug.print("CALLER_LOOP_SKIP: sched_skip_count={}, PC=0x{X:0>8}, LR=0x{X:0>8}, SP=0x{X:0>8}\n", .{
-                        self.sched_skip_count, pc, lr, sp,
-                    });
+                    if (self.caller_loop_escape_failures < 5) {
+                        std.debug.print("CALLER_LOOP_SKIP: sched_skip_count={}, PC=0x{X:0>8}, LR=0x{X:0>8}, SP=0x{X:0>8}\n", .{
+                            self.sched_skip_count, pc, lr, sp,
+                        });
+                    }
                     self.cpu.setReg(0, 0);
                     self.cpu.setReg(15, lr);
                     // Don't fully reset
@@ -976,7 +1040,33 @@ pub const Emulator = struct {
                 }
                 // After 50000 iterations, try enabling IRQ and setting pending
                 if (self.idle_loop_count > 50000) {
-                    std.debug.print("IDLE_LOOP_SKIP: after {} iterations, enabling IRQ and triggering timer\n", .{self.idle_loop_count});
+                    // Debug: show bypass check status
+                    if (self.idle_loop_count == 50001 and !self.lcd_bypass_done) {
+                        std.debug.print("BYPASS_CHECK: done={} total_skips={} pixel_writes={}\n", .{
+                            self.lcd_bypass_done, self.total_sched_skips, self.lcd_ctrl.debug_pixel_writes,
+                        });
+                    }
+                    // After many scheduler skips with no progress, try direct LCD test
+                    if (!self.lcd_bypass_done and self.total_sched_skips > 50 and self.lcd_ctrl.debug_pixel_writes == 0) {
+                        std.debug.print("\n*** LCD BYPASS TEST ***\n", .{});
+                        std.debug.print("Scheduler stuck after {} total skips with 0 LCD writes\n", .{self.total_sched_skips});
+                        std.debug.print("Attempting direct LCD fill...\n", .{});
+
+                        // Fill screen with red using LCD controller directly
+                        const red = lcd.Color.fromRgb(255, 0, 0);
+                        self.lcd_ctrl.clear(red);
+                        self.lcd_ctrl.update();
+
+                        std.debug.print("LCD clear+update called. Pixel writes now: {}\n", .{self.lcd_ctrl.debug_pixel_writes});
+                        std.debug.print("LCD updates now: {}\n", .{self.lcd_ctrl.debug_update_count});
+
+                        // Only do this once
+                        self.lcd_bypass_done = true;
+                    }
+
+                    if (self.idle_loop_count == 50001) {
+                        std.debug.print("IDLE_LOOP_SKIP: after {} iterations, enabling IRQ and triggering timer (total_sched_skips={})\n", .{ self.idle_loop_count, self.total_sched_skips });
+                    }
                     self.cpu.enableIrq();
                     // Fire Timer1 to trigger scheduler
                     self.int_ctrl.assertInterrupt(.timer1);

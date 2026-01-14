@@ -166,6 +166,9 @@ pub const MemoryBus = struct {
     /// Flag indicating current access is from COP (for PROC_ID)
     is_cop_access: bool,
 
+    /// Debug: PROC_ID read counter
+    proc_id_read_count: u32,
+
     /// Debug: track ATA-related writes
     debug_last_ata_read: bool,
     debug_last_ata_value: u32,
@@ -480,6 +483,7 @@ pub const MemoryBus = struct {
             .first_sdram_write_addr = 0,
             .first_sdram_write_value = 0,
             .is_cop_access = false,
+            .proc_id_read_count = 0,
             .debug_last_ata_read = false,
             .debug_last_ata_value = 0,
             .debug_ata_reads_for_iram_count = 0,
@@ -586,6 +590,7 @@ pub const MemoryBus = struct {
             .first_sdram_write_addr = 0,
             .first_sdram_write_value = 0,
             .is_cop_access = false,
+            .proc_id_read_count = 0,
             .debug_last_ata_read = false,
             .debug_last_ata_value = 0,
             .debug_ata_reads_for_iram_count = 0,
@@ -799,7 +804,14 @@ pub const MemoryBus = struct {
             .sdram => self.readSdram(translated_addr),
             .iram => self.readIram(translated_addr),
             .lcd => self.readPeripheral(self.lcd, translated_addr, LCD_START),
-            .proc_id => if (self.is_cop_access) @as(u32, 0xAA) else @as(u32, 0x55),
+            .proc_id => blk: {
+                const proc_val: u32 = if (self.is_cop_access) 0xAA else 0x55;
+                if (self.proc_id_read_count < 5) {
+                    std.debug.print("PROC_ID_READ: addr=0x{X:0>8} returning 0x{X:0>2}\n", .{ addr, proc_val });
+                    self.proc_id_read_count += 1;
+                }
+                break :blk proc_val;
+            },
             .mailbox => self.readMailbox(translated_addr),
             .interrupt_ctrl => self.readPeripheral(self.interrupt_ctrl, translated_addr, INT_CTRL_START),
             .timers => self.readPeripheral(self.timers, translated_addr, TIMER_START),

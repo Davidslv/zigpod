@@ -378,13 +378,13 @@ pub fn main() !void {
             // When running from physical 0x1000017C, r6 = 0x10000000 (correct)
             // When running from virtual 0x17C, r6 = 0x00000000 (wrong!)
             //
-            // So we must start from physical address 0x10000100 and let crt0 set up MMAP.
+            // So we must start from physical address 0x10000000 (the actual entry point).
             emu.bus.mmap_enabled = false;
             emu.rockbox_restart_count = 1; // Skip COP sync detection since we're loading directly
             print("MMAP disabled - crt0 will configure it\n", .{});
 
-            // Set PC to physical entry point (0x10000100 = SDRAM + crt0 entry)
-            const rockbox_entry: u32 = 0x10000100;
+            // Set PC to physical entry point (0x10000000 = SDRAM start, actual crt0 entry)
+            const rockbox_entry: u32 = 0x10000000;
             emu.cpu.setPc(rockbox_entry);
 
             // Initialize LR to 0 - Rockbox doesn't return to bootloader
