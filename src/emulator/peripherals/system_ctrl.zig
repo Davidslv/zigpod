@@ -92,6 +92,9 @@ pub const SystemController = struct {
     /// COP state machine
     cop_state: CopState,
 
+    /// Counter for COP wake requests (helps distinguish boot vs kernel wake)
+    cop_wake_count: u32,
+
     /// Device reset callback (called when a device is reset)
     reset_callback: ?*const fn (Device) void,
 
@@ -153,6 +156,7 @@ pub const SystemController = struct {
             .cpu_ctl = 0,
             .cop_ctl = DEFAULT_COP_CTL,
             .cop_state = .disabled,
+            .cop_wake_count = 0,
             .reset_callback = null,
             .enable_callback = null,
             .is_cop_access = false,
@@ -303,12 +307,21 @@ pub const SystemController = struct {
             REG_CACHE_CTL => self.cache_ctl,
             REG_CPU_CTL => self.cpu_ctl,
             // COP_CTL: Return a value that indicates COP is in a "ready" state
-            // We emulate COP as always being in sync/ready state:
-            // - Bit 31 = 1 (sleeping/idle)
-            // - Bit 30 = 1 (wake acknowledged)
-            // - Bits 16-9 = all 1s (various ready flags)
-            // This should satisfy all COP sync checks in Rockbox crt0.S
-            REG_COP_CTL => 0xC000FE00 | (self.cop_ctl & 0x1FF),
+            // The behavior differs between boot sync and kernel wake:
+            // - During early boot sync: bit 31 = 1 (sleeping/idle) - bootloader expects this
+            // - After kernel tries to wake COP: bit 31 = 0 (awake) - kernel expects this
+            // We use cop_wake_count to detect when kernel has started waking COP
+            REG_COP_CTL => blk: {
+                // Base value with ready flags
+                const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
+                // If many wake attempts (kernel is in wake loop), return awake (bit 31 = 0)
+                // Otherwise return sleeping (bit 31 = 1) for bootloader sync
+                if (self.cop_wake_count >= 2) {
+                    break :blk ready_flags; // bit 31 = 0 (awake)
+                } else {
+                    break :blk ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+                }
+            },
             else => 0,
         };
     }
@@ -386,6 +399,11 @@ pub const SystemController = struct {
                 const PROC_SLEEP: u32 = 0x80000000;
                 const old = self.cop_ctl;
 
+                // Trace COP_CTL writes to understand the pattern
+                if (self.cop_wake_count < 10) {
+                    std.debug.print("COP_CTL write: value=0x{X:0>8}, old=0x{X:0>8}, wake_count={}\n", .{ value, old, self.cop_wake_count });
+                }
+
                 // Store non-sleep bits, preserve sleep bit (read forces it to 1 anyway)
                 self.cop_ctl = (value & ~PROC_SLEEP) | (self.cop_ctl & PROC_SLEEP);
 
@@ -393,10 +411,17 @@ pub const SystemController = struct {
                 const wake_request = (value & PROC_SLEEP) == 0 and (old & PROC_SLEEP) != 0;
                 if (wake_request) {
                     self.cop_ctl &= ~PROC_SLEEP;
+                    self.cop_wake_count += 1;
                     if (self.cop_state == .sleeping) {
                         self.cop_state = .waking;
                     }
                 }
+                // Also count explicit wake commands (writing 0x80000000)
+                if (value == PROC_SLEEP) {
+                    self.cop_wake_count += 1;
+                }
+                // Count ANY write as a wake attempt for progress
+                self.cop_wake_count += 1;
             },
             else => {},
         }

@@ -98,6 +98,13 @@ pub const MemoryBus = struct {
     /// Offset 0x0C contains return address for boot ROM call
     flash_ctrl_regs: [64]u32,
 
+    /// PP5021C MMAP (Memory Mapping) Registers
+    /// 8 pairs of LOGICAL/PHYSICAL registers at 0xF000F000-0xF000F03C
+    /// Used by Rockbox to remap SDRAM (0x10000000) to address 0x00000000
+    mmap_logical: [8]u32,
+    mmap_physical: [8]u32,
+    mmap_enabled: bool,
+
     /// Hardware accelerator buffer (0x60003000-0x60003FFF)
     /// Apple firmware uses this for checksum/copy operations
     hw_accel_regs: [1024]u32,
@@ -336,6 +343,47 @@ pub const MemoryBus = struct {
         return addr;
     }
 
+    /// Apply PP5021C MMAP translation
+    /// When MMAP is enabled, addresses 0x00000000-0x00FFFFFF are remapped to SDRAM (0x10000000)
+    /// This is used by Rockbox to place exception vectors at address 0x00000000
+    fn applyMmap(self: *const Self, addr: u32) u32 {
+        if (!self.mmap_enabled) {
+            return addr;
+        }
+
+        // Check each MMAP entry to see if it applies to this address
+        // For now, we implement a simplified version that handles Rockbox's typical use case:
+        // MMAP0 remaps 0x00000000-0x00FFFFFF to SDRAM at 0x10000000
+        for (self.mmap_logical, self.mmap_physical, 0..) |logical, physical, i| {
+            // Skip entries without permission bits
+            if ((physical & 0x0F00) == 0) {
+                continue;
+            }
+
+            // The logical register contains a mask value (e.g., 0x00003C00 or 0x00003E00)
+            // Bit 10 (0x0400) = 64MB, Bit 9 (0x0200) = 32MB granularity
+            // For simplicity, if MMAP entry 0 is configured, remap low addresses to SDRAM
+
+            if (i == 0) {
+                // MMAP0: Check if address is in low memory (0x00000000-0x00FFFFFF)
+                // that should be remapped to SDRAM
+                if (addr < 0x01000000) {
+                    // Translate to SDRAM address
+                    const translated = SDRAM_START + addr;
+                    // Only log first few translations to avoid spam
+                    if (self.debug_sdram_data_read_count < 5) {
+                        std.debug.print("MMAP: 0x{X:0>8} -> 0x{X:0>8} (SDRAM)\n", .{ addr, translated });
+                    }
+                    return translated;
+                }
+            }
+
+            _ = logical; // For future use with more complex MMAP configurations
+        }
+
+        return addr;
+    }
+
     /// Initialize the memory bus
     pub fn init(sdram_size: usize, boot_rom: []const u8) Self {
         _ = sdram_size;
@@ -359,6 +407,9 @@ pub const MemoryBus = struct {
             .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
             .flash_ctrl_regs = [_]u32{0} ** 64,
+            .mmap_logical = [_]u32{0} ** 8,
+            .mmap_physical = [_]u32{0} ** 8,
+            .mmap_enabled = false,
             .hw_accel_regs = [_]u32{0} ** 1024,
             .low_mem_ram = [_]u8{0} ** 1024,
             .low_mem_written = [_]bool{false} ** 256,
@@ -421,6 +472,9 @@ pub const MemoryBus = struct {
             .lcd_bridge = null,
             .stub_registers = [_]u32{0} ** 256,
             .flash_ctrl_regs = [_]u32{0} ** 64,
+            .mmap_logical = [_]u32{0} ** 8,
+            .mmap_physical = [_]u32{0} ** 8,
+            .mmap_enabled = false,
             .hw_accel_regs = [_]u32{0} ** 1024,
             .low_mem_ram = [_]u8{0} ** 1024,
             .low_mem_written = [_]bool{false} ** 256,
@@ -542,7 +596,9 @@ pub const MemoryBus = struct {
     /// Read 32-bit value
     pub fn read32(self: *Self, addr: u32) u32 {
         // Translate Apple firmware encoded addresses (0x04xxxxxx → 0x10xxxxxx)
-        const translated_addr = translateAddress(addr);
+        // Then apply MMAP translation (0x00xxxxxx → 0x10xxxxxx when enabled)
+        const fw_translated = translateAddress(addr);
+        const translated_addr = self.applyMmap(fw_translated);
         const region = getRegion(translated_addr);
         self.last_access_addr = translated_addr;
         self.last_access_region = region;
@@ -749,7 +805,9 @@ pub const MemoryBus = struct {
         // }
 
         // Translate Apple firmware encoded addresses (0x04xxxxxx → 0x10xxxxxx)
-        const translated_addr = translateAddress(addr);
+        // Then apply MMAP translation (0x00xxxxxx → 0x10xxxxxx when enabled)
+        const fw_translated = translateAddress(addr);
+        const translated_addr = self.applyMmap(fw_translated);
         const region = getRegion(translated_addr);
         self.last_access_addr = translated_addr;
         self.last_access_region = region;
@@ -917,9 +975,20 @@ pub const MemoryBus = struct {
     fn readFlashCtrl(self: *const Self, addr: u32) u32 {
         const offset = (addr - FLASH_CTRL_START) >> 2;
 
-        // Return "BX LR" (0xE12FFF1E) at offset 0 and 4 to act as return stubs
-        // when firmware tries to execute code at 0xF000F000
-        if (offset == 0 or offset == 1) {
+        // MMAP registers are at offsets 0-15 (0xF000F000-0xF000F03C)
+        if (offset < 16) {
+            const pair_idx = offset >> 1;
+            const is_physical = (offset & 1) != 0;
+            if (is_physical) {
+                return self.mmap_physical[pair_idx];
+            } else {
+                return self.mmap_logical[pair_idx];
+            }
+        }
+
+        // Return "BX LR" (0xE12FFF1E) at offsets 16-17 as return stubs
+        // for accidental execution at higher flash_ctrl addresses
+        if (offset == 16 or offset == 17) {
             return 0xE12FFF1E; // BX LR - return to caller
         }
 
@@ -931,6 +1000,37 @@ pub const MemoryBus = struct {
 
     fn writeFlashCtrl(self: *Self, addr: u32, value: u32) void {
         const offset = (addr - FLASH_CTRL_START) >> 2;
+
+        // MMAP registers are at offsets 0-15 (0xF000F000-0xF000F03C)
+        // Even offsets (0,2,4,6,8,10,12,14) are LOGICAL registers
+        // Odd offsets (1,3,5,7,9,11,13,15) are PHYSICAL registers
+        if (offset < 16) {
+            const pair_idx = offset >> 1;
+            const is_physical = (offset & 1) != 0;
+
+            if (is_physical) {
+                self.mmap_physical[pair_idx] = value;
+                // MMAP is enabled when PHYSICAL register has permission bits set
+                // Permission bits are at bits 8-11 (0x0F00)
+                if ((value & 0x0F00) != 0) {
+                    self.mmap_enabled = true;
+                    std.debug.print("MMAP[{}]: PHYSICAL = 0x{X:0>8} (enabled, maps 0x{X:0>8} -> SDRAM)\n", .{
+                        pair_idx,
+                        value,
+                        self.mmap_logical[pair_idx] & 0xFFFFF000,
+                    });
+                }
+            } else {
+                self.mmap_logical[pair_idx] = value;
+                std.debug.print("MMAP[{}]: LOGICAL = 0x{X:0>8}\n", .{ pair_idx, value });
+            }
+            // Also store in flash_ctrl_regs for compatibility
+            if (offset < 64) {
+                self.flash_ctrl_regs[offset] = value;
+            }
+            return;
+        }
+
         if (offset < 64) {
             self.flash_ctrl_regs[offset] = value;
             // Debug: log writes to help understand boot protocol

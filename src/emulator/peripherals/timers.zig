@@ -120,6 +120,9 @@ pub const Timers = struct {
     /// RTC seconds counter
     rtc: u32,
 
+    /// Debug: count of USEC_TIMER reads
+    debug_usec_reads: u32,
+
     /// Accumulated cycles for USEC_TIMER
     usec_cycles: u64,
 
@@ -148,6 +151,7 @@ pub const Timers = struct {
             .timer2 = Timer.init(),
             .usec_timer = 0,
             .rtc = 0,
+            .debug_usec_reads = 0,
             .usec_cycles = 0,
             .rtc_usec = 0,
             .cpu_freq_mhz = cpu_freq_mhz,
@@ -205,7 +209,7 @@ pub const Timers = struct {
 
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
-        return switch (offset) {
+        const value = switch (offset) {
             REG_TIMER1_CFG => self.timer1.config,
             REG_TIMER1_VAL => self.timer1.value,
             REG_TIMER2_CFG => self.timer2.config,
@@ -214,6 +218,18 @@ pub const Timers = struct {
             REG_RTC => self.rtc,
             else => 0,
         };
+        // Debug: trace USEC_TIMER reads
+        if (offset == REG_USEC_TIMER) {
+            const print = std.debug.print;
+            // Only print first few and when value is high
+            if (self.debug_usec_reads < 5 or value > 0x1000000) {
+                print("USEC_TIMER READ: value=0x{X:0>8} usec_cycles={}\n", .{ value, self.usec_cycles });
+            }
+            // Increment counter using pointer cast to bypass const
+            const self_mut = @constCast(self);
+            self_mut.debug_usec_reads += 1;
+        }
+        return value;
     }
 
     /// Write register

@@ -912,6 +912,184 @@ The Rockbox startup is deeply tied to PP5021C memory remapping:
 
 ---
 
+### 2026-01-13: PP5021C Memory Remapping (MMAP) Implementation
+
+**Goal**: Implement memory remapping to allow Rockbox main firmware to execute
+
+**Background**:
+Rockbox crt0 startup code relies on PP5021C memory remapping to remap SDRAM from physical 0x10000000 to logical 0x00000000. Without this, addresses like 0x03E804DC (relative to remapped base) are invalid.
+
+**Implementation**:
+
+1. **MMAP Register Block** (0xF000F000-0xF000F03C)
+
+   Added full MMAP emulation to bus.zig:
+   ```zig
+   // MMAP register offsets
+   const MMAP_0 = 0x00;      // Base address for region 0
+   const MMAP_1 = 0x04;      // Base address for region 1
+   const MMAP_2 = 0x08;      // Base address for region 2
+   const MMAP_3 = 0x0C;      // Base address for region 3
+   const MMAP_MASK_0 = 0x10; // Mask for region 0
+   // ... etc
+   ```
+
+2. **Address Translation**:
+
+   When MMAP is enabled (MMAP_0 written), addresses in range 0x00000000-0x01FFFFFF are translated to 0x10000000-0x11FFFFFF:
+   ```zig
+   fn translateAddress(self: *Self, addr: u32) u32 {
+       if (self.mmap_enabled and addr < 0x02000000) {
+           return addr | 0x10000000;
+       }
+       return addr;
+   }
+   ```
+
+3. **MMAP Activation**:
+
+   The bootloader writes to MMAP registers at 0xF000F000, which triggers remapping:
+   - Write to MMAP_0 (0xF000F00C) activates remapping callback
+   - PP_VER read (0x70000000) with value 0x50503530 confirms PP5021
+
+**Results**:
+
+| Before MMAP | After MMAP |
+|-------------|------------|
+| PC=0x03E804DC → crash | PC=0x03E804DC → translated to 0x13E804DC |
+| Invalid main() address | Valid execution continues |
+
+**Files Changed**:
+- `src/emulator/memory/bus.zig`: Full MMAP register emulation
+- `src/emulator/core.zig`: Address translation in step()
+
+---
+
+### 2026-01-13: COP Sync Loop Skips - Complete Implementation
+
+**Goal**: Skip all COP synchronization loops in Rockbox startup
+
+**Problem**:
+Rockbox crt0-pp.S has 8+ COP polling loops where CPU waits for COP to complete actions. Since we only emulate CPU, these loops are infinite.
+
+**Solution**:
+
+Added comprehensive loop detection and skip in core.zig:
+```zig
+// COP poll loop skip - addresses where CPU waits for COP
+const loop_starts = [_]u32{
+    0x10000204, 0x1000023C, 0x10000258, 0x10000270,
+    0x10000288, 0x100002C8, 0x100002DC, 0x10000320
+};
+const loop_exits = [_]u32{
+    0x10000214, 0x1000024C, 0x10000264, 0x1000027C,
+    0x10000294, 0x100002DC, 0x100002E8, 0x1000032C
+};
+
+// When PC matches a loop start, jump to corresponding exit
+for (loop_starts, loop_exits) |start, exit| {
+    if (effective_pc == start) {
+        self.cpu.setReg(15, exit);
+        return 1;
+    }
+}
+```
+
+**Loop Addresses Identified**:
+
+| Loop Start | Loop Exit | Purpose |
+|------------|-----------|---------|
+| 0x10000204 | 0x10000214 | First COP sync |
+| 0x1000023C | 0x1000024C | Second COP sync |
+| 0x10000258 | 0x10000264 | Third COP sync |
+| 0x10000270 | 0x1000027C | Fourth COP sync |
+| 0x10000288 | 0x10000294 | Fifth COP sync |
+| 0x100002C8 | 0x100002DC | Sixth COP sync |
+| 0x100002DC | 0x100002E8 | Seventh COP sync (self-poll) |
+| 0x10000320 | 0x1000032C | Eighth COP sync |
+
+**Results**:
+- Firmware progresses through all COP sync stages
+- BSS clear completes (millions of cycles)
+- main() reached and begins executing
+
+---
+
+### 2026-01-13: Current State - Kernel COP Wake Loop (In Progress)
+
+**Status**: Rockbox loads and starts kernel, but gets stuck in COP wake loop
+
+**Progress**:
+1. ✅ Bootloader executes correctly
+2. ✅ rockbox.ipod loaded from disk (774KB)
+3. ✅ MMAP remapping working
+4. ✅ COP startup sync loops skipped (8 total)
+5. ✅ main() called, kernel initializing
+6. ⏳ **STUCK**: COP wake loop at 0x769C-0x76B8
+
+**The Wake Loop Problem**:
+
+After kernel initialization, Rockbox tries to wake the COP for dual-core operation:
+```arm
+@ Function at 0x769C (wake_core):
+769C:  MOV R3, #0x60007000    ; COP_CTL base
+76A0:  ADD R3, R3, #4         ; COP_CTL = 0x60007004
+76A4:  MOV R2, #0x80000000    ; PROC_SLEEP bit
+76A8:  STR R2, [R3]           ; Write sleep bit (wake request)
+76AC:  LDR R2, [R3]           ; Read back
+76B0:  TST R2, #0x80000000    ; Check if still sleeping
+76B4:  BNE 76A8               ; Loop if sleeping
+76B8:  BX LR                  ; Return when awake
+```
+
+The kernel calls this function repeatedly from a higher-level loop:
+- Caller at ~0x7690 calls wake_core
+- Checks COP_CTL bit 31
+- If still sleeping, calls again
+- Never exits because COP never actually wakes
+
+**Attempted Solutions**:
+
+1. **COP_WAKE_SKIP**: Force return from 0x769C function
+   - Result: Millions of function calls, caller keeps calling
+
+2. **cop_wake_count**: Track wake attempts, change COP_CTL read
+   - Count increments on each COP_CTL write
+   - After threshold, return bit 31 = 0 (awake)
+   - Result: Count not incrementing properly due to write pattern mismatch
+
+**COP_CTL Register Behavior**:
+```zig
+// In system_ctrl.zig
+REG_COP_CTL => blk: {
+    const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
+    if (self.cop_wake_count >= 2) {
+        break :blk ready_flags; // bit 31 = 0 (awake)
+    } else {
+        break :blk ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+    }
+},
+```
+
+**Debug Output**:
+```
+Final PC: 0x0000769C, Mode: system, Thumb: false
+Executed 150000000 cycles
+Timers: 45200 accesses
+```
+
+**Next Steps**:
+1. Trace actual COP_CTL write values to understand pattern
+2. Adjust cop_wake_count increment conditions
+3. Or skip at caller level (0x7690) instead of function level
+
+**Files Changed**:
+- `src/emulator/core.zig`: COP poll skips, MMAP detection, wake skip (disabled)
+- `src/emulator/peripherals/system_ctrl.zig`: cop_wake_count, COP_CTL read/write handling
+- `src/emulator/memory/bus.zig`: MMAP register emulation
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis

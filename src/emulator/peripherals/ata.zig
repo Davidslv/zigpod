@@ -344,15 +344,15 @@ pub const AtaController = struct {
             }
             debug_disk_read_success += 1;
 
-            // Debug: dump directory entries for sectors 2055 and 2056
-            if (lba == 2055 or lba == 2056 or lba == 2057) {
+            // Debug: dump directory entries for root dir and .rockbox dir
+            if (lba == 6144 or lba == 6145 or lba == 6146) {
                 std.debug.print("=== Sector {} ", .{lba});
-                if (lba == 2055) {
+                if (lba == 6144) {
                     std.debug.print("(ROOT DIR) ===\n", .{});
-                } else if (lba == 2056) {
+                } else if (lba == 6145) {
                     std.debug.print("(.ROCKBOX DIR) ===\n", .{});
                 } else {
-                    std.debug.print("(FILE CONTENT) ===\n", .{});
+                    std.debug.print("(ROCKBOX.IPOD FILE DATA) ===\n", .{});
                     // Hex dump first 32 bytes of file content
                     std.debug.print("  First 32 bytes: ", .{});
                     for (self.data_buffer[0..32]) |b| {
@@ -360,7 +360,7 @@ pub const AtaController = struct {
                     }
                     std.debug.print("\n", .{});
                 }
-                if (lba != 2057) {
+                if (lba != 6146) {
                     var entry_idx: usize = 0;
                     while (entry_idx < 8) : (entry_idx += 1) {
                         const offset = entry_idx * 32;
@@ -624,7 +624,7 @@ pub const AtaController = struct {
                 // Check if sector is complete
                 if (self.buffer_pos >= self.buffer_len) {
                     const completed_lba = self.getLba();
-                    if (completed_lba == 2055 or completed_lba == 2056 or completed_lba == 2057) {
+                    if (completed_lba == 6144 or completed_lba == 6145 or completed_lba == 6146) {
                         std.debug.print("ATA: Completed reading sector {}, {} words read\n", .{ completed_lba, self.buffer_len / 2 });
                     }
                     if (self.sectors_remaining > 0) {

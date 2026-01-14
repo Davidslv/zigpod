@@ -638,6 +638,24 @@ pub const Emulator = struct {
                 self.total_cycles, pc, self.cpu.getReg(0), self.cpu.getReg(14),
             });
         }
+
+        // Trace post-MMAP execution at low addresses (0x000001C4 onwards)
+        // When MMAP is enabled, low addresses translate to SDRAM
+        if (self.bus.mmap_enabled and pc < 0x01000000 and pc >= 0x000001C0) {
+            // Only trace around key addresses to reduce noise
+            if (pc >= 0x000002D0 and pc <= 0x000002F0) {
+                std.debug.print("MMAP EXEC: cycle={} PC=0x{X:0>8} -> 0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                    self.total_cycles, pc, pc + 0x10000000, self.cpu.getReg(0), self.cpu.getReg(14),
+                });
+            }
+        }
+
+        // Check for invalid PC values (0x03E804DC is a known bad address from constant pool)
+        if (pc == 0x03E804DC or (pc >= 0x02000000 and pc < 0x10000000)) {
+            std.debug.print("INVALID_PC: cycle={} PC=0x{X:0>8} LR=0x{X:0>8} - possible bad jump target\n", .{
+                self.total_cycles, pc, self.cpu.getReg(14),
+            });
+        }
         // COP SYNC FIX: PP5021C has dual ARM cores (CPU + COP) that need to synchronize
         // at startup. Since we only emulate CPU, Rockbox's crt0 startup enters an infinite
         // loop waiting for COP. This fix detects the restart and skips past ALL sync code.
@@ -659,20 +677,35 @@ pub const Emulator = struct {
 
         // Skip the IRAM remapping jump at 0x100001AC
         // The MOV PC, #0x40000000 jumps to remapping code which returns to bootloader
-        // Since we don't need memory remapping in emulation, skip to 0x100001B0
+        // Since the IRAM code isn't loaded, we skip it and manually configure MMAP
         if (pc == 0x100001AC and self.rockbox_restart_count > 0) {
-            std.debug.print("SKIP_IRAM_REMAP: Skipping MOV PC,#0x40000000 to continue at 0x100001B0\n", .{});
+            std.debug.print("SKIP_IRAM_REMAP: Skipping MOV PC,#0x40000000, configuring MMAP manually\n", .{});
+
+            // Manually configure MMAP to map 0x00000000+ to SDRAM 0x10000000+
+            // This is what the IRAM remapping code would do:
+            // - MMAP0_LOGICAL = 0x00003E00 (32MB mask) or 0x00003C00 (64MB)
+            // - MMAP0_PHYSICAL = 0x00000F84 (permissions: read/write/data/code)
+            self.bus.mmap_logical[0] = 0x00003E00;
+            self.bus.mmap_physical[0] = 0x00000F84;
+            self.bus.mmap_enabled = true;
+            std.debug.print("MMAP: Manually configured - 0x00000000-0x00FFFFFF -> 0x10000000 (SDRAM)\n", .{});
+
             self.cpu.setReg(15, 0x100001B0);
             return 1;
         }
 
         // Fix BX R1 at 0x100001BC - R1 contains post-remap address 0x000001C4
-        // Without memory remapping, we need to jump to SDRAM address 0x100001C4 instead
+        // With MMAP enabled, addresses like 0x000001C4 auto-translate to 0x100001C4
+        // Without MMAP, we need to manually fix the jump target
         if (pc == 0x100001BC) {
             const r1 = self.cpu.getReg(1);
             if (r1 == 0x000001C4) {
-                std.debug.print("FIX_BX_R1: Fixing jump from 0x000001C4 to 0x100001C4\n", .{});
-                self.cpu.setReg(1, 0x100001C4);
+                if (self.bus.mmap_enabled) {
+                    std.debug.print("FIX_BX_R1: MMAP enabled, 0x000001C4 will auto-translate\n", .{});
+                } else {
+                    std.debug.print("FIX_BX_R1: MMAP not enabled, fixing jump from 0x000001C4 to 0x100001C4\n", .{});
+                    self.cpu.setReg(1, 0x100001C4);
+                }
             }
         }
 
@@ -712,19 +745,48 @@ pub const Emulator = struct {
         // COP SYNC FIX #2: After the first sync skip, Rockbox has many COP polling loops
         // that read COP_CTL (0x60007004) in a tight loop waiting for COP to signal ready.
         // Detect the pattern and skip each loop.
-        if (self.rockbox_restart_count > 1 and pc >= 0x10000200 and pc < 0x10000400) {
+        // When MMAP is enabled, PC can be either 0x10000xxx (direct) or 0x00000xxx (remapped)
+        const effective_pc = if (self.bus.mmap_enabled and pc < 0x01000000) pc + 0x10000000 else pc;
+        if (self.rockbox_restart_count >= 1 and effective_pc >= 0x10000200 and effective_pc < 0x10000400) {
             // Detected loop start addresses (found empirically):
             // 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8
             // 0x10000320 (additional loop found after 0x10000300)
-            const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8, 0x10000320 };
-            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002D4, 0x1000032C };
+            const loop_starts = [_]u32{ 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8, 0x100002DC, 0x10000320 };
+            // Note: 0x100002C8 loop exits to 0x100002DC, and 0x100002DC is ANOTHER loop that exits to 0x100002E8
+            const loop_exits = [_]u32{ 0x10000214, 0x1000024C, 0x10000264, 0x1000027C, 0x10000294, 0x100002DC, 0x100002E8, 0x1000032C };
             for (loop_starts, 0..) |start, i| {
-                if (pc == start) {
-                    self.cpu.setReg(15, loop_exits[i]);
+                if (effective_pc == start) {
+                    // Exit to remapped address if MMAP is enabled, otherwise to direct address
+                    const exit_addr = if (self.bus.mmap_enabled and pc < 0x01000000) loop_exits[i] - 0x10000000 else loop_exits[i];
+                    std.debug.print("COP_POLL_SKIP: PC=0x{X:0>8} -> exit 0x{X:0>8}\n", .{ pc, exit_addr });
+                    self.cpu.setReg(15, exit_addr);
                     return 1;
                 }
             }
         }
+
+        // COP WAKE LOOP SKIP: DISABLED FOR DEBUGGING
+        // The kernel tries to wake the COP in a tight loop at 0x769C-0x76B0.
+        // This loop writes 0x80000000 to COP_CTL (0x60007004) repeatedly.
+        // Without a real COP, this loops forever. Skip to the function return (BX LR at 0x76B8).
+        // Addresses are in remapped space (MMAP enabled), physical = 0x1000xxxx.
+        // if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled) {
+        //     const cop_wake_loop_start: u32 = 0x769C; // BL in the loop
+        //     const cop_wake_loop_body: u32 = 0x76A8; // STR in the loop
+        //     const cop_wake_loop_exit: u32 = 0x76B8; // BX LR after the loop
+        //     if (effective_pc >= 0x10007690 and effective_pc <= 0x100076B8) {
+        //         // Detect the loop (PC in the range 0x769C-0x76B0)
+        //         if (pc == cop_wake_loop_start or pc == cop_wake_loop_body or
+        //             pc == 0x769C or pc == 0x76A0 or pc == 0x76A4 or
+        //             pc == 0x76A8 or pc == 0x76AC or pc == 0x76B0)
+        //         {
+        //             std.debug.print("COP_WAKE_SKIP: PC=0x{X:0>8} -> exit 0x{X:0>8}\n", .{ pc, cop_wake_loop_exit });
+        //             self.cpu.setReg(15, cop_wake_loop_exit);
+        //             return 1;
+        //         }
+        //     }
+        // }
+
         // Trace when PC is in the checksum loop
         if (pc == 0x4000061C) {
             if (self.total_cycles % 10000000 == 0) { // Sample every 10M cycles
