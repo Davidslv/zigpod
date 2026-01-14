@@ -369,37 +369,35 @@ pub fn main() !void {
                 print("COP PC set to 0x10000800 (Apple firmware entry)\n", .{});
             }
         } else {
-            // Rockbox firmware - requires MMAP and initialization
-            // Enable MMAP to map 0x00000000-0x0FFFFFFF to SDRAM 0x10000000+
-            // This is what the bootloader normally does before jumping to Rockbox
+            // Rockbox firmware - let crt0 configure MMAP itself
+            // Rockbox is linked at DRAMORIG=0x00000000 (virtual address 0)
+            // Physical SDRAM starts at 0x10000000
             //
-            // IMPORTANT: Rockbox is linked to run at 0x08000000, so we must set PC
-            // to 0x08000000 (not 0x10000000). The MMAP will translate instruction
-            // fetches from 0x08xxxxxx to 0x10xxxxxx.
-            emu.bus.mmap_enabled = true;
-            emu.bus.mmap_physical[0] = 0x0F00; // Set permission bits to enable MMAP entry 0
+            // IMPORTANT: Do NOT pre-enable MMAP! The crt0 code at 0x17C does:
+            //   r6 = pc & 0xFF000000
+            // When running from physical 0x1000017C, r6 = 0x10000000 (correct)
+            // When running from virtual 0x17C, r6 = 0x00000000 (wrong!)
+            //
+            // So we must start from physical address 0x10000100 and let crt0 set up MMAP.
+            emu.bus.mmap_enabled = false;
             emu.rockbox_restart_count = 1; // Skip COP sync detection since we're loading directly
-            print("MMAP enabled for direct Rockbox loading (mmap_physical[0]=0x0F00)\n", .{});
+            print("MMAP disabled - crt0 will configure it\n", .{});
 
-            // Set PC to Rockbox's linked address (0x08000000), not physical SDRAM
-            // MMAP will translate this to 0x10000000 for memory access
-            emu.cpu.setPc(0x08000000);
+            // Set PC to physical entry point (0x10000100 = SDRAM + crt0 entry)
+            const rockbox_entry: u32 = 0x10000100;
+            emu.cpu.setPc(rockbox_entry);
 
-            // Initialize LR to 0 - Rockbox doesn't return to bootloader, but if it
-            // tries to, this will be caught as an invalid address
+            // Initialize LR to 0 - Rockbox doesn't return to bootloader
             emu.cpu.regs.r[14] = 0;
 
-            // Initialize SP (R13) to a sensible stack location in SDRAM
-            // Use 0x09FFFFE0 which is within 32MB SDRAM (maps to physical 0x11FFFFE0)
-            // This works with both 32MB and 64MB configurations
-            // Rockbox will set up its own stacks, but this provides a safe initial stack
-            emu.cpu.regs.r[13] = 0x09FFFFE0; // Within 32MB SDRAM (MMAP: 0x11FFFFE0)
+            // Initialize SP (R13) to physical stack location in SDRAM
+            emu.cpu.regs.r[13] = 0x11FFFFE0;
 
-            print("PC set to 0x08000000 (Rockbox entry, MMAP -> 0x10000000)\n", .{});
-            print("LR=0x0 (halt on invalid return), SP=0x09FFFFE0 (within 32MB)\n", .{});
+            print("PC set to physical 0x{X:0>8}\n", .{rockbox_entry});
+            print("LR=0x0 (halt on invalid return), SP=0x11FFFFE0 (physical)\n", .{});
             if (enable_cop) {
-                emu.initCop(0x08000000);
-                print("COP PC set to 0x08000000 (same entry point)\n", .{});
+                emu.initCop(rockbox_entry);
+                print("COP PC set to 0x{X:0>8} (same entry point)\n", .{rockbox_entry});
             }
         }
     }

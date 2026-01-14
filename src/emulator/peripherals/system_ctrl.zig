@@ -321,7 +321,14 @@ pub const SystemController = struct {
             REG_DEV_INIT1 => self.dev_init1,
             REG_DEV_INIT2 => self.dev_init2,
             REG_CACHE_CTL => self.cache_ctl,
-            REG_CPU_CTL => self.cpu_ctl,
+            REG_CPU_CTL => blk: {
+                // CPU should always appear AWAKE (bit 31 = 0)
+                const result = self.cpu_ctl & ~@as(u32, 0x80000000);
+                if (self.cop_ctl_read_count < 50 or self.cop_ctl_read_count % 10000 == 0) {
+                    std.debug.print("CPU_CTL READ: 0x{X:0>8} (stored=0x{X:0>8})\n", .{ result, self.cpu_ctl });
+                }
+                break :blk result;
+            },
             // COP_CTL: Always return SLEEPING (bit 31 = 1)
             //
             // ANALYSIS: Both crt0 sync loops AND wake_core exit when PROC_SLEEP=1:
