@@ -1710,6 +1710,93 @@ not just at startup. The scheduler tries to coordinate work with COP continuousl
 
 ---
 
+### 2026-01-14: Scheduler Loop Analysis and Skip Implementation (continued)
+
+**Goal**: Break out of scheduler loops to allow GUI thread to run and produce LCD output
+
+**Analysis Summary**:
+
+After extensive investigation, the execution flow was traced:
+
+1. **main() Execution**:
+   - main() at 0x03E804DC is reached and executing
+   - Calls kernel_init() at 0x7C618
+   - kernel_init() performs ~100 initialization instructions
+   - Enables Timer1, installs IRQ handler
+   - Then blocks on scheduler
+
+2. **Scheduler Flow Identified**:
+   - IRQ handler at 0x7C528 calls scheduler polling at 0x89A20
+   - Scheduler at 0x89A20 calls switch_thread at 0x84B5C
+   - switch_thread at 0x84B5C loops waiting for COP/thread sync
+   - This creates an infinite loop: IRQ → scheduler → switch_thread → loop
+
+3. **Skip Implementation Attempts**:
+
+   | Address | Skip Type | Effect |
+   |---------|-----------|--------|
+   | 0x89A20 | Scheduler skip | Prevented thread switching entirely |
+   | 0x84B5C | switch_thread skip | Returns immediately, scheduler continues |
+   | 0x7C558 | Caller loop escape | Uses stack to find return address |
+   | 0x7C7E0 | Idle loop skip | Triggers timer to attempt thread switch |
+
+4. **Counter Separation**:
+   - Separated `main_trace_count` from `switch_thread_count` to avoid interference
+   - main() trace now shows 100 instructions of kernel initialization
+
+5. **Key Observation - No Thread Switching**:
+   - When we skip switch_thread, we return "no thread to run"
+   - The scheduler accepts this and returns to idle loop
+   - No other threads (like GUI thread) ever get scheduled
+   - Result: 0 LCD pixel writes
+
+**Root Cause Identified**:
+
+The Rockbox kernel's thread scheduler is deeply intertwined with COP (Coprocessor) synchronization:
+- switch_thread at 0x84B5C expects COP responses to determine runnable threads
+- Without real COP, the scheduler cannot identify which threads are ready
+- Skipping switch_thread returns "no threads" which prevents any work from happening
+
+**Current State**:
+
+- ✅ main() reached and executes ~100 instructions of kernel init
+- ✅ Timer1 enabled, IRQ handler installed
+- ✅ Timer IRQ fires and enters handler
+- ✅ Scheduler is called from IRQ handler
+- ❌ switch_thread cannot find runnable threads without COP
+- ❌ GUI thread never scheduled
+- ❌ 0 LCD pixel writes from Rockbox main firmware
+
+**Skips Currently Active**:
+
+1. **switch_thread at 0x84B5C**: Skip after 1000 iterations, return 0
+2. **Caller loop at 0x7C558**: Escape using stack after 4 switch_thread skips
+3. **Idle loop at 0x7C7E0**: Enable IRQ and trigger Timer1 after 50001 iterations
+
+**Required Next Steps**:
+
+1. **Implement Real Thread Queue Simulation**:
+   - Instead of skipping switch_thread, simulate finding a runnable thread
+   - Return thread context pointer instead of 0
+   - This requires understanding Rockbox's thread control block layout
+
+2. **Alternative: Disable COP-Dependent Scheduling**:
+   - Patch Rockbox to use single-core scheduling mode
+   - Or modify COP_CTL responses to satisfy all scheduler checks
+
+3. **Alternative: Direct LCD Test**:
+   - Skip kernel init entirely and jump directly to LCD driver code
+   - Test LCD output without going through scheduler
+
+**Files Modified This Session**:
+
+- `src/emulator/core.zig`: Added switch_thread skip, separated counters
+- `src/emulator/peripherals/system_ctrl.zig`: COP_CTL context-aware responses
+
+**Commit**: (pending)
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis

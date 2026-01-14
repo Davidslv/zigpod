@@ -161,6 +161,15 @@ pub const Emulator = struct {
     /// Counter for iterations in wake_core polling loop
     wake_loop_iterations: u32,
 
+    /// Counter for scheduler skip count (to detect repeated scheduler calls)
+    sched_skip_count: u32,
+
+    /// Counter for idle loop iterations
+    idle_loop_count: u32,
+
+    /// Counter for switch_thread skip iterations
+    switch_thread_count: u32,
+
     /// Flag: Timer1 enabled by emulator to fix kernel initialization
     timer1_enabled_by_emulator: bool,
 
@@ -246,6 +255,9 @@ pub const Emulator = struct {
             .rockbox_restart_count = 0,
             .cop_wake_skip_count = 0,
             .wake_loop_iterations = 0,
+            .sched_skip_count = 0,
+            .idle_loop_count = 0,
+            .switch_thread_count = 0,
             .timer1_enabled_by_emulator = false,
             .main_entered = false,
             .main_trace_count = 0,
@@ -864,6 +876,114 @@ pub const Emulator = struct {
                 std.debug.print("KERNEL_INIT_COMPLETE: IRQ vector installed, Timer1 enabled by firmware\n", .{});
             }
 
+            // SWITCH_THREAD SKIP at 0x84B5C (inner scheduler function that loops)
+            // This function loops waiting for COP/thread sync
+            // Skip immediately by returning success code
+            if (effective_pc == 0x10084B5C or pc == 0x84B5C or pc == 0x00084B5C) {
+                self.switch_thread_count += 1;
+                if (self.switch_thread_count == 1 or self.switch_thread_count % 50000 == 0) {
+                    std.debug.print("SWITCH_THREAD: iter={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                        self.switch_thread_count, pc, self.cpu.getReg(0), self.cpu.getReg(14),
+                    });
+                }
+                // Skip after just 1000 iterations to let scheduler logic run but avoid blocking
+                if (self.switch_thread_count > 1000) {
+                    const lr = self.cpu.getReg(14);
+                    self.sched_skip_count += 1;
+                    if (self.sched_skip_count <= 5 or self.sched_skip_count % 100 == 0) {
+                        std.debug.print("SWITCH_THREAD_SKIP[{}]: returning to LR=0x{X:0>8}\n", .{
+                            self.sched_skip_count, lr,
+                        });
+                    }
+                    // Return success - allow caller to continue
+                    self.cpu.setReg(0, 0);
+                    self.cpu.setReg(15, lr);
+                    self.switch_thread_count = 0;
+                    return 1;
+                }
+            }
+
+            // CALLER LOOP SKIP at 0x7C558 (caller of scheduler)
+            // After multiple scheduler skips, the caller keeps calling it again.
+            // Skip the caller loop by returning to ITS caller.
+            if (effective_pc == 0x10007C558 or pc == 0x7C558 or effective_pc == 0x1007C558) {
+                if (self.sched_skip_count > 3) {
+                    const lr = self.cpu.getReg(14);
+                    const sp = self.cpu.getReg(13);
+
+                    // If LR == PC, we're in a self-loop. Pop return address from stack.
+                    if (lr == pc or lr == effective_pc) {
+                        // Look for saved LR on stack - typical ARM push is {r4-r11, lr}
+                        // Stack grows down, so saved registers are at SP+offset
+                        // Try reading at various offsets to find a valid return address
+                        const saved_at_28 = self.bus.read32(sp + 28); // Offset for 7th pushed reg
+                        const saved_at_32 = self.bus.read32(sp + 32); // Offset for 8th pushed reg
+                        const saved_at_4 = self.bus.read32(sp + 4); // Just after SP
+
+                        std.debug.print("CALLER_LOOP_SELF: LR==PC, SP=0x{X:0>8}, stack[4]=0x{X:0>8}, stack[28]=0x{X:0>8}, stack[32]=0x{X:0>8}\n", .{
+                            sp, saved_at_4, saved_at_28, saved_at_32,
+                        });
+
+                        // Try to find a plausible return address (should be in firmware range)
+                        var return_addr: u32 = 0;
+                        if (saved_at_28 >= 0x7000 and saved_at_28 < 0x100000 and saved_at_28 != pc) {
+                            return_addr = saved_at_28;
+                        } else if (saved_at_32 >= 0x7000 and saved_at_32 < 0x100000 and saved_at_32 != pc) {
+                            return_addr = saved_at_32;
+                        } else if (saved_at_4 >= 0x7000 and saved_at_4 < 0x100000 and saved_at_4 != pc) {
+                            return_addr = saved_at_4;
+                        }
+
+                        if (return_addr != 0) {
+                            std.debug.print("CALLER_LOOP_ESCAPE: Using stack return addr 0x{X:0>8}\n", .{return_addr});
+                            self.cpu.setReg(0, 0);
+                            self.cpu.setReg(13, sp + 36); // Pop 9 registers (36 bytes)
+                            self.cpu.setReg(15, return_addr);
+
+                            // Clear Timer1 interrupt to prevent immediate re-entry
+                            self.int_ctrl.clearInterrupt(.timer1);
+
+                            // Don't fully reset - allow faster escape on repeat
+                            self.sched_skip_count = 2;
+                            return 1;
+                        }
+                    }
+
+                    std.debug.print("CALLER_LOOP_SKIP: sched_skip_count={}, PC=0x{X:0>8}, LR=0x{X:0>8}, SP=0x{X:0>8}\n", .{
+                        self.sched_skip_count, pc, lr, sp,
+                    });
+                    self.cpu.setReg(0, 0);
+                    self.cpu.setReg(15, lr);
+                    // Don't fully reset
+                    self.sched_skip_count = 2;
+                    return 1;
+                }
+            }
+
+            // IDLE LOOP SKIP at 0x7C7E0 (idle thread or main loop)
+            // After scheduler skips, execution ends up here in a tight loop
+            // This is likely the idle thread waiting for interrupts
+            if (effective_pc == 0x10007C7E0 or pc == 0x7C7E0 or effective_pc == 0x1007C7E0) {
+                self.idle_loop_count += 1;
+                if (self.idle_loop_count == 1 or self.idle_loop_count % 100000 == 0) {
+                    std.debug.print("IDLE_LOOP: iter={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8} IRQ_dis={}\n", .{
+                        self.idle_loop_count,
+                        pc,
+                        self.cpu.getReg(0),
+                        self.cpu.getReg(14),
+                        self.cpu.regs.cpsr.irq_disable,
+                    });
+                }
+                // After 50000 iterations, try enabling IRQ and setting pending
+                if (self.idle_loop_count > 50000) {
+                    std.debug.print("IDLE_LOOP_SKIP: after {} iterations, enabling IRQ and triggering timer\n", .{self.idle_loop_count});
+                    self.cpu.enableIrq();
+                    // Fire Timer1 to trigger scheduler
+                    self.int_ctrl.assertInterrupt(.timer1);
+                    self.idle_loop_count = 0;
+                }
+            }
+
             // IRAM LOOP SKIP at 0x400071DC-0x400071EC
             // This is an RNG/entropy loop that spins forever without hardware entropy
             // Skip it after 100000 iterations to allow kernel init to continue
@@ -1087,8 +1207,8 @@ pub const Emulator = struct {
             std.debug.print("KERNEL_PATH: Reached main() entry at PC=0x{X:0>8} (effective=0x{X:0>8}) instr=0x{X:0>8}\n", .{ pc, effective_pc, instr });
         }
 
-        // Trace first 20 instructions after main() entry
-        if (self.main_entered and self.main_trace_count < 20) {
+        // Trace first 100 instructions after main() entry
+        if (self.main_entered and self.main_trace_count < 100) {
             const instr = self.bus.read32(effective_pc);
             std.debug.print("MAIN_TRACE[{d}]: PC=0x{X:0>8} (eff=0x{X:0>8}) instr=0x{X:0>8} LR=0x{X:0>8}\n", .{
                 self.main_trace_count, pc, effective_pc, instr, self.cpu.getReg(14),
