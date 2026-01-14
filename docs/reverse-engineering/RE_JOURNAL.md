@@ -2060,6 +2060,69 @@ MMAP EXEC: cycle=1095900 PC=0x000002D0 -> 0x100002D0 R2=0x... SP=0x...
 
 ---
 
+### 2026-01-14: CPU_CTL Auto-Wake Fix for RTOS Scheduler
+
+**Goal**: Fix scheduler blocking on CPU sleep/wake synchronization
+
+**Problem**:
+The RTOS scheduler was blocking because `core_thread_init()` calls `sleep_core(CPU)` which writes 0x80000000 to CPU_CTL (0x60007000). On real hardware, the COP would wake the CPU by writing 0 to CPU_CTL. Since we don't emulate COP execution, the CPU was stuck forever waiting for a wake signal that never came.
+
+**Root Cause Analysis** (from Rockbox source `firmware/target/arm/pp/system-target.h`):
+```c
+static inline void sleep_core(unsigned int core) {
+    *(core ? &COP_CTL : &CPU_CTL) = PROC_SLEEP;  // Write 0x80000000
+}
+
+static inline void wake_core(unsigned int core) {
+    *(core ? &COP_CTL : &CPU_CTL) = 0;  // Write 0x00000000
+}
+```
+
+The scheduler flow in `firmware/target/arm/pp/thread-pp.c`:
+```c
+void core_thread_init(void) {
+    // CPU wakes COP, then puts itself to sleep waiting for COP to wake it
+    wake_core(COP);
+    sleep_core(CPU);
+    // ... continues after COP wakes CPU ...
+}
+```
+
+**Solution**:
+Added CPU_CTL auto-wake in `system_ctrl.zig`:
+
+```zig
+REG_CPU_CTL => {
+    const PROC_SLEEP: u32 = 0x80000000;
+    if ((value & PROC_SLEEP) != 0) {
+        // CPU trying to sleep - immediately wake it (simulate COP writing 0)
+        std.debug.print("CPU_CTL WRITE: value=0x{X:0>8} (SLEEP) -> auto-wake to 0\n", .{value});
+        self.cpu_ctl = 0; // Auto-wake
+    } else {
+        self.cpu_ctl = value;
+    }
+},
+```
+
+**Results** (15-second test with bootloader + disk image):
+- CPU_CTL auto-wake working: 298 scheduler iterations logged
+- BSS clear loop completes successfully
+- main() has correct value: 0xE92D4880
+- INIT_COPY phase completes: R2=0x03E91BA8 >= R3=0x03E91BA8
+- "Rockbox boot loa..." strings visible in SDRAM
+
+**Remaining Issues**:
+- No LCD output yet (LCD2 bridge not accessed)
+- No ATA disk I/O yet (0xC3xxxxxx registers not accessed)
+- May need more emulation cycles or additional initialization fixes
+
+**Files Changed**:
+- `src/emulator/peripherals/system_ctrl.zig`: Added CPU_CTL auto-wake logic
+
+**Commit**: feat: CPU_CTL auto-wake for RTOS scheduler bypass
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis

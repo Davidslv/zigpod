@@ -471,7 +471,20 @@ pub const SystemController = struct {
             REG_PLL_DIV => self.pll_div = value,
             REG_PLL_STATUS => {}, // Read-only
             REG_CACHE_CTL => self.cache_ctl = value,
-            REG_CPU_CTL => self.cpu_ctl = value,
+            REG_CPU_CTL => {
+                // CPU_CTL handles CPU sleep/wake state
+                // When CPU writes 0x80000000 (PROC_SLEEP), it's putting itself to sleep
+                // and waiting for COP to wake it by writing 0
+                // Since we don't emulate COP, immediately auto-wake the CPU
+                const PROC_SLEEP: u32 = 0x80000000;
+                if ((value & PROC_SLEEP) != 0) {
+                    // CPU trying to sleep - immediately wake it (simulate COP writing 0)
+                    std.debug.print("CPU_CTL WRITE: value=0x{X:0>8} (SLEEP) -> auto-wake to 0\n", .{value});
+                    self.cpu_ctl = 0; // Auto-wake
+                } else {
+                    self.cpu_ctl = value;
+                }
+            },
             REG_COP_CTL => {
                 // COP_CTL handles coprocessor sleep/wake state
                 // Bit 31 (PROC_SLEEP) indicates COP is sleeping
