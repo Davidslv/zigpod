@@ -13,6 +13,28 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2026-01-13 | See below | **SUCCESS** | Boot path fix - Rockbox loads successfully! |
 | 2026-01-14 | See below | In Progress | RTOS scheduler - Timer1/idle loop investigation |
 | 2026-01-14 | [COP_WAKE_INVESTIGATION.md](COP_WAKE_INVESTIGATION.md) | **BLOCKING** | Detailed COP wake analysis with prioritized solutions |
+| 2026-01-14 | See below | In Progress | main() address investigation - binary layout issue |
+
+---
+
+## Important Resources
+
+### Local Rockbox Source Code
+**Location**: `~/projects/rockbox`
+
+Key files for PP502x (iPod Video) development:
+- `firmware/target/arm/pp/crt0-pp.S` - Startup/initialization code
+- `firmware/target/arm/pp/app-pp.lds` - Linker script for main firmware
+- `firmware/target/arm/pp/boot-pp.lds` - Linker script for bootloader
+- `firmware/export/pp5020.h` - PP5020 hardware register definitions
+- `bootloader/ipod.c` - iPod bootloader code
+
+Key memory layout facts:
+- DRAMORIG = 0x00000000 (code linked at address 0)
+- NOCACHE_BASE = 0x10000000 (physical SDRAM)
+- IRAM = 0x40000000 (48KB internal RAM)
+- MMAP0 at 0xf000f000 remaps SDRAM to address 0
+- MMAP at 0x60006100 provides 0x03E8xxxx -> 0x1000xxxx alias
 
 ---
 
@@ -1615,7 +1637,76 @@ The COP_CTL register at 0x60007004:
 - `src/emulator/peripherals/system_ctrl.zig`: COP_CTL always returns AWAKE
 - `src/emulator/core.zig`: Updated wake_core skip logic (now rarely triggers)
 
-**Commit**: (to be committed)
+**Commit**: b360f1d
+
+---
+
+### 2026-01-14: SDRAM 64MB Fix - Major Breakthrough!
+
+**Goal**: Debug why Rockbox main firmware crashes after "Rockbox loaded."
+
+**Critical Bug Found: SDRAM_END Hardcoded to 32MB**
+
+The main() function at virtual address 0x03E804DC was executing `BX LR` (return) immediately
+instead of actual code. Investigation revealed:
+
+1. **The .init section copy loop WAS running** (R2 destination pointer advanced)
+2. **But destination memory never changed** (main() still had 0xE12FFF1E garbage)
+3. **Root cause**: `SDRAM_END` in bus.zig was hardcoded to `0x11FFFFFF` (32MB)
+4. **Problem**: Rockbox iPod Video is compiled for 64MB RAM
+   - ENDAUDIOADDR = 0x03E80000 (where .init section goes)
+   - With MMAP, this translates to physical 0x13E8xxxx
+   - 0x13E8xxxx > 0x11FFFFFF, so `getRegion()` returned `.unmapped`
+   - Writes to unmapped memory were silently dropped!
+
+**Fixes Applied**:
+
+1. **SDRAM_END**: `0x11FFFFFF` → `0x13FFFFFF` (64MB)
+   ```zig
+   const SDRAM_END: u32 = 0x13FFFFFF; // 64MB maximum
+   ```
+
+2. **MMAP mask**: `0x00003E00` (32MB) → `0x00003C00` (64MB)
+   Required for addresses in 0x03E8xxxx range to translate correctly.
+
+3. **COP_CTL kernel-phase response**: Return AWAKE after kernel_init_complete
+   The scheduler loops wait for COP to be AWAKE, not SLEEPING.
+
+**Results After Fix**:
+
+| Before Fix | After Fix |
+|------------|-----------|
+| main() = 0xE12FFF1E (BX LR) | main() = 0xE92D4880 (PUSH {R7,R11,LR}) |
+| Execution returns immediately | Execution enters kernel init |
+| 0 LCD writes from firmware | Timer1 enabled, IRQ handler running |
+
+**Current State**:
+
+- ✅ Bootloader LCD: 460,800 pixel writes (working perfectly)
+- ✅ .init section copy: Working (main() has valid code)
+- ✅ main() execution: Starts correctly
+- ✅ kernel_init: Progresses (Timer1 enabled, IRQ vector installed)
+- ❌ LCD from Rockbox: 0 writes (stuck in IRQ handler loops)
+
+**IRQ Handler Loop Analysis**:
+
+After kernel init, CPU enters IRQ mode and gets stuck around 0x84B5C-0x84BA4.
+This code is in the scheduler/threading system and polls for COP coordination:
+- Reads from process control array at R12 + R0*4
+- Tests bit 31 (PROC_SLEEP) for each task/core
+- Loops waiting for specific conditions
+
+The fundamental issue: **Rockbox assumes dual-core operation throughout the kernel**,
+not just at startup. The scheduler tries to coordinate work with COP continuously.
+
+**Potential Solutions** (not yet implemented):
+
+1. **Full COP emulation**: Emulate COP as second ARM core responding to coordination
+2. **Single-core Rockbox build**: Compile Rockbox with single-core option
+3. **Aggressive loop skipping**: Detect and skip all COP coordination loops
+4. **Fake scheduler tick**: Inject thread context switches without COP
+
+**Commit**: b360f1d
 
 ---
 
