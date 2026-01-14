@@ -12,6 +12,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2026-01-13 | See below | **SUCCESS** | Rockbox bootloader LCD output working! |
 | 2026-01-13 | See below | **SUCCESS** | Boot path fix - Rockbox loads successfully! |
 | 2026-01-14 | See below | In Progress | RTOS scheduler - Timer1/idle loop investigation |
+| 2026-01-14 | [COP_WAKE_INVESTIGATION.md](COP_WAKE_INVESTIGATION.md) | **BLOCKING** | Detailed COP wake analysis with prioritized solutions |
 
 ---
 
