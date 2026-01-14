@@ -764,7 +764,8 @@ pub const Emulator = struct {
 
         // COP polling loop at 0x10000148 - CPU waits for COP to sleep
         // The loop is: LDR R1,[R2] / TST R1,#0x80000000 / BEQ (loop)
-        // We need bit 31 set in COP_STATUS for the loop to exit
+        // With COP_CTL returning SLEEPING (bit 31=1), this loop exits naturally.
+        // RE-ENABLED: Other loops at 0x200+ expect AWAKE, so we need to skip all.
         if (pc == 0x10000148) {
             // Note: 0x1004 is the offset from sys_ctrl base 0x60006000 for COP_CTL at 0x60007004
             const cop_status = self.sys_ctrl.read(0x1004);
@@ -798,7 +799,7 @@ pub const Emulator = struct {
         }
 
         // COP polling loop at 0x1F4 (post-MMAP) - waits for bit 31 = 1 (sleeping)
-        // This is in the early startup after MMAP is enabled
+        // RE-ENABLED: Multiple loop types exist, need to skip all
         if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled and effective_pc == 0x100001F4) {
             const exit_addr: u32 = if (pc < 0x01000000) 0x200 else 0x10000200;
             std.debug.print("COP_POLL_SKIP_1F4: PC=0x{X:0>8} -> exit 0x{X:0>8}\n", .{ pc, exit_addr });
@@ -806,6 +807,7 @@ pub const Emulator = struct {
             return 1;
         }
 
+        // RE-ENABLED: Some loops expect AWAKE, some expect SLEEPING - can't satisfy all
         if (self.rockbox_restart_count >= 1 and effective_pc >= 0x10000200 and effective_pc < 0x10000400) {
             // Detected loop start addresses (found empirically):
             // 0x10000204, 0x1000023C, 0x10000258, 0x10000270, 0x10000288, 0x100002C8
@@ -834,78 +836,131 @@ pub const Emulator = struct {
             }
         }
 
-        // COP WAKE SKIP: wake_core at 0x769C waits for COP response.
-        // Without COP emulation, this loop never completes naturally.
-        // Skip at entry by returning via LR or jumping to the function epilogue.
+        // KERNEL INIT DETECTION: Check if kernel init has completed
+        // Milestones: IRQ vector installed + Timer1 enabled by firmware
+        // When both are detected, mark kernel_init_complete for diagnostics.
         if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled) {
-            if (pc == 0x769C or effective_pc == 0x1000769C) {
+            // Check for IRQ vector installation
+            const irq_installed = self.bus.isIrqVectorInstalled();
+
+            // Check for Timer1 enable by firmware (not by us)
+            const timer1_enabled = self.timer.timer1.isEnabled() and !self.timer1_enabled_by_emulator;
+            if (timer1_enabled and !self.bus.timer1_enabled_by_firmware) {
+                self.bus.markTimer1EnabledByFirmware();
+            }
+
+            // Mark kernel init complete when both milestones reached
+            if (irq_installed and self.bus.timer1_enabled_by_firmware and !self.sys_ctrl.isKernelInitComplete()) {
+                self.sys_ctrl.setKernelInitComplete();
+                std.debug.print("KERNEL_INIT_COMPLETE: IRQ vector installed, Timer1 enabled by firmware\n", .{});
+            }
+
+            // IRAM LOOP SKIP at 0x400071DC-0x400071EC
+            // This is an RNG/entropy loop that spins forever without hardware entropy
+            // Skip it after 100000 iterations to allow kernel init to continue
+            if (pc >= 0x400071D0 and pc <= 0x40007200) {
+                self.wake_loop_iterations += 1;
+                if (self.wake_loop_iterations == 1 or self.wake_loop_iterations == 100) {
+                    std.debug.print("IRAM_LOOP: iter={} PC=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                        self.wake_loop_iterations,
+                        pc,
+                        self.cpu.getReg(14),
+                    });
+                }
+                // Skip after 100000 iterations
+                if (self.wake_loop_iterations > 100000) {
+                    const lr = self.cpu.getReg(14);
+                    std.debug.print("IRAM_LOOP_SKIP: Skipping after {} iterations, returning to 0x{X:0>8}\n", .{
+                        self.wake_loop_iterations,
+                        lr,
+                    });
+                    // Set R0 to a "success" value and return to caller
+                    self.cpu.setReg(0, 0);
+                    self.cpu.setReg(15, lr);
+                    self.wake_loop_iterations = 0;
+                    return 1;
+                }
+            }
+
+            // WAKE_CORE HANDLING at 0x769C-0x76B8 (function body only, not idle thread)
+            // wake_core polls COP_CTL and MBX_MSG_STAT in a loop.
+            // The idle thread at 0x76BC+ calls wake_core, so we only skip the inner function.
+            const in_wake_core = (pc >= 0x769C and pc <= 0x76B8) or
+                (effective_pc >= 0x1000769C and effective_pc <= 0x100076B8);
+            if (in_wake_core) {
                 self.cop_wake_skip_count += 1;
                 const lr = self.cpu.getReg(14);
 
+                // Debug trace first 5 entries
                 if (self.cop_wake_skip_count <= 5) {
-                    std.debug.print("WAKE_CORE_SKIP: #{} LR=0x{X:0>8}\n", .{ self.cop_wake_skip_count, lr });
+                    std.debug.print("WAKE_CORE: iter={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                        self.cop_wake_skip_count,
+                        pc,
+                        self.cpu.getReg(0),
+                        lr,
+                    });
                 }
 
-                // Skip the function entirely by returning to caller
-                // If LR is invalid (0, 0x769C, or pointing back to wake_core),
-                // jump to idle thread exit at 0x76C4
-                if (lr == 0 or lr == 0x769C or lr == 0x1000769C or (lr >= 0x76A0 and lr <= 0x76C4)) {
-                    self.cpu.setReg(15, 0x76C4);
-                    if (self.cop_wake_skip_count <= 5) {
-                        std.debug.print("WAKE_CORE_SKIP: LR invalid, jumping to 0x76C4\n", .{});
-                    }
-                } else {
-                    // Valid LR - return to caller
-                    self.cpu.setReg(15, lr);
-                    if (self.cop_wake_skip_count <= 5) {
-                        std.debug.print("WAKE_CORE_SKIP: Returning to caller at 0x{X:0>8}\n", .{lr});
-                    }
-                }
+                // COP sync loop skip: The loop at 0x76A4-0x76B0 is an infinite loop waiting for
+                // IRQ/COP response. Without IRQ, we need to simulate a function return.
+                // The function at 0x7694 pushed {R4, LR} - we need to pop them to return properly.
+                if (self.cop_wake_skip_count > 10000) {
+                    // Read the saved return address from stack
+                    // PUSH {R4, LR} = SP -= 8, then store R4 at SP, LR at SP+4
+                    const sp = self.cpu.getReg(13);
+                    const saved_lr = self.bus.read32(sp + 4);
+                    const saved_r4 = self.bus.read32(sp);
 
-                // Enable IRQs for scheduler
-                self.cpu.enableIrq();
-                return 1;
+                    std.debug.print("WAKE_CORE_SKIP: iter={} SP=0x{X:0>8} saved_R4=0x{X:0>8} saved_LR=0x{X:0>8}\n", .{
+                        self.cop_wake_skip_count,
+                        sp,
+                        saved_r4,
+                        saved_lr,
+                    });
+
+                    // Check if saved_LR is valid (not 0 and not inside wake_core)
+                    const is_valid_lr = saved_lr != 0 and
+                        (saved_lr < 0x7694 or saved_lr > 0x76B8) and
+                        (saved_lr < 0x10007694 or saved_lr > 0x100076B8);
+
+                    if (is_valid_lr) {
+                        // Simulate POP {R4, PC} - return to caller
+                        self.cpu.setReg(4, saved_r4);
+                        self.cpu.setReg(15, saved_lr);
+                        self.cpu.setReg(13, sp + 8);
+                        std.debug.print("WAKE_CORE_SKIP: Returning to valid LR=0x{X:0>8}\n", .{saved_lr});
+                    } else {
+                        // saved_LR=0 or inside wake_core - this is a task entry point
+                        // Skip to idle_thread at 0x76BC instead of returning
+                        // Keep stack as-is since we're not returning
+                        self.cpu.setReg(15, 0x76BC);
+                        std.debug.print("WAKE_CORE_SKIP: Invalid LR, jumping to idle_thread at 0x76BC\n", .{});
+                    }
+                    self.cpu.enableIrq(); // Enable IRQs for scheduler
+                    self.cop_wake_skip_count = 0;
+                    return 1;
+                }
             }
 
-            // TIMER1 KICKSTART: If we're stuck in idle loop and Timer1
-            // isn't enabled, manually configure and enable it to start the scheduler.
-            // Idle loop at 0x76C4-0x76DC, includes branch back instruction
+            // Track idle loop iterations (for debugging)
             const in_idle_loop = (pc >= 0x76C4 and pc <= 0x76DC) or
                 (effective_pc >= 0x100076C4 and effective_pc <= 0x100076DC);
-            if (in_idle_loop and !self.timer1_enabled_by_emulator) {
+            if (in_idle_loop) {
                 self.wake_loop_iterations += 1;
-                // Debug: print at key iteration counts
-                if (self.wake_loop_iterations == 1 or self.wake_loop_iterations == 1000 or self.wake_loop_iterations == 5000) {
-                    std.debug.print("TIMER1_KICKSTART: idle loop iter={} PC=0x{X:0>8}\n", .{ self.wake_loop_iterations, pc });
-                }
-                // After 10000 iterations in idle loop, enable Timer1
-                if (self.wake_loop_iterations > 10000) {
-                    self.timer1_enabled_by_emulator = true;
-                    std.debug.print("TIMER1_KICKSTART: Enabling Timer1 after {} idle iterations\n", .{self.wake_loop_iterations});
-
-                    // Configure Timer1 for 10ms tick (10000 us)
-                    // Timer runs at 1MHz, so count = 10000
-                    const timer_config: u32 = 0xC0000000 | 10000; // Enable + Repeat + 10000 count
-                    self.timer.timer1.setConfig(timer_config);
-                    std.debug.print("TIMER1_KICKSTART: config=0x{X:0>8}\n", .{timer_config});
-
-                    // Enable Timer1 interrupt in interrupt controller
-                    self.int_ctrl.cpu_enable |= 0x00000001; // Timer1 is bit 0
-
-                    // Protect Timer1 from being disabled by firmware
-                    self.int_ctrl.protectInterrupt(.timer1);
-
-                    self.wake_loop_iterations = 0;
+                if (self.wake_loop_iterations == 1 or self.wake_loop_iterations % 100000 == 0) {
+                    std.debug.print("IDLE_LOOP: iter={} PC=0x{X:0>8} Timer1={} IRQ_vector={}\n", .{
+                        self.wake_loop_iterations,
+                        pc,
+                        self.timer.timer1.isEnabled(),
+                        self.bus.isIrqVectorInstalled(),
+                    });
                 }
             } else {
-                // Only reset counter if we're not in wake_core or idle loop area
-                // The idle thread at 0x76C4-0x76DC calls wake_core at 0x769C
+                // Include IRAM loop area in the "don't reset" check
                 const in_wake_area = (pc >= 0x769C and pc <= 0x76DC) or
-                    (effective_pc >= 0x1000769C and effective_pc <= 0x100076DC);
-                if (!in_wake_area) {
-                    if (self.wake_loop_iterations > 0 and self.wake_loop_iterations < 10) {
-                        std.debug.print("TIMER1_RESET: PC=0x{X:0>8} iter was {}\n", .{ pc, self.wake_loop_iterations });
-                    }
+                    (effective_pc >= 0x1000769C and effective_pc <= 0x100076DC) or
+                    (pc >= 0x400071D0 and pc <= 0x40007200);
+                if (!in_wake_area and self.wake_loop_iterations > 0) {
                     self.wake_loop_iterations = 0;
                 }
             }

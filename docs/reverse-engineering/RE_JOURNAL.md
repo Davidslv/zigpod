@@ -1517,6 +1517,107 @@ The fundamental problem is a chicken-and-egg issue:
 
 ---
 
+---
+
+### 2026-01-14: COP Always-Awake Fix - Major Progress!
+
+**Goal**: Fix kernel initialization getting stuck in wake_core COP synchronization loop
+
+**Background**:
+Previous investigations identified a chicken-and-egg problem:
+- wake_core function at 0x7694-0x76B8 loops forever writing to COP_CTL waiting for IRQ
+- Skipping wake_core caused the caller to loop back and call it again infinitely
+- The saved LR on stack was 0 (task entry point), so returning from the function didn't help
+
+**Root Cause Analysis**:
+
+Traced the actual COP_CTL read/write pattern:
+1. System does only 2 COP_CTL reads BEFORE entering wake_core
+2. Both reads returned SLEEPING (bit 31 = 1)
+3. This caused the system to call wake_core to "wake up" the COP
+4. wake_core function structure:
+   ```arm
+   7694: PUSH {R4, LR}           ; Function entry
+   7698: BL 0x7C618              ; Call setup function
+   769C: BL 0x7668               ; Call another setup
+   76A0: LDR R3, [PC, #12]       ; Load COP_CTL address (0x60007004)
+   76A4: MOV R0, #0x80000000     ; Load wake signal
+   76A8: STR R0, [R3]            ; Write to COP_CTL
+   76AC: NOP
+   76B0: B 0x76A4                ; INFINITE LOOP - no exit condition!
+   ```
+
+**Key Insight**:
+The infinite loop at 0x76A4-0x76B0 has NO SOFTWARE EXIT CONDITION. It's designed to:
+1. Send wake signal to COP continuously
+2. Be interrupted by Timer1 IRQ or COP response IRQ
+3. Never exit through normal control flow
+
+Since we don't emulate the COP or have proper IRQ support, this loop is genuinely infinite.
+
+**Solution: COP Always-Awake**:
+
+Instead of trying to skip wake_core (which kept getting re-called), we prevent it from being called in the first place by making COP_CTL always return "awake":
+
+```zig
+// In system_ctrl.zig - COP_CTL read
+REG_COP_CTL => blk: {
+    // EXPERIMENT: Always return COP awake (bit 31 = 0)
+    // This prevents the system from needing to call wake_core
+    result = ready_flags; // bit 31 = 0 (awake)
+    sleep_state = "AWAKE";
+    break :blk result;
+},
+```
+
+**Results**:
+
+| Before | After |
+|--------|-------|
+| 2 COP_CTL reads → stuck in wake_core | Many COP_CTL reads → system progresses |
+| PC stuck at 0x769C-0x76B8 | Execution reaches FAT32 filesystem scanning |
+| 0 LCD writes | System actively reading directory entries |
+| kernel_init=false | System progresses through initialization |
+
+**Debug Output After Fix**:
+```
+COP_CTL READ #1: 0x4000FE00 (AWAKE, ack_countdown=0, kernel_init=false)
+COP_CTL READ #2: 0x4000FE00 (AWAKE, ack_countdown=0, kernel_init=false)
+...
+COP_CTL READ #20: 0x4000FE00 (AWAKE, ack_countdown=0, kernel_init=false)
+...
+DIR_ENTRY[0x11006F54]: first_byte=0x41('A'), val=0x50006941
+LFN_START READ at 0x11006F54: val=0x50006941
+ATTR READ at 0x11006F5C: val=0x0F005F00, attr_byte=0x0F
+```
+
+The system is now:
+1. Progressing past COP synchronization
+2. Initializing FAT32 filesystem
+3. Reading directory entries from SDRAM
+4. Searching for iPod_Control and .rockbox directories
+
+**Remaining Work**:
+- Timer1 still shows `enabled=false` - scheduler not running yet
+- IRQ_vector not installed - interrupt handlers not set up
+- PC eventually reaches ~0x08000144-0x08000148 in early init code
+- May need additional fixes to complete kernel initialization
+
+**Technical Details**:
+
+The COP_CTL register at 0x60007004:
+- Bit 31 (PROC_SLEEP): 1 = COP sleeping, 0 = COP awake
+- By always returning bit 31 = 0, the firmware sees COP as already awake
+- This lets initialization proceed without blocking on COP sync
+
+**Files Changed**:
+- `src/emulator/peripherals/system_ctrl.zig`: COP_CTL always returns AWAKE
+- `src/emulator/core.zig`: Updated wake_core skip logic (now rarely triggers)
+
+**Commit**: (to be committed)
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis
