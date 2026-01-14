@@ -665,6 +665,24 @@ pub const Emulator = struct {
                 });
             }
         }
+
+        // CRITICAL: Check for PC values that are clearly invalid (outside all memory regions)
+        // Valid regions: 0x00-0x1C (vectors), IRAM (0x40000000), SDRAM (0x10000000-0x14000000),
+        // MMAP regions (0x00-0x10000000 when MMAP enabled)
+        // Values > 0x80000000 or == 0xE12FFF1C (looks like BX instruction) are definitely wrong
+        if (pc >= 0x80000000 or (pc >= 0x14000000 and pc < 0x40000000)) {
+            std.debug.print("\n!!! FATAL: PC=0x{X:0>8} is outside all valid memory regions !!!\n", .{pc});
+            std.debug.print("    LR=0x{X:0>8}, R0=0x{X:0>8}, R1=0x{X:0>8}, R2=0x{X:0>8}\n", .{
+                self.cpu.getReg(14), self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2),
+            });
+            std.debug.print("    R12=0x{X:0>8}, SP=0x{X:0>8}, cycle={}\n", .{
+                self.cpu.getReg(12), self.cpu.getReg(13), self.total_cycles,
+            });
+            std.debug.print("    This likely indicates a corrupt return address or bad branch\n", .{});
+            // Halt execution by setting a breakpoint or trap
+            self.running = false;
+            return 0;
+        }
         // COP SYNC FIX: PP5021C has dual ARM cores (CPU + COP) that need to synchronize
         // at startup. Since we only emulate CPU, Rockbox's crt0 startup enters an infinite
         // loop waiting for COP. This fix detects the restart and skips past ALL sync code.

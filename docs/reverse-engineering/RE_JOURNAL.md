@@ -1197,6 +1197,88 @@ When using `--load-sdram rockbox.ipod`, the firmware wasn't executing correctly:
 
 ---
 
+### 2026-01-14: CP15 Coprocessor Emulation & SDRAM Stack Fix
+
+**Goal**: Fix exception cascade when loading Rockbox directly via --load-sdram
+
+**Problem Identified**:
+When loading rockbox.ipod directly, execution bounced between exception vectors 0x04 (undefined)
+and 0x08 (SWI). Investigation revealed two issues:
+
+1. **CP15 Coprocessor Instructions**: Rockbox uses CP15 (System Control Coprocessor) instructions
+   for cache/MMU control. ARM7TDMI doesn't have CP15, but PP5021C does. Without emulation,
+   these triggered undefined instruction exceptions.
+
+2. **SDRAM Stack Out of Bounds**: Initial SP was set to 0x0BFFFFE0 (top of 64MB SDRAM),
+   but emulator defaults to 32MB. Stack writes went to unmapped memory, corrupting LR.
+
+**Root Cause Analysis**:
+
+The exception cascade was caused by MRC/MCR p15 instructions at Rockbox startup:
+```asm
+MRC p15, 0, R0, c1, c0, 0   ; Read control register
+BIC R0, R0, #...            ; Clear cache bits
+MCR p15, 0, R0, c1, c0, 0   ; Write control register
+MRC p15, 0, PC, c7, c10, 3  ; Test clean with PC = set flags
+```
+
+The MRC with Rd=PC is a special case that sets condition flags instead of writing to PC.
+Rockbox uses this to test cache state in a loop.
+
+**Solution Implemented**:
+
+1. **CP15 Emulation** (`arm_executor.zig`):
+   - Added `executeCoprocessor15()` function
+   - Handles MRC (read) and MCR (write) for key registers:
+     - CRn=0: ID register (returns 0x41007000 for ARM720T-like ID)
+     - CRn=1: Control register (returns 0 = cache/MMU disabled)
+     - CRn=2: Page table base
+     - CRn=3: Domain access control
+     - CRn=7: Cache operations
+     - CRn=8: TLB operations
+   - MRC with Rd=PC sets NZCV flags from result (Z=1 for cache test = pass)
+   - MCR writes are logged but ignored (no actual cache in emulator)
+
+2. **Stack Location Fix** (`main.zig`):
+   - Changed initial SP from 0x0BFFFFE0 to 0x09FFFFE0
+   - 0x09FFFFE0 is within 32MB SDRAM (maps to physical 0x11FFFFE0)
+   - Works with both 32MB and 64MB configurations
+
+3. **Invalid PC Detection** (`core.zig`):
+   - Added check for PC values > 0x80000000 or in unmapped ranges
+   - Logs detailed register state and halts cleanly on invalid jump
+
+**Result**:
+- Rockbox successfully executes through CP15 setup
+- Page table initialization works (writes to 0x0BFFC000)
+- MMU/cache enable sequence completes
+- Execution progresses to FAT32 filesystem scanning
+- No more exception cascade!
+
+**CP15 Register Reference (PP5021C)**:
+
+| CRn | CRm | op2 | Name | Emulated Value |
+|-----|-----|-----|------|----------------|
+| 0 | 0 | 0 | Main ID | 0x41007000 |
+| 0 | 0 | 1 | Cache Type | 0x00000000 |
+| 1 | 0 | 0 | Control | 0x00000000 |
+| 2 | 0 | 0 | TTB | (ignored) |
+| 3 | 0 | 0 | Domain Access | (ignored) |
+| 7 | * | * | Cache Ops | Z=1 for test |
+| 8 | * | * | TLB Ops | (ignored) |
+
+**Files Changed**:
+- `src/emulator/cpu/arm_executor.zig`: CP15 emulation
+- `src/emulator/main.zig`: SP initialization within 32MB
+- `src/emulator/core.zig`: Invalid PC detection
+
+**Next Steps**:
+1. Rockbox now reaches filesystem scanning
+2. Need proper FAT32 disk image with .rockbox directory
+3. Or investigate further what files Rockbox is looking for
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis

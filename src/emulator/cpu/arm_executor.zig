@@ -92,7 +92,14 @@ pub fn execute(regs: *RegisterFile, bus: *const MemoryBus, instruction: u32) u32
         .mrs => executeMrs(regs, instruction),
         .msr => executeMsr(regs, instruction),
         .coprocessor_data, .coprocessor_transfer, .coprocessor_register => {
-            // Coprocessor instructions - undefined on ARM7TDMI without coprocessor
+            // Check for CP15 (system control coprocessor)
+            // PP5021C doesn't have true CP15, but Rockbox may use these instructions
+            // We emulate CP15 to allow the code to continue
+            const cp_num: u4 = @truncate((instruction >> 8) & 0xF);
+            if (cp_num == 15) {
+                return executeCoprocessor15(regs, instruction);
+            }
+            // Other coprocessors - undefined on ARM7TDMI without coprocessor
             _ = exceptions.enterException(regs, .undefined);
             return 3;
         },
@@ -735,6 +742,110 @@ fn executeMsr(regs: *RegisterFile, instruction: u32) u32 {
     }
 
     return 1;
+}
+
+/// Execute CP15 (System Control Coprocessor) instruction
+/// PP5021C doesn't have true CP15, but Rockbox uses these instructions.
+/// We emulate basic CP15 functionality to allow the code to continue.
+///
+/// CP15 Register Layout:
+/// - c0: ID registers (read-only)
+/// - c1: Control register (cache/MMU enable bits)
+/// - c7: Cache operations
+/// - c9: Cache lockdown
+///
+/// Instruction formats:
+/// MRC p15, op1, Rd, CRn, CRm, op2  - Read from CP15
+/// MCR p15, op1, Rd, CRn, CRm, op2  - Write to CP15
+fn executeCoprocessor15(regs: *RegisterFile, instruction: u32) u32 {
+    // Decode coprocessor instruction fields
+    const is_mrc = (instruction >> 20) & 0x1 == 1; // L bit: 1=MRC (read), 0=MCR (write)
+    const crn: u4 = @truncate((instruction >> 16) & 0xF); // CRn field
+    const rd: u4 = @truncate((instruction >> 12) & 0xF); // Destination/source register
+    const op2: u3 = @truncate((instruction >> 5) & 0x7); // Opcode 2
+    const crm: u4 = @truncate(instruction & 0xF); // CRm field
+
+    // CP15 register values (emulated)
+    // These are typical values for an ARM processor with caches disabled
+    const cp15_regs = struct {
+        // c0,c0,0 - Main ID Register: ARM7TDMI-like ID
+        const main_id: u32 = 0x41007000;
+        // c0,c0,1 - Cache Type Register: No caches
+        const cache_type: u32 = 0x00000000;
+        // c1,c0,0 - Control Register: Everything disabled
+        const control: u32 = 0x00000000;
+    };
+
+    if (is_mrc) {
+        // MRC - Read from CP15
+        var value: u32 = 0;
+
+        switch (crn) {
+            0 => {
+                // ID registers
+                switch (crm) {
+                    0 => {
+                        switch (op2) {
+                            0 => value = cp15_regs.main_id, // Main ID
+                            1 => value = cp15_regs.cache_type, // Cache Type
+                            else => value = 0,
+                        }
+                    },
+                    else => value = 0,
+                }
+            },
+            1 => {
+                // Control register
+                if (crm == 0 and op2 == 0) {
+                    value = cp15_regs.control;
+                }
+            },
+            else => {
+                // Other registers return 0
+                value = 0;
+            },
+        }
+
+        // Write result to destination register
+        if (rd == 15) {
+            // When Rd=PC, the result sets condition flags instead of writing to PC
+            // This is used for test/wait operations (e.g., cache clean test)
+            // Set NZCV flags based on result:
+            // - N = bit 31, Z = (result == 0), C = bit 30, V = bit 29
+            regs.cpsr.negative = (value >> 31) != 0;
+            regs.cpsr.zero = (value == 0);
+            regs.cpsr.carry = ((value >> 30) & 1) != 0;
+            regs.cpsr.overflow = ((value >> 29) & 1) != 0;
+        } else {
+            regs.set(rd, value);
+        }
+
+        // Debug trace for first few accesses
+        const count = struct {
+            var c: u32 = 0;
+        };
+        if (count.c < 10) {
+            count.c += 1;
+            if (rd == 15) {
+                std.debug.print("CP15 MRC: CRn={}, CRm={}, op2={}, Rd=PC (flags: N={} Z={} C={} V={})\n", .{ crn, crm, op2, @intFromBool(regs.cpsr.negative), @intFromBool(regs.cpsr.zero), @intFromBool(regs.cpsr.carry), @intFromBool(regs.cpsr.overflow) });
+            } else {
+                std.debug.print("CP15 MRC: CRn={}, CRm={}, op2={}, Rd=r{} -> 0x{X:0>8}\n", .{ crn, crm, op2, rd, value });
+            }
+        }
+    } else {
+        // MCR - Write to CP15 (ignored, but logged)
+        const value = regs.get(rd);
+
+        const count = struct {
+            var c: u32 = 0;
+        };
+        if (count.c < 10) {
+            count.c += 1;
+            std.debug.print("CP15 MCR: CRn={}, CRm={}, op2={}, value=0x{X:0>8} (ignored)\n", .{ crn, crm, op2, value });
+        }
+    }
+
+    return 1; // 1 cycle for coprocessor operations
 }
 
 // Tests

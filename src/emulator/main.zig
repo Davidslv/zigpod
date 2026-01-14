@@ -384,7 +384,19 @@ pub fn main() !void {
             // Set PC to Rockbox's linked address (0x08000000), not physical SDRAM
             // MMAP will translate this to 0x10000000 for memory access
             emu.cpu.setPc(0x08000000);
+
+            // Initialize LR to 0 - Rockbox doesn't return to bootloader, but if it
+            // tries to, this will be caught as an invalid address
+            emu.cpu.regs.r[14] = 0;
+
+            // Initialize SP (R13) to a sensible stack location in SDRAM
+            // Use 0x09FFFFE0 which is within 32MB SDRAM (maps to physical 0x11FFFFE0)
+            // This works with both 32MB and 64MB configurations
+            // Rockbox will set up its own stacks, but this provides a safe initial stack
+            emu.cpu.regs.r[13] = 0x09FFFFE0; // Within 32MB SDRAM (MMAP: 0x11FFFFE0)
+
             print("PC set to 0x08000000 (Rockbox entry, MMAP -> 0x10000000)\n", .{});
+            print("LR=0x0 (halt on invalid return), SP=0x09FFFFE0 (within 32MB)\n", .{});
             if (enable_cop) {
                 emu.initCop(0x08000000);
                 print("COP PC set to 0x08000000 (same entry point)\n", .{});
