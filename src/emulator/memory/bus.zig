@@ -1807,7 +1807,10 @@ pub const MemoryBus = struct {
     }
 
     fn readSdram(self: *Self, addr: u32) u32 {
-        const offset = addr - SDRAM_START;
+        // Apply address wrapping for smaller SDRAM sizes (e.g., 32MB on 30GB iPod)
+        // Rockbox uses this for RAM detection: reads from 0x11FFFFFF detect RAM size
+        const raw_offset = addr - SDRAM_START;
+        const offset = raw_offset % self.sdram.len;
 
         var value: u32 = 0xE12FFF1E; // Default: "BX LR" for unmapped
 
@@ -1865,7 +1868,10 @@ pub const MemoryBus = struct {
     }
 
     fn writeSdram(self: *Self, addr: u32, value: u32) void {
-        const offset = addr - SDRAM_START;
+        // Apply address wrapping for smaller SDRAM sizes (e.g., 32MB on 30GB iPod)
+        // Rockbox uses this for RAM detection: writes to 0x13FFFFFF wrap to 0x11FFFFFF on 32MB
+        const raw_offset = addr - SDRAM_START;
+        const offset = raw_offset % self.sdram.len;
         if (offset + 3 < self.sdram.len) {
             // Capture first SDRAM write
             if (self.sdram_write_count == 0) {

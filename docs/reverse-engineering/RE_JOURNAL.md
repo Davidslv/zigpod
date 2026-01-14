@@ -1793,7 +1793,84 @@ The Rockbox kernel's thread scheduler is deeply intertwined with COP (Coprocesso
 - `src/emulator/core.zig`: Added switch_thread skip, separated counters
 - `src/emulator/peripherals/system_ctrl.zig`: COP_CTL context-aware responses
 
-**Commit**: (pending)
+**Commit**: 2c640cf
+
+---
+
+### 2026-01-14: SDRAM Configuration - 32MB vs 64MB and Runtime Detection
+
+**Goal**: Configure emulator for 30GB iPod 5G (32MB SDRAM)
+
+**Critical Discovery: Rockbox Runtime RAM Detection**
+
+Rockbox uses a **single unified build** for all iPod Video models. It detects RAM size at runtime using a clever technique in `crt0-pp.S`:
+
+```asm
+/* detect 32mb vs 64mb model */
+mov    r2, #0x12000000
+mov    r3, #64
+strb   r3, [r2, #-1]   /* write 64 to 0x11FFFFFF (last byte of first 32MB) */
+
+mov    r2, #0x14000000
+mov    r3, #32
+strb   r3, [r2, #-1]   /* write 32 to 0x13FFFFFF (last byte of second 32MB) */
+
+/* If 32MB RAM: 0x13FFFFFF wraps to 0x11FFFFFF, value becomes 32 */
+/* If 64MB RAM: 0x13FFFFFF is separate location, value stays 64 */
+```
+
+The detection is read later in `system_init()` (`system-pp502x.c:598`):
+```c
+volatile unsigned char *end32 = (volatile unsigned char *)0x01ffffff;
+probed_ramsize = *end32;
+```
+
+And used in `core_allocator_init()` (`core_alloc.c:48`):
+```c
+if(MEMORYSIZE==64 && probed_ramsize!=64)
+{
+    audiobufend -= (32<<20);  // Reduce audio buffer by 32MB
+}
+```
+
+**iPod Video Memory Configurations**:
+
+| Model | Storage | RAM | Logic Board |
+|-------|---------|-----|-------------|
+| 5G | 30GB | 32MB | 820-1763-A |
+| 5G | 60GB | 64MB | 820-1763-A |
+| 5.5G | 30GB | 32MB | 820-1975-A |
+| 5.5G | 80GB | 64MB | 820-1975-A |
+
+**Emulator Fixes Applied**:
+
+1. **Default SDRAM to 32MB** (`main.zig`):
+   ```zig
+   var sdram_mb: usize = 32; // For 30GB iPod 5G
+   ```
+
+2. **Address Wrapping** (`bus.zig`):
+   ```zig
+   // Apply address wrapping for smaller SDRAM sizes
+   // Rockbox uses this for RAM detection
+   const raw_offset = addr - SDRAM_START;
+   const offset = raw_offset % self.sdram.len;
+   ```
+
+   On 32MB: Address 0x13FFFFFF wraps to 0x11FFFFFF (offset 0x1FFFFFF)
+
+**iFlash Solo Note**: Storage mods do NOT affect RAM. The 32MB vs 64MB is determined by physical RAM chips on the logic board, not storage.
+
+**Results**:
+- Address wrapping works correctly
+- main() at 0x13E804DC (wraps to 0x11E804DC) = 0xE92D4880 (correct code!)
+- Kernel initialization proceeds with 32MB detection
+
+**Sources from Rockbox**:
+- `firmware/target/arm/pp/crt0-pp.S:145-160` - RAM detection algorithm
+- `firmware/target/arm/pp/system-pp502x.c:594-599` - probed_ramsize reading
+- `firmware/core_alloc.c:46-52` - Runtime audiobufend adjustment
+- `tools/configure:1980` - "memory=64 # always. This is reduced at runtime if needed"
 
 ---
 
