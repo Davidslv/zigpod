@@ -310,12 +310,19 @@ pub const SystemController = struct {
             // Multiple boot phases poll this register:
             // - Bootloader sync at 0x148/0x1EC: waits for bit 31 = 1 (sleeping)
             // - Post-MMAP sync at 0x1F4: waits for bit 31 = 1 (sleeping)
-            // - Kernel wake at 0x769C: waits for bit 31 = 0 (awake)
+            // - Kernel wake at 0x769C: waits for bit 31 = 0 (awake) - but this should
+            //   make the loop exit because condition2 becomes FALSE
             // Since most checks expect sleeping, we always return bit 31 = 1.
-            // The kernel wake loop at 0x769C is handled by COP_WAKE_SKIP in core.zig.
             REG_COP_CTL => blk: {
                 const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
-                break :blk ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+                const result = ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+                // Debug: trace COP_CTL reads
+                if (self.cop_wake_count < 10) {
+                    std.debug.print("COP_CTL READ: returning 0x{X:0>8} (PROC_SLEEP={})\n", .{
+                        result, (result & 0x80000000) != 0,
+                    });
+                }
+                break :blk result;
             },
             else => 0,
         };

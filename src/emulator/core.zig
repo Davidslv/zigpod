@@ -158,6 +158,12 @@ pub const Emulator = struct {
     /// Counter for COP wake function calls (to detect infinite loops)
     cop_wake_skip_count: u32,
 
+    /// Counter for iterations in wake_core polling loop
+    wake_loop_iterations: u32,
+
+    /// Flag: Timer1 enabled by emulator to fix kernel initialization
+    timer1_enabled_by_emulator: bool,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -230,6 +236,8 @@ pub const Emulator = struct {
             .filename_patched = false,
             .rockbox_restart_count = 0,
             .cop_wake_skip_count = 0,
+            .wake_loop_iterations = 0,
+            .timer1_enabled_by_emulator = false,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -816,65 +824,90 @@ pub const Emulator = struct {
             }
         }
 
-        // TRACE: Figure out why PC goes from 0x7698 directly to 0x769C
-        // bx lr with LR=0 should go to address 0, not 0x769C
-        if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled and self.cop_wake_skip_count == 0) {
-            // Detailed trace: ALL PCs to see what happens between 0x7698 and 0x769C
-            if (effective_pc >= 0x10007690 and effective_pc <= 0x100076A0) {
-                const lr = self.cpu.getReg(14);
-                const sp = self.cpu.getReg(13);
-                std.debug.print("TRACE_DETAIL: PC=0x{X:0>8} (eff=0x{X:0>8}) LR=0x{X:0>8} SP=0x{X:0>8}\n", .{ pc, effective_pc, lr, sp });
-            }
-            // Also check if we hit address 0-0x10
-            if (pc < 0x20) {
-                const lr = self.cpu.getReg(14);
-                std.debug.print("TRACE_LOW: PC=0x{X:0>8}, LR=0x{X:0>8}\n", .{ pc, lr });
+        // KERNEL STARTUP FIX: Disabled for now - letting kernel run naturally to see progression
+        // The Timer1/IRQ approach wasn't working because our minimal handler doesn't call scheduler
+        // TODO: Re-enable this once we figure out how to properly invoke scheduler tick
+        if (false and self.rockbox_restart_count >= 1 and self.bus.mmap_enabled and !self.timer1_enabled_by_emulator) {
+            if (effective_pc == 0x10007694) {
+                self.timer1_enabled_by_emulator = true;
+                std.debug.print("KERNEL_FIX: DISABLED\n", .{});
             }
         }
 
-        // COP WAKE LOOP SKIP: wake_core at 0x769C has an infinite loop (0x76AC-0x76B8).
-        // This function is designed to NEVER return - it's the COP sleep loop.
-        // For CPU emulation, we skip this entirely by returning via LR.
-        //
-        // The function is called via a tail-call chain:
-        // some_init() sets LR=0x769C, then calls another init function
-        // that init returns to 0x769C (wake_core), which loops forever
-        //
-        // Strategy: Skip all entries by returning immediately via LR.
-        // If LR is 0 or invalid, find the next instruction after the call chain.
+        // COP WAKE SKIP: wake_core at 0x769C waits for COP response.
+        // Without COP emulation, this loop never completes naturally.
+        // Skip at entry by returning via LR or jumping to the function epilogue.
         if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled) {
-            // Skip wake_core at entry
             if (pc == 0x769C or effective_pc == 0x1000769C) {
                 self.cop_wake_skip_count += 1;
+                const lr = self.cpu.getReg(14);
+
                 if (self.cop_wake_skip_count <= 5) {
-                    const lr = self.cpu.getReg(14);
-                    std.debug.print("COP_WAKE_SKIP: at 0x769C (skip #{}), LR=0x{X:0>8}\n", .{ self.cop_wake_skip_count, lr });
+                    std.debug.print("WAKE_CORE_SKIP: #{} LR=0x{X:0>8}\n", .{ self.cop_wake_skip_count, lr });
                 }
 
-                // Find a valid return address
-                // If LR is 0x769C (recursive), 0, or invalid, skip to 0x76C4 (after wake_core)
-                const lr = self.cpu.getReg(14);
-                if (lr == 0x769C or lr == 0 or lr == 0x1000769C) {
-                    // Can't return to caller, skip to next function
+                // Skip the function entirely by returning to caller
+                // If LR is invalid (0, 0x769C, or pointing back to wake_core),
+                // jump to idle thread exit at 0x76C4
+                if (lr == 0 or lr == 0x769C or lr == 0x1000769C or (lr >= 0x76A0 and lr <= 0x76C4)) {
                     self.cpu.setReg(15, 0x76C4);
                     if (self.cop_wake_skip_count <= 5) {
-                        std.debug.print("COP_WAKE_SKIP: LR invalid, jumping to 0x76C4\n", .{});
+                        std.debug.print("WAKE_CORE_SKIP: LR invalid, jumping to 0x76C4\n", .{});
                     }
                 } else {
-                    // Return to caller
+                    // Valid LR - return to caller
                     self.cpu.setReg(15, lr);
+                    if (self.cop_wake_skip_count <= 5) {
+                        std.debug.print("WAKE_CORE_SKIP: Returning to caller at 0x{X:0>8}\n", .{lr});
+                    }
                 }
+
+                // Enable IRQs for scheduler
+                self.cpu.enableIrq();
                 return 1;
             }
-            // Also catch if we somehow reach the loop
-            const in_wake_loop = (pc >= 0x76A0 and pc <= 0x76B8) or
-                (effective_pc >= 0x100076A0 and effective_pc <= 0x100076B8);
-            if (in_wake_loop) {
-                if (self.cop_wake_skip_count <= 5) {
-                    std.debug.print("COP_WAKE_SKIP: in loop at 0x{X:0>8}, jumping to 0x76C4\n", .{pc});
+
+            // TIMER1 KICKSTART: If we're stuck in idle loop and Timer1
+            // isn't enabled, manually configure and enable it to start the scheduler.
+            // Idle loop at 0x76C4-0x76DC, includes branch back instruction
+            const in_idle_loop = (pc >= 0x76C4 and pc <= 0x76DC) or
+                (effective_pc >= 0x100076C4 and effective_pc <= 0x100076DC);
+            if (in_idle_loop and !self.timer1_enabled_by_emulator) {
+                self.wake_loop_iterations += 1;
+                // Debug: print at key iteration counts
+                if (self.wake_loop_iterations == 1 or self.wake_loop_iterations == 1000 or self.wake_loop_iterations == 5000) {
+                    std.debug.print("TIMER1_KICKSTART: idle loop iter={} PC=0x{X:0>8}\n", .{ self.wake_loop_iterations, pc });
                 }
-                self.cpu.setReg(15, 0x76C4);
-                return 1;
+                // After 10000 iterations in idle loop, enable Timer1
+                if (self.wake_loop_iterations > 10000) {
+                    self.timer1_enabled_by_emulator = true;
+                    std.debug.print("TIMER1_KICKSTART: Enabling Timer1 after {} idle iterations\n", .{self.wake_loop_iterations});
+
+                    // Configure Timer1 for 10ms tick (10000 us)
+                    // Timer runs at 1MHz, so count = 10000
+                    const timer_config: u32 = 0xC0000000 | 10000; // Enable + Repeat + 10000 count
+                    self.timer.timer1.setConfig(timer_config);
+                    std.debug.print("TIMER1_KICKSTART: config=0x{X:0>8}\n", .{timer_config});
+
+                    // Enable Timer1 interrupt in interrupt controller
+                    self.int_ctrl.cpu_enable |= 0x00000001; // Timer1 is bit 0
+
+                    // Protect Timer1 from being disabled by firmware
+                    self.int_ctrl.protectInterrupt(.timer1);
+
+                    self.wake_loop_iterations = 0;
+                }
+            } else {
+                // Only reset counter if we're not in wake_core or idle loop area
+                // The idle thread at 0x76C4-0x76DC calls wake_core at 0x769C
+                const in_wake_area = (pc >= 0x769C and pc <= 0x76DC) or
+                    (effective_pc >= 0x1000769C and effective_pc <= 0x100076DC);
+                if (!in_wake_area) {
+                    if (self.wake_loop_iterations > 0 and self.wake_loop_iterations < 10) {
+                        std.debug.print("TIMER1_RESET: PC=0x{X:0>8} iter was {}\n", .{ pc, self.wake_loop_iterations });
+                    }
+                    self.wake_loop_iterations = 0;
+                }
             }
         }
 

@@ -186,6 +186,13 @@ pub const Timers = struct {
         if (self.timer1.tick(cpu_cycles, self.cpu_freq_mhz)) {
             if (self.int_ctrl) |ctrl| {
                 ctrl.assertInterrupt(.timer1);
+                // Debug: print when Timer1 fires (only first 5 times)
+                if (ctrl.debug_timer1_fires < 5) {
+                    ctrl.debug_timer1_fires += 1;
+                    std.debug.print("TIMER1_FIRE: #{} raw_status=0x{X:0>8} cpu_enable=0x{X:0>8}\n", .{
+                        ctrl.debug_timer1_fires, ctrl.raw_status, ctrl.cpu_enable,
+                    });
+                }
             }
         }
 
@@ -235,7 +242,13 @@ pub const Timers = struct {
     /// Write register
     pub fn write(self: *Self, offset: u32, value: u32) void {
         switch (offset) {
-            REG_TIMER1_CFG => self.timer1.setConfig(value),
+            REG_TIMER1_CFG => {
+                const enabled = (value & Timer.ENABLE_BIT) != 0;
+                const repeat = (value & Timer.REPEAT_BIT) != 0;
+                const count = value & Timer.COUNT_MASK;
+                std.debug.print("TIMER1_CFG: value=0x{X:0>8} enabled={} repeat={} count={}\n", .{ value, enabled, repeat, count });
+                self.timer1.setConfig(value);
+            },
             REG_TIMER1_VAL => {
                 self.timer1.acknowledge();
                 if (self.int_ctrl) |ctrl| {

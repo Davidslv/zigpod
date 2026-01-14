@@ -68,6 +68,13 @@ pub const InterruptController = struct {
     /// COP interrupt enable mask
     cop_enable: u32,
 
+    /// Protected interrupt mask - these interrupts cannot be disabled by firmware writes
+    /// Used by emulator to keep Timer1 enabled for RTOS scheduler kickstart
+    protected_mask: u32,
+
+    /// Debug: count Timer1 fires
+    debug_timer1_fires: u32,
+
     /// CPU FIQ enable mask
     cpu_fiq_enable: u32,
 
@@ -121,6 +128,8 @@ pub const InterruptController = struct {
             .forced_status = 0,
             .cpu_enable = 0,
             .cop_enable = 0,
+            .protected_mask = 0,
+            .debug_timer1_fires = 0,
             .cpu_fiq_enable = 0,
             .cop_fiq_enable = 0,
             .cpu_priority = 0,
@@ -161,6 +170,12 @@ pub const InterruptController = struct {
     pub fn forceEnableCpuInterrupt(self: *Self, irq: Interrupt) void {
         self.cpu_enable |= irq.mask();
         self.updateLines();
+    }
+
+    /// Protect an interrupt from being disabled by firmware writes
+    /// Protected interrupts stay enabled even when firmware writes to CPU_INT_DIS
+    pub fn protectInterrupt(self: *Self, irq: Interrupt) void {
+        self.protected_mask |= irq.mask();
     }
 
     /// Clear an interrupt (usually called by peripheral when acknowledged)
@@ -313,11 +328,19 @@ pub const InterruptController = struct {
 
             // CPU enable/disable
             REG_CPU_INT_EN => {
+                std.debug.print("CPU_INT_EN: enabling 0x{X:0>8} (was 0x{X:0>8})\n", .{ value, self.cpu_enable });
                 self.cpu_enable |= value;
                 self.updateLines();
             },
             REG_CPU_INT_DIS => {
-                self.cpu_enable &= ~value;
+                // Respect protected mask - don't disable protected interrupts
+                const actual_disable = value & ~self.protected_mask;
+                if (self.protected_mask != 0 and (value & self.protected_mask) != 0) {
+                    std.debug.print("CPU_INT_DIS: disabling 0x{X:0>8} (was 0x{X:0>8}), protected=0x{X:0>8}, actual=0x{X:0>8}\n", .{ value, self.cpu_enable, self.protected_mask, actual_disable });
+                } else {
+                    std.debug.print("CPU_INT_DIS: disabling 0x{X:0>8} (was 0x{X:0>8})\n", .{ value, self.cpu_enable });
+                }
+                self.cpu_enable &= ~actual_disable;
                 self.updateLines();
             },
             REG_CPU_INT_PRIORITY => {

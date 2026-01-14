@@ -121,6 +121,16 @@ pub const MemoryBus = struct {
     cpu_queue: u32,
     cop_queue: u32,
 
+    /// MBX_MSG_STAT - Message status register for CPU/COP wake signaling
+    /// Bit 2 (0x4): CPU intend_wake set by CPU, cleared by COP reading
+    /// Bit 3 (0x8): COP intend_wake set by COP, cleared by CPU reading
+    /// When CPU wakes COP: CPU sets bit 3 via MBX_MSG_SET, waits for COP to clear it
+    /// We auto-clear COP bits to simulate COP responding
+    mbx_msg_stat: u32,
+
+    /// Cycle counter for auto-clearing COP response bits
+    mbx_cop_clear_countdown: u32,
+
     /// Access tracking for debugging
     last_access_addr: u32,
     last_access_region: Region,
@@ -158,6 +168,8 @@ pub const MemoryBus = struct {
 
     /// Debug: track ATA-related writes
     debug_last_ata_read: bool,
+    debug_last_ata_value: u32,
+    debug_ata_reads_for_iram_count: u32,
     debug_ata_write_count: u32,
     debug_ata_first_write_addr: u32,
     debug_ata_first_write_value: u32,
@@ -221,6 +233,11 @@ pub const MemoryBus = struct {
     debug_dev_init_offset_counts: [32]u32, // Histogram of accesses to offsets 0x00-0x7C (32 dwords)
     debug_int_ctrl_offset_counts: [64]u32, // Histogram of interrupt controller offsets
 
+    /// Debug: Firmware load checksum tracking (write16 to 0x10000000+)
+    debug_fw_write_sum: u64,
+    debug_fw_write_count: u64,
+    debug_fw_write_tracking: bool,
+
     /// Debug: SDRAM data read tracing for finding task state array
     /// Tracks unique SDRAM read addresses (excluding code region 0x10000000-0x10300000)
     debug_sdram_data_read_enabled: bool,
@@ -229,6 +246,9 @@ pub const MemoryBus = struct {
     debug_sdram_data_read_vals: [64]u32,
     /// Count reads per 4KB page for heat map
     debug_sdram_page_reads: [256]u32, // Pages 0x10000-0x100FF (1MB coverage starting at 0x10000000)
+
+    /// Debug: count writes to loadbuffer region (0x10000000-0x100C0000)
+    debug_loadbuffer_write_count: u64,
 
     const Self = @This();
 
@@ -266,8 +286,18 @@ pub const MemoryBus = struct {
     /// COP_QUEUE at 0x60001020: COP sets bit 29, only CPU read clears it
     const MAILBOX_START: u32 = 0x60001000;
     const MAILBOX_END: u32 = 0x60001FFF;
+    const MBX_MSG_STAT_OFFSET: u32 = 0x00; // 0x60001000 - Status register
+    const MBX_MSG_SET_OFFSET: u32 = 0x04; // 0x60001004 - Set bits in status
+    const MBX_MSG_CLR_OFFSET: u32 = 0x08; // 0x60001008 - Clear bits in status
     const CPU_QUEUE_OFFSET: u32 = 0x10; // 0x60001010
     const COP_QUEUE_OFFSET: u32 = 0x20; // 0x60001020
+
+    /// Mailbox bit meanings for MBX_MSG_STAT:
+    /// Bit 2 (0x4): CPU intend_wake - set when CPU wants to wake COP
+    /// Bit 3 (0x8): COP intend_wake - set when COP wants to wake CPU
+    /// wake_core() sets (0x4 << core) then waits for it to clear
+    const MBX_CPU_WAKE_BIT: u32 = 0x4; // Bit 2: CPU wake signal
+    const MBX_COP_WAKE_BIT: u32 = 0x8; // Bit 3: COP wake signal
 
     /// System Controller (includes processor control at 0x60007000)
     const SYS_CTRL_START: u32 = 0x60006000;
@@ -431,6 +461,8 @@ pub const MemoryBus = struct {
             .low_mem_written = [_]bool{false} ** 256,
             .cpu_queue = 0,
             .cop_queue = 0,
+            .mbx_msg_stat = 0,
+            .mbx_cop_clear_countdown = 0,
             .last_access_addr = 0,
             .last_access_region = .unmapped,
             .lcd_write_count = 0,
@@ -446,71 +478,8 @@ pub const MemoryBus = struct {
             .first_sdram_write_value = 0,
             .is_cop_access = false,
             .debug_last_ata_read = false,
-            .debug_ata_write_count = 0,
-            .debug_ata_first_write_addr = 0,
-            .debug_ata_first_write_value = 0,
-            .debug_ata_writes_to_sdram = 0,
-            .debug_ata_writes_to_iram = 0,
-            .debug_mbr_area_writes = 0,
-            .debug_ata_write_addrs = [_]u32{0} ** 8,
-            .debug_ata_write_vals = [_]u32{0} ** 8,
-            .debug_mbr_value_writes = 0,
-            .debug_mbr_value_last_addr = 0,
-            .debug_mbr_value_last_val = 0,
-            .debug_region_writes = 0,
-            .debug_region_first_addr = 0,
-            .debug_region_first_val = 0,
-            .debug_part_reads = 0,
-            .debug_part_read_addrs = [_]u32{0} ** 16,
-            .debug_part_read_vals = [_]u32{0} ** 16,
-        };
-    }
-
-    /// Initialize with external SDRAM allocation
-    pub fn initWithSdram(sdram: []u8, boot_rom: []const u8) Self {
-        return .{
-            .boot_rom = boot_rom,
-            .sdram = sdram,
-            .iram = [_]u8{0} ** (96 * 1024),
-            .interrupt_ctrl = null,
-            .timers = null,
-            .system_ctrl = null,
-            .cache_ctrl = null,
-            .dma = null,
-            .gpio = null,
-            .device_init = null,
-            .gpo32 = null,
-            .i2s = null,
-            .i2c = null,
-            .clickwheel = null,
-            .ata = null,
-            .lcd = null,
-            .lcd_bridge = null,
-            .stub_registers = [_]u32{0} ** 256,
-            .flash_ctrl_regs = [_]u32{0} ** 64,
-            .mmap_logical = [_]u32{0} ** 8,
-            .mmap_physical = [_]u32{0} ** 8,
-            .mmap_enabled = false,
-            .hw_accel_regs = [_]u32{0} ** 1024,
-            .low_mem_ram = [_]u8{0} ** 1024,
-            .low_mem_written = [_]bool{false} ** 256,
-            .cpu_queue = 0,
-            .cop_queue = 0,
-            .last_access_addr = 0,
-            .last_access_region = .unmapped,
-            .lcd_write_count = 0,
-            .hw_accel_read_count = 0,
-            .hw_accel_write_count = 0,
-            .kickstart_enabled = false,
-            .kickstart_read_count = 0,
-            .button_event_pending = false,
-            .lcd_bridge_write_count = 0,
-            .sdram_write_count = 0,
-            .iram_write_count = 0,
-            .first_sdram_write_addr = 0,
-            .first_sdram_write_value = 0,
-            .is_cop_access = false,
-            .debug_last_ata_read = false,
+            .debug_last_ata_value = 0,
+            .debug_ata_reads_for_iram_count = 0,
             .debug_ata_write_count = 0,
             .debug_ata_first_write_addr = 0,
             .debug_ata_first_write_value = 0,
@@ -555,11 +524,120 @@ pub const MemoryBus = struct {
             .debug_dev_init_accesses = 0,
             .debug_dev_init_offset_counts = [_]u32{0} ** 32,
             .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
+            .debug_fw_write_sum = 0,
+            .debug_fw_write_count = 0,
+            .debug_fw_write_tracking = false,
             .debug_sdram_data_read_enabled = false,
             .debug_sdram_data_read_count = 0,
             .debug_sdram_data_read_addrs = [_]u32{0} ** 64,
             .debug_sdram_data_read_vals = [_]u32{0} ** 64,
             .debug_sdram_page_reads = [_]u32{0} ** 256,
+            .debug_loadbuffer_write_count = 0,
+        };
+    }
+
+    /// Initialize with external SDRAM allocation
+    pub fn initWithSdram(sdram: []u8, boot_rom: []const u8) Self {
+        return .{
+            .boot_rom = boot_rom,
+            .sdram = sdram,
+            .iram = [_]u8{0} ** (96 * 1024),
+            .interrupt_ctrl = null,
+            .timers = null,
+            .system_ctrl = null,
+            .cache_ctrl = null,
+            .dma = null,
+            .gpio = null,
+            .device_init = null,
+            .gpo32 = null,
+            .i2s = null,
+            .i2c = null,
+            .clickwheel = null,
+            .ata = null,
+            .lcd = null,
+            .lcd_bridge = null,
+            .stub_registers = [_]u32{0} ** 256,
+            .flash_ctrl_regs = [_]u32{0} ** 64,
+            .mmap_logical = [_]u32{0} ** 8,
+            .mmap_physical = [_]u32{0} ** 8,
+            .mmap_enabled = false,
+            .hw_accel_regs = [_]u32{0} ** 1024,
+            .low_mem_ram = [_]u8{0} ** 1024,
+            .low_mem_written = [_]bool{false} ** 256,
+            .cpu_queue = 0,
+            .cop_queue = 0,
+            .mbx_msg_stat = 0,
+            .mbx_cop_clear_countdown = 0,
+            .last_access_addr = 0,
+            .last_access_region = .unmapped,
+            .lcd_write_count = 0,
+            .hw_accel_read_count = 0,
+            .hw_accel_write_count = 0,
+            .kickstart_enabled = false,
+            .kickstart_read_count = 0,
+            .button_event_pending = false,
+            .lcd_bridge_write_count = 0,
+            .sdram_write_count = 0,
+            .iram_write_count = 0,
+            .first_sdram_write_addr = 0,
+            .first_sdram_write_value = 0,
+            .is_cop_access = false,
+            .debug_last_ata_read = false,
+            .debug_last_ata_value = 0,
+            .debug_ata_reads_for_iram_count = 0,
+            .debug_ata_write_count = 0,
+            .debug_ata_first_write_addr = 0,
+            .debug_ata_first_write_value = 0,
+            .debug_ata_writes_to_sdram = 0,
+            .debug_ata_writes_to_iram = 0,
+            .debug_mbr_area_writes = 0,
+            .debug_ata_write_addrs = [_]u32{0} ** 8,
+            .debug_ata_write_vals = [_]u32{0} ** 8,
+            .debug_mbr_value_writes = 0,
+            .debug_mbr_value_last_addr = 0,
+            .debug_mbr_value_last_val = 0,
+            .debug_region_writes = 0,
+            .debug_region_first_addr = 0,
+            .debug_region_first_val = 0,
+            .debug_part_reads = 0,
+            .debug_part_read_addrs = [_]u32{0} ** 16,
+            .debug_part_read_vals = [_]u32{0} ** 16,
+            .debug_part_size_writes = 0,
+            .debug_part_size_addrs = [_]u32{0} ** 8,
+            .debug_part_type_writes = 0,
+            .debug_part_type_addrs = [_]u32{0} ** 8,
+            .debug_pinfo_writes = 0,
+            .debug_pinfo_write_addrs = [_]u32{0} ** 8,
+            .debug_pinfo_write_vals = [_]u32{0} ** 8,
+            .debug_part0_reads = 0,
+            .debug_lfn_write_count = 0,
+            .debug_lfn_write_addrs = [_]u32{0} ** 8,
+            .debug_lfn_write_vals = [_]u32{0} ** 8,
+            .debug_sector_read_count = 0,
+            .debug_sector_read_addrs = [_]u32{0} ** 32,
+            .debug_sector_read_vals = [_]u32{0} ** 32,
+            .debug_lfn_attr_read_count = 0,
+            .debug_boot_rom_addr0_read = false,
+            .debug_boot_rom_read_count = 0,
+            .debug_hw_accel_read_count = 0,
+            .debug_timer_accesses = 0,
+            .debug_gpio_accesses = 0,
+            .debug_i2c_accesses = 0,
+            .debug_sys_ctrl_accesses = 0,
+            .debug_int_ctrl_accesses = 0,
+            .debug_mailbox_accesses = 0,
+            .debug_dev_init_accesses = 0,
+            .debug_dev_init_offset_counts = [_]u32{0} ** 32,
+            .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
+            .debug_fw_write_sum = 0,
+            .debug_fw_write_count = 0,
+            .debug_fw_write_tracking = false,
+            .debug_sdram_data_read_enabled = false,
+            .debug_sdram_data_read_count = 0,
+            .debug_sdram_data_read_addrs = [_]u32{0} ** 64,
+            .debug_sdram_data_read_vals = [_]u32{0} ** 64,
+            .debug_sdram_page_reads = [_]u32{0} ** 256,
+            .debug_loadbuffer_write_count = 0,
         };
     }
 
@@ -596,10 +674,48 @@ pub const MemoryBus = struct {
     }
 
     /// Read 8-bit value
+    /// Debug: track checksum byte reads
+    pub var debug_chksum_tracking: bool = false;
+    pub var debug_chksum_sum: u64 = 0;
+    pub var debug_chksum_count: u64 = 0;
+    pub var debug_chksum_start_addr: u32 = 0;
+
+    // Firmware buffer read32 tracking (for checksum calculation)
+    pub var debug_fw_read32_tracking: bool = false;
+    pub var debug_fw_read32_sum: u64 = 0;
+    pub var debug_fw_read32_count: u64 = 0;
+    pub var debug_fw_read32_start: u32 = 0;
+
     pub fn read8(self: *Self, addr: u32) u8 {
         const value = self.read32(addr & ~@as(u32, 3));
         const shift: u5 = @truncate((addr & 3) * 8);
-        return @truncate(value >> shift);
+        const result: u8 = @truncate(value >> shift);
+
+        // Track reads from LOADBUFFER region for firmware checksum verification
+        if (!debug_chksum_tracking and addr == 0x10000000) {
+            debug_chksum_tracking = true;
+            debug_chksum_sum = 0;
+            debug_chksum_count = 0;
+            debug_chksum_start_addr = addr;
+        }
+
+        if (debug_chksum_tracking and addr >= 0x10000000 and addr < 0x100C0000) {
+            debug_chksum_sum += @as(u64, result);
+            debug_chksum_count += 1;
+            // Print summary when we reach firmware size (774004 bytes)
+            if (debug_chksum_count == 774004) {
+                const sum_with_model = @as(u32, @truncate(debug_chksum_sum)) + 5;
+                const diff = @as(i64, sum_with_model) - 0x04D7ABD6;
+                if (diff == 0) {
+                    std.debug.print("CHECKSUM: OK (0x{X:0>8})\n", .{sum_with_model});
+                } else {
+                    std.debug.print("CHECKSUM: MISMATCH! got=0x{X:0>8} expected=0x04D7ABD6 diff={d}\n", .{ sum_with_model, diff });
+                }
+                debug_chksum_tracking = false; // Stop tracking
+            }
+        }
+
+        return result;
     }
 
     /// Read 16-bit value
@@ -619,10 +735,8 @@ pub const MemoryBus = struct {
         self.last_access_addr = translated_addr;
         self.last_access_region = region;
 
-        // Track ATA DATA register reads (offset 0x1E0 from ATA_START)
-        if (region == .ata and (translated_addr - ATA_START) == 0x1E0) {
-            self.debug_last_ata_read = true;
-        }
+        // Flag ATA DATA register reads for tracking (value captured after read)
+        const is_ata_data_read = region == .ata and (translated_addr - ATA_START) == 0x1E0;
 
         // Track reads from partition struct area (0x11001A00-0x11001B00)
         if (addr >= 0x11001A00 and addr < 0x11001B00) {
@@ -689,6 +803,68 @@ pub const MemoryBus = struct {
             .unmapped => 0xE12FFF1E, // Return "BX LR" for graceful handling of uninitialized pointers
         };
 
+        // Track ATA DATA register reads
+        if (is_ata_data_read) {
+            self.debug_last_ata_read = true;
+            self.debug_last_ata_value = value;
+        }
+
+        // Track 32-bit reads from EXACT firmware buffer start (0x110001D0 - 0x110001F0)
+        // Very specific: only track reads from first 32 bytes of firmware buffer
+        if (translated_addr >= 0x110001D0 and translated_addr < 0x110001F0) {
+            std.debug.print("*** FW_BUFFER_READ32: 0x{X:0>8} = 0x{X:0>8} ***\n", .{ translated_addr, value });
+        }
+
+        // Track reads from DRAM_START (0x10000000 - 0x10000020) where firmware should be
+        if (translated_addr >= 0x10000000 and translated_addr < 0x10000020) {
+            std.debug.print("*** DRAM_START_READ32: 0x{X:0>8} = 0x{X:0>8} ***\n", .{ translated_addr, value });
+        }
+
+        // Track 32-bit reads from firmware buffer region (0x110001D0 - 0x110BD3EC)
+        // This catches checksum loops that use LDR + byte extraction
+        // BUT only start counting if we see reads from 0x110001D8 (first checksum byte after header)
+        if (translated_addr == 0x110001D8 and !debug_fw_read32_tracking) {
+            debug_fw_read32_tracking = true;
+            debug_fw_read32_sum = 0;
+            debug_fw_read32_count = 0;
+            debug_fw_read32_start = translated_addr;
+            std.debug.print("\n*** READ32 FIRMWARE CHECKSUM: Starting at 0x{X:0>8} ***\n", .{translated_addr});
+        }
+        if (debug_fw_read32_tracking and translated_addr >= 0x110001D0 and translated_addr < 0x110BD3EC) {
+            // Sum all 4 bytes from this word
+            const b0: u64 = value & 0xFF;
+            const b1: u64 = (value >> 8) & 0xFF;
+            const b2: u64 = (value >> 16) & 0xFF;
+            const b3: u64 = (value >> 24) & 0xFF;
+            debug_fw_read32_sum += b0 + b1 + b2 + b3;
+            debug_fw_read32_count += 4;
+
+            // Print first few reads
+            if (debug_fw_read32_count <= 32) {
+                std.debug.print("FW_READ32[{}]: 0x{X:0>8} = 0x{X:0>8} (bytes: {X:0>2} {X:0>2} {X:0>2} {X:0>2})\n", .{
+                    debug_fw_read32_count - 4,
+                    translated_addr,
+                    value,
+                    @as(u8, @truncate(b0)),
+                    @as(u8, @truncate(b1)),
+                    @as(u8, @truncate(b2)),
+                    @as(u8, @truncate(b3)),
+                });
+            }
+
+            // Print when checksum-worth of bytes read (774004 bytes)
+            if (debug_fw_read32_count >= 774004 and debug_fw_read32_count < 774012) {
+                const sum_with_model = @as(u32, @truncate(debug_fw_read32_sum)) + 5;
+                std.debug.print("\n*** READ32 FIRMWARE CHECKSUM ***\n", .{});
+                std.debug.print("  Bytes read: {}\n", .{debug_fw_read32_count});
+                std.debug.print("  Start addr: 0x{X:0>8}\n", .{debug_fw_read32_start});
+                std.debug.print("  Raw sum: 0x{X:0>8}\n", .{@as(u32, @truncate(debug_fw_read32_sum))});
+                std.debug.print("  With MODEL_NUMBER (5): 0x{X:0>8}\n", .{sum_with_model});
+                std.debug.print("  Expected: 0x04D7ABD6\n", .{});
+                std.debug.print("  Difference: {}\n", .{@as(i64, sum_with_model) - 0x04D7ABD6});
+            }
+        }
+
         // Complete tracking for partition struct area reads
         if (addr >= 0x11001A00 and addr < 0x11001B00) {
             if (self.debug_part_reads < 16) {
@@ -754,6 +930,11 @@ pub const MemoryBus = struct {
 
     /// Write 8-bit value
     pub fn write8(self: *Self, addr: u32, value: u8) void {
+        // Track write8 to the problem area (0x100008EC-0x100008F0)
+        if (addr >= 0x100008E8 and addr <= 0x100008F0) {
+            std.debug.print("*** WRITE8_PROBLEM: addr=0x{X:0>8} val=0x{X:0>2} ***\n", .{ addr, value });
+        }
+
         // Read-modify-write for byte access to 32-bit registers
         const aligned = addr & ~@as(u32, 3);
         const shift: u5 = @truncate((addr & 3) * 8);
@@ -790,6 +971,45 @@ pub const MemoryBus = struct {
         const mask: u32 = @as(u32, 0xFFFF) << shift;
 
         const region = getRegion(addr);
+
+        // Track firmware writes to 0x10000000+ for checksum debugging
+        // Start tracking when first write to 0x10000000 occurs
+        if (region == .sdram and addr == SDRAM_START) {
+            self.debug_fw_write_tracking = true;
+            self.debug_fw_write_sum = 0;
+            self.debug_fw_write_count = 0;
+            std.debug.print("\n*** BUS: Starting firmware write tracking at 0x{X:0>8} ***\n", .{addr});
+        }
+
+        // Track write16 to the problem area (0x100008EC-0x100008F0)
+        if (region == .sdram and addr >= 0x100008E8 and addr <= 0x100008F0) {
+            std.debug.print("*** WRITE16_PROBLEM: addr=0x{X:0>8} val=0x{X:0>4} ***\n", .{ addr, value });
+        }
+        // Track bytes being written to firmware area (skip header area - first 8 bytes)
+        if (self.debug_fw_write_tracking and region == .sdram) {
+            const offset = addr - SDRAM_START;
+            // Only count after header (8 bytes)
+            if (offset >= 8) {
+                const lo: u8 = @truncate(value);
+                const hi: u8 = @truncate(value >> 8);
+                self.debug_fw_write_sum += @as(u64, lo) + @as(u64, hi);
+                self.debug_fw_write_count += 2;
+                // Print first 16 bytes
+                if (self.debug_fw_write_count <= 16) {
+                    std.debug.print("BUS_FW[{}]: lo=0x{X:0>2} hi=0x{X:0>2} @ 0x{X:0>8}\n", .{ self.debug_fw_write_count - 2, lo, hi, addr });
+                }
+                // Print when we reach firmware size
+                if (self.debug_fw_write_count >= 774004 and self.debug_fw_write_count < 774008) {
+                    const sum_with_model = @as(u32, @truncate(self.debug_fw_write_sum)) + 5;
+                    std.debug.print("\n*** BUS FIRMWARE WRITE CHECKSUM ***\n", .{});
+                    std.debug.print("  Bytes: {}\n", .{self.debug_fw_write_count});
+                    std.debug.print("  Sum with MODEL_NUMBER: 0x{X:0>8}\n", .{sum_with_model});
+                    std.debug.print("  Expected: 0x04D7ABD6\n", .{});
+                    std.debug.print("  Difference: {d}\n", .{@as(i64, sum_with_model) - 0x04D7ABD6});
+                }
+            }
+        }
+
         if (region == .sdram or region == .iram) {
             // Direct write to RAM
             if (region == .sdram) {
@@ -836,6 +1056,38 @@ pub const MemoryBus = struct {
             self.lcd_bridge_write_count += 1;
         }
 
+        // Track firmware writes to SDRAM for checksum debugging
+        // First firmware word after header is 0xE321F0D3 (little-endian of D3 F0 21 E3)
+        // Start tracking when we see this value
+        if (region == .sdram and value == 0xE321F0D3 and !self.debug_fw_write_tracking) {
+            self.debug_fw_write_tracking = true;
+            self.debug_fw_write_sum = 0;
+            self.debug_fw_write_count = 0;
+            std.debug.print("\n*** BUS32: Found firmware start pattern at 0x{X:0>8} ***\n", .{translated_addr});
+        }
+        // Once tracking is active, count all bytes written in the firmware buffer region
+        if (self.debug_fw_write_tracking and region == .sdram) {
+            const b0: u8 = @truncate(value);
+            const b1: u8 = @truncate(value >> 8);
+            const b2: u8 = @truncate(value >> 16);
+            const b3: u8 = @truncate(value >> 24);
+            self.debug_fw_write_sum += @as(u64, b0) + @as(u64, b1) + @as(u64, b2) + @as(u64, b3);
+            self.debug_fw_write_count += 4;
+            // Print first 32 bytes
+            if (self.debug_fw_write_count <= 32) {
+                std.debug.print("BUS32_FW[{}]: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} @ 0x{X:0>8}\n", .{ self.debug_fw_write_count - 4, b0, b1, b2, b3, translated_addr });
+            }
+            // Print checksum around firmware size
+            if (self.debug_fw_write_count >= 774000 and self.debug_fw_write_count < 774008) {
+                const sum_with_model = @as(u32, @truncate(self.debug_fw_write_sum)) + 5;
+                std.debug.print("\n*** BUS32 FIRMWARE WRITE CHECKSUM ***\n", .{});
+                std.debug.print("  Bytes: {}\n", .{self.debug_fw_write_count});
+                std.debug.print("  Sum with MODEL_NUMBER: 0x{X:0>8}\n", .{sum_with_model});
+                std.debug.print("  Expected: 0x04D7ABD6\n", .{});
+                std.debug.print("  Difference: {d}\n", .{@as(i64, sum_with_model) - 0x04D7ABD6});
+            }
+        }
+
         // Debug: track writes containing LFN entry signature for "rockbox.ipod"
         // First 16-bit word of LFN entry is: 0x41 (ord) + 0x72 ('r') = 0x7241
         // Or as 32-bit: 0x006F7241 (two UTF-16LE chars: 'r' + 'o')
@@ -855,6 +1107,21 @@ pub const MemoryBus = struct {
         if (addr == 0x11006F74) {
             const print = std.debug.print;
             print("WRITE to 0x11006F74: val=0x{X:0>8}, lfn_writes={d}\n", .{ value, self.debug_lfn_write_count });
+        }
+
+        // Track writes to loadbuffer region (silent - just count)
+        if (translated_addr >= 0x10000000 and translated_addr < 0x100C0000) {
+            self.debug_loadbuffer_write_count += 1;
+        }
+
+        // DEBUG: Track first 16 SDRAM writes after firmware pattern is detected
+        if (self.debug_fw_write_tracking and region == .sdram and self.debug_fw_write_count < 64) {
+            std.debug.print("FW_SDRAM_WRITE[{}]: addr=0x{X:0>8} trans=0x{X:0>8} val=0x{X:0>8}\n", .{
+                self.debug_fw_write_count,
+                addr,
+                translated_addr,
+                value,
+            });
         }
         // Track ALL writes containing LFN start pattern anywhere in SDRAM (to find other buffers)
         if (region == .sdram and value == 0x6F007241) {
@@ -1258,11 +1525,29 @@ pub const MemoryBus = struct {
     }
 
     // Mailbox registers for CPU/COP synchronization
+    // MBX_MSG_STAT at 0x60001000: Status register for wake signaling
+    // MBX_MSG_SET at 0x60001004: Write to set bits in MBX_MSG_STAT
+    // MBX_MSG_CLR at 0x60001008: Write to clear bits in MBX_MSG_STAT
     // CPU_QUEUE at 0x60001010: CPU writes set bits, COP reads clear them
     // COP_QUEUE at 0x60001020: COP writes set bits, CPU reads clear them
     fn readMailbox(self: *Self, addr: u32) u32 {
         const offset = addr - MAILBOX_START;
         return switch (offset) {
+            MBX_MSG_STAT_OFFSET => blk: {
+                // Check if we need to auto-clear COP wake bit (fake COP response)
+                if (self.mbx_cop_clear_countdown > 0) {
+                    self.mbx_cop_clear_countdown -= 1;
+                    if (self.mbx_cop_clear_countdown == 0) {
+                        // COP has "responded" - clear the wake bit
+                        const old_stat = self.mbx_msg_stat;
+                        self.mbx_msg_stat &= ~MBX_COP_WAKE_BIT;
+                        if ((old_stat & MBX_COP_WAKE_BIT) != 0) {
+                            std.debug.print("MBX: Fake COP response - cleared bit 3, stat 0x{X:0>8} -> 0x{X:0>8}\n", .{ old_stat, self.mbx_msg_stat });
+                        }
+                    }
+                }
+                break :blk self.mbx_msg_stat;
+            },
             CPU_QUEUE_OFFSET => blk: {
                 // COP reading CPU_QUEUE clears bit 29
                 if (self.is_cop_access) {
@@ -1288,6 +1573,23 @@ pub const MemoryBus = struct {
     fn writeMailbox(self: *Self, addr: u32, value: u32) void {
         const offset = addr - MAILBOX_START;
         switch (offset) {
+            MBX_MSG_SET_OFFSET => {
+                // Set bits in MBX_MSG_STAT
+                const old_stat = self.mbx_msg_stat;
+                self.mbx_msg_stat |= value;
+
+                // If CPU is setting COP wake bit (bit 3), start auto-clear countdown
+                // This simulates COP receiving and acknowledging the wake request
+                if ((value & MBX_COP_WAKE_BIT) != 0) {
+                    std.debug.print("MBX: CPU set COP wake bit, stat 0x{X:0>8} -> 0x{X:0>8}, scheduling fake response\n", .{ old_stat, self.mbx_msg_stat });
+                    // Clear after 10 reads (simulate COP response time)
+                    self.mbx_cop_clear_countdown = 10;
+                }
+            },
+            MBX_MSG_CLR_OFFSET => {
+                // Clear bits in MBX_MSG_STAT
+                self.mbx_msg_stat &= ~value;
+            },
             CPU_QUEUE_OFFSET => {
                 // CPU writing to CPU_QUEUE sets bits (OR operation for bit 29)
                 if (!self.is_cop_access) {
@@ -1441,14 +1743,6 @@ pub const MemoryBus = struct {
 
     fn readSdram(self: *Self, addr: u32) u32 {
         const offset = addr - SDRAM_START;
-
-        // Patch: SWI vector literal pool at 0x100008EC
-        // The firmware contains 0x40000008 (IRAM) but the SWI handler has PC-relative
-        // branches that only work from SDRAM. Return the SDRAM address instead.
-        // SWI handler is at firmware offset 0x8F0 + 0x6C = 0x95C = SDRAM 0x1000095C
-        if (addr == 0x100008EC) {
-            return 0x1000095C; // SWI handler in SDRAM
-        }
 
         var value: u32 = 0xE12FFF1E; // Default: "BX LR" for unmapped
 

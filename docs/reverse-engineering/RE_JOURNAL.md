@@ -11,6 +11,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2025-01-12 | [RTOS_SCHEDULER_INVESTIGATION.md](RTOS_SCHEDULER_INVESTIGATION.md) | In Progress | Breaking out of scheduler loop |
 | 2026-01-13 | See below | **SUCCESS** | Rockbox bootloader LCD output working! |
 | 2026-01-13 | See below | **SUCCESS** | Boot path fix - Rockbox loads successfully! |
+| 2026-01-14 | See below | In Progress | RTOS scheduler - Timer1/idle loop investigation |
 
 ---
 
@@ -1276,6 +1277,243 @@ Rockbox uses this to test cache state in a loop.
 1. Rockbox now reaches filesystem scanning
 2. Need proper FAT32 disk image with .rockbox directory
 3. Or investigate further what files Rockbox is looking for
+
+---
+
+### 2026-01-14: RTOS Scheduler Investigation - Timer1 and Idle Loop
+
+**Goal**: Get LCD pixel writes to occur in Rockbox firmware
+
+**Problem Identified**:
+After Rockbox loads successfully (checksum OK, "Rockbox loaded." printed), the CPU gets stuck
+in an idle loop at 0x769C (wake_core function) with zero LCD writes. The RTOS scheduler never runs.
+
+**Root Cause Analysis**:
+
+1. **Timer1 Never Enabled**: The debug trace shows `Timer1_enabled=false` even after Rockbox
+   starts. Rockbox's `tick_start()` function never runs, which means `kernel_init()` is
+   either not called or exits early.
+
+2. **COP Synchronization Issue**: The Rockbox kernel uses COP (Coprocessor) synchronization
+   during initialization. Without proper COP responses, the kernel enters a fallback path
+   that skips thread creation and scheduler setup.
+
+3. **Idle Loop Structure**: The CPU ends up in `wake_core()` at 0x769C which is the COP
+   idle function. This is designed to never return - it waits for interrupts. But since
+   Timer1 is never enabled, no scheduler tick interrupts occur.
+
+**Execution Flow Traced**:
+```
+1. Bootloader loads rockbox.ipod to 0x10000000
+2. Bootloader jumps to Rockbox via COP_CTL write
+3. Rockbox starts at 0x10000000 (MSR CPSR, #0xD3)
+4. COP polling loop at 0x10000148 - SKIPPED by emulator
+5. Early init code runs (0x10000154-0x100001BC)
+6. [Gap - kernel init should happen here]
+7. CPU reaches wake_core at 0x1000769C via MMAP
+8. COP_WAKE_SKIP triggers, jumps to 0x76C4
+9. Code at 0x76C4 loops back to 0x769C
+10. Stuck in idle loop forever
+```
+
+**Approaches Attempted**:
+
+1. **Install Minimal IRQ Handler**: Wrote ARM code to SDRAM at 0x10000018 that acknowledges
+   Timer1 and returns. Handler works but doesn't invoke scheduler.
+   - IRQ fires correctly
+   - Handler executes (LDR R0, STR to TIMER1_VAL, SUBS PC, LR, #4)
+   - CPU returns to idle loop - no progress
+
+2. **Skip Idle Loop**: Tried jumping past wake_core to 0x76C4, 0x7700
+   - 0x76C4: Still part of idle loop, cycles back to 0x769C
+   - 0x7700: Causes crash (invalid PC 0x2FFF1EE0) due to missing setup
+
+3. **Protect Timer1 Interrupt**: Added protection in interrupt controller to prevent
+   firmware from disabling Timer1.
+   - Works: Firmware writes 0xFFFFFFFF to CPU_INT_DIS but Timer1 stays enabled
+   - Still doesn't help: No scheduler to invoke
+
+**Key Technical Details**:
+
+Mailbox registers (0x60001000):
+- MBX_MSG_STAT: Read to check COP intend_sleep bit (0x8)
+- MBX_MSG_SET/CLR: Set/clear mailbox bits
+- CPU uses these to synchronize with COP
+
+PROC_CTL registers (0x60007000):
+- CPU_CTL: 0x60007000
+- COP_CTL: 0x60007004
+- PROC_SLEEP bit (0x80000000): Set when core enters sleep
+
+wake_core loop condition:
+```c
+while ((MBX_MSG_STAT & (0x4 << othercore)) != 0 &&
+       (PROC_CTL(othercore) & PROC_SLEEP) == 0);
+```
+
+**Current Status**:
+
+The fundamental issue is that Rockbox requires proper COP synchronization during kernel
+initialization. Without the COP responding correctly:
+1. Thread creation may be skipped
+2. Timer1 (scheduler tick) is never enabled
+3. CPU enters idle loop with no way to make progress
+
+**Possible Solutions** (not yet implemented):
+
+1. **Full COP Emulation**: Emulate the COP as a second ARM7TDMI core that responds
+   to synchronization requests.
+
+2. **Fake COP Responses**: Make mailbox and PROC_CTL registers return values that
+   simulate a responsive COP.
+
+3. **Direct Thread Invocation**: Identify the main thread entry point and force
+   the CPU to jump there, bypassing the scheduler.
+
+4. **Alternative Firmware**: Use a simpler Rockbox build that doesn't require COP
+   synchronization (single-core build).
+
+**Files Changed**:
+- `src/emulator/core.zig`: KERNEL_FIX (Timer1 enable), COP_WAKE_SKIP
+- `src/emulator/peripherals/interrupt_ctrl.zig`: Protected interrupt mask
+- `src/emulator/peripherals/timers.zig`: Debug output for Timer1 fires
+
+**Next Steps**:
+1. Investigate COP emulation approach
+2. Or find Rockbox single-core build options
+3. Or trace deeper into kernel_init() to find exact failure point
+
+---
+
+### 2026-01-14: Fake COP Responses and Timer1 Kickstart
+
+**Goal**: Break out of wake_core idle loop by faking COP responses and forcibly enabling Timer1
+
+**Background**:
+The previous investigation identified that the CPU was stuck in wake_core (0x769C-0x76DC) because:
+1. COP never responds to wake signals
+2. Timer1 never enabled by firmware (kernel init incomplete)
+3. RTOS scheduler never runs
+
+**Implementation**:
+
+1. **Fake COP Mailbox Responses** (`bus.zig`):
+
+   Added mailbox register emulation to simulate COP acknowledging wake requests:
+   ```zig
+   // New fields in MemoryBus struct
+   mbx_msg_stat: u32,           // MBX_MSG_STAT - Message status register
+   mbx_cop_clear_countdown: u32, // Cycle counter for auto-clearing COP response bits
+
+   // Constants
+   const MBX_MSG_STAT_OFFSET: u32 = 0x00;  // 0x60001000 - Status register
+   const MBX_MSG_SET_OFFSET: u32 = 0x04;   // 0x60001004 - Set bits in status
+   const MBX_MSG_CLR_OFFSET: u32 = 0x08;   // 0x60001008 - Clear bits in status
+   const MBX_CPU_WAKE_BIT: u32 = 0x4;      // Bit 2: CPU wake signal
+   const MBX_COP_WAKE_BIT: u32 = 0x8;      // Bit 3: COP wake signal
+   ```
+
+   When CPU sets the COP wake bit (0x8), the emulator auto-clears it after 10 reads to simulate COP acknowledging the wake request.
+
+2. **COP_CTL PROC_SLEEP Bit** (`system_ctrl.zig`):
+
+   Made COP_CTL always return PROC_SLEEP=1 (bit 31 set):
+   ```zig
+   REG_COP_CTL => blk: {
+       const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
+       const result = ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
+       break :blk result;
+   },
+   ```
+
+   This makes wake_core exit its inner loop immediately (COP is always "sleeping" so no need to wait).
+
+3. **Timer1 Kickstart** (`core.zig`):
+
+   When CPU stuck in idle loop for too long, forcibly enable Timer1:
+   ```zig
+   // Detect idle loop at 0x76C4-0x76DC
+   const in_idle_loop = (pc >= 0x76C4 and pc <= 0x76DC) or
+       (effective_pc >= 0x100076C4 and effective_pc <= 0x100076DC);
+
+   if (in_idle_loop and !self.timer1_enabled_by_emulator) {
+       self.wake_loop_iterations += 1;
+       if (self.wake_loop_iterations > 10000) {
+           self.timer1_enabled_by_emulator = true;
+           // Configure Timer1 for 10ms tick (count=10000)
+           const timer_config: u32 = 0xC0000000 | 10000; // Enable + Repeat + 10000
+           self.timer.timer1.setConfig(timer_config);
+           self.int_ctrl.cpu_enable |= 0x00000001; // Timer1 is bit 0
+           self.int_ctrl.protectInterrupt(.timer1);
+       }
+   }
+   ```
+
+4. **IRQ Enable in COP_WAKE_SKIP** (`core.zig`):
+
+   Force IRQ enable when skipping wake_core:
+   ```zig
+   if (pc == 0x769C or effective_pc == 0x1000769C) {
+       // ... skip logic ...
+       self.cpu.enableIrq();  // Ensure IRQs are enabled
+       return 1;
+   }
+   ```
+
+**Results**:
+
+| Metric | Status |
+|--------|--------|
+| Timer1 fires | ✅ Working (TIMER1_FIRE messages in output) |
+| IRQs taken | ✅ CPU enters IRQ mode (Mode=0x12) |
+| Scheduler tick | ❌ Not invoked |
+| LCD writes | ❌ Still 0 |
+
+**Why Scheduler Tick Doesn't Work**:
+
+The Timer1 fires correctly and IRQs are taken, but the scheduler tick function is never invoked because:
+
+1. **IRQ Vector Not Set Up**: The IRQ vector at 0x40000018 contains 0x84813004 (garbage/boot ROM code), not the kernel's IRQ handler
+2. **Kernel Init Incomplete**: Because we skip wake_core at entry, the kernel never completes initialization including installing interrupt handlers
+3. **Thread List Empty**: Without full kernel init, no threads are created, so even if scheduler ran, there's nothing to schedule
+
+**Debug Output Observed**:
+```
+WAKE_CORE: entry #1, LR=0x0000769C
+PERIODIC: cycle=110000000 PC=0x400071DC R0=0xFE40FF31 ...
+TIMER1_FIRE: raw_status=0x00800001, cpu_enabled=0x00000001
+WAKE_CORE: Forcing exit after 1001 loop iterations
+```
+
+The periodic trace shows PC stuck in 0x400071DC-0x400071EC range (bootloader code, not kernel).
+
+**Key Insight**:
+
+The fundamental problem is a chicken-and-egg issue:
+- To break out of wake_core, we skip kernel initialization code
+- But kernel initialization is what installs IRQ handlers and creates threads
+- Without IRQ handlers and threads, Timer1 interrupts don't help
+
+**Files Changed**:
+- `src/emulator/memory/bus.zig`: Mailbox fake COP responses
+- `src/emulator/peripherals/system_ctrl.zig`: COP_CTL PROC_SLEEP tracing
+- `src/emulator/core.zig`: Timer1 kickstart, COP_WAKE_SKIP with IRQ enable
+
+**Next Steps for Next Agent**:
+
+1. **Option A - Let Kernel Initialize**: Instead of skipping wake_core at entry (0x769C), let the kernel run until it naturally reaches the idle loop. This requires:
+   - Making COP_CTL return "awake" after first few checks
+   - Or detecting when kernel init is complete before enabling wake_core skip
+
+2. **Option B - Install Custom IRQ Handler**: Write a minimal IRQ handler that calls the Rockbox scheduler tick:
+   - Find address of `timer1_tick()` function in Rockbox binary
+   - Install trampoline at 0x40000018 that calls it
+   - Requires disassembling Rockbox to find function address
+
+3. **Option C - Direct Thread Start**: Find the main thread entry point and force execution there:
+   - Bypass scheduler entirely
+   - Set up minimal thread context
+   - Jump to main menu/UI code
 
 ---
 
