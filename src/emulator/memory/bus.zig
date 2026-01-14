@@ -366,9 +366,9 @@ pub const MemoryBus = struct {
 
             if (i == 0) {
                 // MMAP0: Check if address is in low memory that should be remapped to SDRAM
-                // Rockbox uses addresses 0x00000000-0x07FFFFFF for remapped SDRAM
-                // (larger range to accommodate trampolines at 0x03Exxxxx)
-                if (addr < 0x08000000) {
+                // Rockbox uses addresses 0x00000000-0x0FFFFFFF for remapped SDRAM
+                // The firmware is linked at 0x08000000, so addresses 0x08xxxxxx need translation
+                if (addr < 0x10000000) {
                     // For addresses like 0x03E914B4, subtract 0x03E80000 to get offset
                     // This accounts for Rockbox's link address within SDRAM
                     var translated: u32 = SDRAM_START + addr;
@@ -378,6 +378,12 @@ pub const MemoryBus = struct {
                     // Actual physical address = addr - 0x03E80000 + 0x10000000
                     if (addr >= 0x03E80000 and addr < 0x04000000) {
                         translated = (addr - 0x03E80000) + SDRAM_START;
+                    }
+
+                    // Handle Rockbox's main code linked at 0x08000000
+                    // Rockbox is linked to run at 0x08000000, maps to SDRAM 0x10000000
+                    if (addr >= 0x08000000 and addr < 0x10000000) {
+                        translated = (addr - 0x08000000) + SDRAM_START;
                     }
 
                     // Only log first few translations to avoid spam

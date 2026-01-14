@@ -1124,6 +1124,79 @@ Skip wake_core entirely at entry (0x769C) and jump to 0x76C4. However, the calle
 
 ---
 
+---
+
+### 2026-01-14: Direct Rockbox Loading and MMAP Improvements
+
+**Goal**: Enable direct loading of rockbox.ipod into SDRAM, bypassing the bootloader's FAT32 filesystem
+
+**Problem Discovered**:
+When using `--load-sdram rockbox.ipod`, the firmware wasn't executing correctly:
+1. Header detection missing "ip6g" model ID (iPod Video 5th gen)
+2. MMAP only translated 0x00000000-0x07FFFFFF, but Rockbox is linked at 0x08000000
+3. PC was set to 0x10000000 (physical SDRAM) instead of 0x08000000 (Rockbox's linked address)
+4. MMAP permission bits not initialized when enabling directly
+
+**Fixes Applied**:
+
+1. **iPod Firmware Header Detection** (`main.zig`):
+   - Added "ip5g" and "ip6g" model IDs to header detection
+   - Rockbox for iPod Video uses "ip6g" magic bytes
+   ```zig
+   // Check for iPod firmware header (model identifier at offset 4)
+   if (std.mem.eql(u8, fw_data[4..8], "ip5g") or
+       std.mem.eql(u8, fw_data[4..8], "ip6g"))
+   ```
+
+2. **Extended MMAP Translation** (`bus.zig`):
+   - Added translation for 0x08000000-0x0FFFFFFF range
+   - Rockbox is linked at 0x08000000, not 0x10000000
+   ```zig
+   // Handle Rockbox's main code linked at 0x08000000
+   if (addr >= 0x08000000 and addr < 0x10000000) {
+       translated = (addr - 0x08000000) + SDRAM_START;
+   }
+   ```
+
+3. **MMAP Permission Initialization** (`main.zig`):
+   - When enabling MMAP directly, must also set permission bits
+   ```zig
+   emu.bus.mmap_enabled = true;
+   emu.bus.mmap_physical[0] = 0x0F00; // Set permission bits
+   ```
+
+4. **Correct Entry Point** (`main.zig`):
+   - PC must be set to 0x08000000 (Rockbox's linked address), not 0x10000000
+   - MMAP translates 0x08000000 → 0x10000000 for memory access
+   ```zig
+   emu.cpu.setPc(0x08000000);
+   ```
+
+5. **effective_pc Calculation** (`core.zig`):
+   - Added 0x08xxxxxx range to effective_pc translation for COP skip logic
+
+**Current Status**:
+- Header detection: Working
+- MMAP translation: Working for 0x00-0x0F range
+- Entry execution: Progresses through startup code
+- **Issue**: Execution eventually hits exception cascade (bouncing between vectors 0x04 and 0x08)
+- Root cause: Need to investigate why exception handlers enter infinite loop
+
+**MMAP Translation Summary**:
+| Virtual Address | Physical Address | Description |
+|----------------|------------------|-------------|
+| 0x00000000-0x00FFFFFF | 0x10000000+ | Standard MMAP remap |
+| 0x03E80000-0x03FFFFFF | 0x10000000+ | Rockbox trampolines |
+| 0x08000000-0x0FFFFFFF | 0x10000000+ | Rockbox linked code |
+| 0x10000000+ | Direct | Physical SDRAM |
+
+**Files Changed**:
+- `src/emulator/main.zig`: Header detection, MMAP init, entry point
+- `src/emulator/memory/bus.zig`: Extended MMAP for 0x08xxxxxx
+- `src/emulator/core.zig`: effective_pc translation, INVALID_PC check
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis

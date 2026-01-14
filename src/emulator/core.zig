@@ -654,10 +654,12 @@ pub const Emulator = struct {
             }
         }
 
-        // Check for invalid PC values - but allow 0x03E8xxxx which are Rockbox trampolines
+        // Check for invalid PC values - but allow mapped ranges
+        // Allow: 0x03E8xxxx-0x03EFxxxx (trampolines), 0x08xxxxxx (Rockbox code)
         if (pc >= 0x02000000 and pc < 0x10000000) {
-            // Rockbox uses 0x03E8xxxx-0x03EFxxxx for trampolines (linked at SDRAM offset)
-            if (pc < 0x03E80000 or pc >= 0x04000000) {
+            const in_trampoline = (pc >= 0x03E80000 and pc < 0x04000000);
+            const in_rockbox_code = (pc >= 0x08000000 and pc < 0x0C000000);
+            if (!in_trampoline and !in_rockbox_code) {
                 std.debug.print("INVALID_PC: cycle={} PC=0x{X:0>8} LR=0x{X:0>8} - possible bad jump target\n", .{
                     self.total_cycles, pc, self.cpu.getReg(14),
                 });
@@ -755,6 +757,7 @@ pub const Emulator = struct {
         // When MMAP is enabled, PC can be in several ranges:
         // - 0x00000xxx-0x00FFFFxx: maps to 0x10000xxx (remapped SDRAM)
         // - 0x03E8xxxx-0x03EFxxxx: maps to 0x100xxxxx (Rockbox trampolines)
+        // - 0x08000xxx-0x0Bxxxxxxx: maps to 0x10000xxx (Rockbox code linked at 0x08000000)
         // - 0x10000xxx: direct SDRAM access
         var effective_pc: u32 = pc;
         if (self.bus.mmap_enabled) {
@@ -762,6 +765,9 @@ pub const Emulator = struct {
                 effective_pc = pc + 0x10000000;
             } else if (pc >= 0x03E80000 and pc < 0x04000000) {
                 effective_pc = (pc - 0x03E80000) + 0x10000000;
+            } else if (pc >= 0x08000000 and pc < 0x10000000) {
+                // Rockbox is linked to run at 0x08000000, maps to SDRAM 0x10000000
+                effective_pc = (pc - 0x08000000) + 0x10000000;
             }
         }
 
@@ -789,6 +795,22 @@ pub const Emulator = struct {
                     self.cpu.setReg(15, exit_addr);
                     return 1;
                 }
+            }
+        }
+
+        // TRACE: Figure out why PC goes from 0x7698 directly to 0x769C
+        // bx lr with LR=0 should go to address 0, not 0x769C
+        if (self.rockbox_restart_count >= 1 and self.bus.mmap_enabled and self.cop_wake_skip_count == 0) {
+            // Detailed trace: ALL PCs to see what happens between 0x7698 and 0x769C
+            if (effective_pc >= 0x10007690 and effective_pc <= 0x100076A0) {
+                const lr = self.cpu.getReg(14);
+                const sp = self.cpu.getReg(13);
+                std.debug.print("TRACE_DETAIL: PC=0x{X:0>8} (eff=0x{X:0>8}) LR=0x{X:0>8} SP=0x{X:0>8}\n", .{ pc, effective_pc, lr, sp });
+            }
+            // Also check if we hit address 0-0x10
+            if (pc < 0x20) {
+                const lr = self.cpu.getReg(14);
+                std.debug.print("TRACE_LOW: PC=0x{X:0>8}, LR=0x{X:0>8}\n", .{ pc, lr });
             }
         }
 

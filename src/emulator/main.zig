@@ -279,14 +279,16 @@ pub fn main() !void {
         sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024); // 16MB max for large firmware
 
         // Check for iPod firmware header (model identifier at offset 4)
-        // Format: 4 bytes checksum + 4 bytes model ("ipvd", "ipod", etc.) + firmware data
+        // Format: 4 bytes checksum + 4 bytes model ("ipvd", "ipod", "ip6g", etc.) + firmware data
         var fw_data = sdram_firmware.?;
         if (fw_data.len >= 8 and (std.mem.eql(u8, fw_data[4..8], "ipvd") or
             std.mem.eql(u8, fw_data[4..8], "ipod") or
             std.mem.eql(u8, fw_data[4..8], "ip3g") or
-            std.mem.eql(u8, fw_data[4..8], "ip4g")))
+            std.mem.eql(u8, fw_data[4..8], "ip4g") or
+            std.mem.eql(u8, fw_data[4..8], "ip5g") or
+            std.mem.eql(u8, fw_data[4..8], "ip6g")))
         {
-            print("Detected iPod firmware header, skipping 8-byte header\n", .{});
+            print("Detected iPod firmware header (model: {s}), skipping 8-byte header\n", .{fw_data[4..8]});
             fw_data = fw_data[8..];
         }
 
@@ -367,11 +369,25 @@ pub fn main() !void {
                 print("COP PC set to 0x10000800 (Apple firmware entry)\n", .{});
             }
         } else {
-            emu.cpu.setPc(0x10000000);
-            print("PC set to 0x10000000 (SDRAM)\n", .{});
+            // Rockbox firmware - requires MMAP and initialization
+            // Enable MMAP to map 0x00000000-0x0FFFFFFF to SDRAM 0x10000000+
+            // This is what the bootloader normally does before jumping to Rockbox
+            //
+            // IMPORTANT: Rockbox is linked to run at 0x08000000, so we must set PC
+            // to 0x08000000 (not 0x10000000). The MMAP will translate instruction
+            // fetches from 0x08xxxxxx to 0x10xxxxxx.
+            emu.bus.mmap_enabled = true;
+            emu.bus.mmap_physical[0] = 0x0F00; // Set permission bits to enable MMAP entry 0
+            emu.rockbox_restart_count = 1; // Skip COP sync detection since we're loading directly
+            print("MMAP enabled for direct Rockbox loading (mmap_physical[0]=0x0F00)\n", .{});
+
+            // Set PC to Rockbox's linked address (0x08000000), not physical SDRAM
+            // MMAP will translate this to 0x10000000 for memory access
+            emu.cpu.setPc(0x08000000);
+            print("PC set to 0x08000000 (Rockbox entry, MMAP -> 0x10000000)\n", .{});
             if (enable_cop) {
-                emu.initCop(0x10000000);
-                print("COP PC set to 0x10000000 (same entry point)\n", .{});
+                emu.initCop(0x08000000);
+                print("COP PC set to 0x08000000 (same entry point)\n", .{});
             }
         }
     }
