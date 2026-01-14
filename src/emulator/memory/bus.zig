@@ -1087,6 +1087,13 @@ pub const MemoryBus = struct {
             self.debug_loadbuffer_write_count += 1;
         }
 
+        // DEBUG: Trace writes to main() location specifically
+        if (addr == 0x03E804DC or translated_addr == 0x13E804DC) {
+            std.debug.print("MAIN_ADDR_WRITE: addr=0x{X:0>8} -> trans=0x{X:0>8} value=0x{X:0>8} mmap={} region={s}\n", .{
+                addr, translated_addr, value, self.mmap_enabled, @tagName(region),
+            });
+        }
+
         // Debug: track LCD writes
         if (region == .lcd) {
             self.lcd_write_count += 1;

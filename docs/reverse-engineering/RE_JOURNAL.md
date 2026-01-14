@@ -1797,6 +1797,192 @@ The Rockbox kernel's thread scheduler is deeply intertwined with COP (Coprocesso
 
 ---
 
+### 2026-01-14: iPod Video Direct Firmware Loading - Entry Point and PROC_ID Fixed
+
+**Goal**: Load iPod Video Rockbox firmware directly via --load-sdram bypassing bootloader
+
+**Background**:
+The bootloader approach works but has COP synchronization issues. Attempting direct firmware loading to:
+1. Bypass bootloader complexity
+2. Test PROC_ID register behavior
+3. Understand crt0 initialization sequence
+
+**Critical Discoveries**:
+
+1. **iPod 6G vs iPod Video Firmware Confusion**
+
+   Initially loaded wrong firmware causing immediate crash:
+   - iPod 6G (Classic) firmware: Linked at 0x08000000 (S5L8702 SDRAM base)
+   - iPod Video firmware: Linked at 0x10000000 (PP5021C SDRAM base)
+
+   File locations:
+   | Firmware | Location | SDRAM Base |
+   |----------|----------|------------|
+   | iPod 6G (wrong) | firmware/rockbox/.rockbox/rockbox.ipod | 0x08000000 |
+   | iPod Video (correct) | firmware/rockbox/ipodvideo/.rockbox/rockbox.ipod | 0x10000000 |
+
+2. **Entry Point Correction**
+
+   Initial entry point was wrong:
+   - Before: 0x10000100 (middle of BSS clear loop!)
+   - After: 0x10000000 (actual crt0 entry point)
+
+   The code at 0x10000000 is `MSR CPSR, #0xD3` (supervisor mode, IRQ disabled).
+
+3. **PROC_ID Register Working**
+
+   The PROC_ID register at 0x60000000 now returns correct values:
+   ```
+   PROC_ID_READ: addr=0x60000000 returning 0x55
+   PROC_ID_CHECK: R0=0x00000055 (0x55=CPU, 0xAA=COP)
+   PROC_ID_BRANCH: Taking CPU path
+   ```
+
+   Implementation in bus.zig:
+   ```zig
+   .proc_id => blk: {
+       const proc_val: u32 = if (self.is_cop_access) 0xAA else 0x55;
+       break :blk proc_val;
+   },
+   ```
+
+4. **crt0 Initialization Sequence Traced**
+
+   Full startup sequence now works:
+   | Step | Address | Action | Status |
+   |------|---------|--------|--------|
+   | 1 | 0x10000000 | MSR CPSR (mode setup) | ✅ |
+   | 2 | 0x10000004 | LDR R0, [PC, #0x14] → PROC_ID | ✅ |
+   | 3 | 0x10000008 | LDR R0, [R0] = 0x55 | ✅ |
+   | 4 | 0x1000000C | CMP R0, #0x55 | ✅ |
+   | 5 | 0x10000010 | BNE to COP path | ✅ (takes CPU path) |
+   | 6 | 0x10000148 | COP poll loop | ✅ (skipped) |
+   | 7 | 0x10000154 | MMAP configuration | ✅ |
+   | 8 | 0x10000220 | .init section copy | ✅ |
+   | 9 | 0x100002C8 | Stack fill (0xDEADBEEF) | ✅ |
+   | 10 | 0x100002D4 | Jump to main() | ❌ (invalid address) |
+
+5. **Stack Fill Loop Analysis**
+
+   The loop at 0x100002C8-0x100002D0 fills stack with 0xDEADBEEF:
+   ```arm
+   2C8: CMP R2, SP           ; Compare current addr with SP
+   2CC: STRLO R0, [R2], #4   ; Store 0xDEADBEEF, increment R2
+   2D0: BLO 0x2C8            ; Loop if R2 < SP
+   ```
+
+   Traced progress:
+   - Initial R2 = 0x4000B0D0 (stack bottom)
+   - Target SP = 0x40010000 (top of IRAM stack)
+   - ~8KB filled in ~12K cycles
+
+**CRITICAL BUG FOUND: main() Address Invalid**
+
+At 0x100002D4, the code does `LDR PC, [0x100003A8]` to jump to main().
+The value at 0x100003A8 is **0x03E804DC**.
+
+Problem:
+- 0x03E804DC with MMAP translates to physical 0x13E804DC
+- This address is ~65MB offset from SDRAM base
+- But the firmware binary is only ~751KB (770,564 bytes)
+- The value at 0x13E804DC is 0xE12FFF1E = `BX LR` (just a return!)
+
+This means:
+1. main() address is in a region that was never populated with firmware data
+2. The address 0x03E804DC assumes the .init section copy populated it
+3. But .init section range (0x03E88694-0x03E91BA8) doesn't include main()
+4. main() is **outside** the loaded firmware file!
+
+**Execution Result**:
+```
+JUMP_TO_MAIN: PC=0x000002D4 loading from 0x100003A8 = 0x03E804DC
+KERNEL_PATH: Reached main() entry at PC=0x03E804DC (effective=0x13E804DC) instr=0xE12FFF1E
+```
+
+After `BX LR` returns, execution falls back to reset vector (0x00000000).
+
+**Conclusion**:
+
+The iPod Video Rockbox firmware (rockbox.ipod) is a **partial** binary that assumes:
+1. The bootloader has already set up memory
+2. Additional code sections are loaded from somewhere else
+3. OR the binary is meant to be loaded differently (not raw to SDRAM)
+
+The bootloader-based approach is likely the correct path forward, as it:
+1. Properly handles the .ipod file format
+2. Loads all required sections
+3. Sets up MMAP before jumping to firmware
+
+**Files Changed**:
+- `src/emulator/main.zig`: Fixed entry point to 0x10000000
+- `src/emulator/memory/bus.zig`: Added PROC_ID read tracing
+- `src/emulator/core.zig`: Expanded MMAP EXEC trace for R2/SP debugging
+
+**Commits**: 94aadc1 (fix: BSS clear loop skip was skipping past main() jump)
+
+---
+
+### 2026-01-14: LCD Bypass Test Implementation
+
+**Goal**: Test LCD output directly, bypassing scheduler issues
+
+**Rationale**:
+Since the RTOS scheduler is blocked waiting for COP responses, and all attempts to skip scheduler loops result in "no runnable threads", try a different approach: directly test LCD functionality.
+
+**Implementation**:
+
+Added LCD bypass trigger in CALLER_LOOP_SKIP after 10 consecutive failures:
+```zig
+// In core.zig - CALLER_LOOP_SKIP handler
+if (self.caller_loop_escape_failures >= 10 and !self.lcd_bypass_done) {
+    std.debug.print("\n*** LCD BYPASS FROM CALLER LOOP ***\n", .{});
+    // Fill screen with red using LCD controller directly
+    const red = lcd.Color.fromRgb(255, 0, 0);
+    self.lcd_ctrl.clear(red);
+    self.lcd_ctrl.update();
+    self.lcd_bypass_done = true;
+}
+
+// After LCD bypass, try jumping to idle loop directly
+if (self.caller_loop_escape_failures >= 15) {
+    self.cpu.regs.switchMode(.supervisor);
+    self.cpu.regs.cpsr.irq_disable = false;
+    self.cpu.setReg(13, 0x08001000);
+    self.cpu.setReg(15, 0x7C7E0);
+    self.int_ctrl.clearInterrupt(.timer1);
+    self.caller_loop_escape_failures = 0;
+    self.sched_skip_count = 0;
+    return 1;
+}
+```
+
+**Added Tracking**:
+- `caller_loop_escape_failures: u32` - Counter for consecutive zero-stack escape failures
+- `lcd_bypass_done: bool` - Flag to prevent repeated LCD bypass attempts
+
+**Results**:
+- LCD bypass logic is in place but hasn't triggered yet in current test runs
+- The fundamental issue remains: firmware doesn't reach LCD initialization
+
+**Current Test Output** (iPod Video firmware):
+```
+MMAP disabled - crt0 will configure it
+PROC_ID_READ: addr=0x60000000 returning 0x55
+PROC_ID_CHECK: R0=0x00000055 (0x55=CPU, 0xAA=COP)
+PROC_ID_BRANCH: Taking CPU path
+...
+COP_POLL_LOOP: Skipping to 0x10000154
+...
+INIT_COPY_DONE: R2=0x03E91BA8 >= R3=0x03E91BA8
+...
+MMAP EXEC: cycle=1095900 PC=0x000002D0 -> 0x100002D0 R2=0x... SP=0x...
+(stuck in MMAP execution loop)
+```
+
+**Commit**: feat: LCD bypass fallback and iPod Video firmware support
+
+---
+
 ## Tools Used
 
 - **radare2**: Disassembly and analysis

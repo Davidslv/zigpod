@@ -134,7 +134,7 @@ pub fn main() !void {
     var iram_firmware_path: ?[]const u8 = null;
     var sdram_firmware_path: ?[]const u8 = null;
     var disk_path: ?[]const u8 = null;
-    var sdram_mb: usize = 32;
+    var sdram_mb: usize = 64; // Default to 64MB - required for Rockbox (compiled for 60GB/80GB models)
     var headless = false;
     var debug = false;
     var trace_count: u64 = 0;
