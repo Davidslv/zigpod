@@ -1123,6 +1123,11 @@ pub const MemoryBus = struct {
             self.lcd_bridge_write_count += 1;
         }
 
+        // DEBUG: Trace writes to RTR queue head (0x1012ACD8)
+        if (translated_addr == 0x1012ACD8) {
+            std.debug.print("RTR_HEAD_WRITE: value=0x{X:0>8} (from addr=0x{X:0>8})\n", .{ value, addr });
+        }
+
         // Track firmware writes to SDRAM for checksum debugging
         // First firmware word after header is 0xE321F0D3 (little-endian of D3 F0 21 E3)
         // Start tracking when we see this value

@@ -105,6 +105,14 @@ pub const SystemController = struct {
     /// When true: COP_CTL returns "sleeping" (bit 31 = 1) so wake_core can exit
     kernel_init_complete: bool,
 
+    /// Flag: Thread wakeup is pending (COP wake response simulation)
+    /// Set when COP receives wake signal after kernel_init_complete
+    pending_thread_wakeup: bool,
+
+    /// Counter: Cycles until thread wakeup executes
+    /// Gives firmware time to settle before we manipulate RTR queue
+    thread_wakeup_countdown: u32,
+
     /// Device reset callback (called when a device is reset)
     reset_callback: ?*const fn (Device) void,
 
@@ -169,6 +177,8 @@ pub const SystemController = struct {
             .cop_wake_count = 0,
             .cop_wake_ack_countdown = 0,
             .kernel_init_complete = false,
+            .pending_thread_wakeup = false,
+            .thread_wakeup_countdown = 0,
             .reset_callback = null,
             .enable_callback = null,
             .is_cop_access = false,
@@ -437,17 +447,25 @@ pub const SystemController = struct {
             REG_COP_CTL => {
                 // COP_CTL handles coprocessor sleep/wake state
                 // Bit 31 (PROC_SLEEP) indicates COP is sleeping
-                // Writing 0x80000000 (PROC_SLEEP=1) is a wake signal to COP
-                // After wake signal, COP wakes up, acknowledges (PROC_SLEEP=0), then sleeps again
+                // Writing 0 clears the sleep bit = wake request
+                // Writing 0x80000000 sets the sleep bit = put to sleep
                 const PROC_SLEEP: u32 = 0x80000000;
 
-                // Store non-sleep bits
+                // Debug: Log ALL writes to COP_CTL
+                if (self.cop_wake_count < 10 or self.cop_wake_count % 100 == 0) {
+                    std.debug.print("COP_CTL_WRITE: value=0x{X:0>8}, kernel_init={}\n", .{ value, self.kernel_init_complete });
+                }
+
+                // Store the value
                 self.cop_ctl = value;
 
-                // Handle wake request (writing PROC_SLEEP=1 is the wake signal)
-                // Start countdown for fake COP acknowledgment - but ONLY if countdown is 0
-                // (don't reset if already counting down from a previous write)
-                if ((value & PROC_SLEEP) != 0) {
+                // Handle wake request
+                // In Rockbox, wake_core() writes 0 to clear sleep bit (wake the core)
+                // We detect ANY write to COP_CTL as a potential wake signal
+                const is_wake_request = (value & PROC_SLEEP) == 0; // Writing 0 = wake
+                const is_sleep_request = (value & PROC_SLEEP) != 0; // Writing 0x80000000 = sleep
+
+                if (is_wake_request or is_sleep_request) {
                     self.cop_wake_count += 1;
                     // Only start countdown if not already counting (prevents reset on every write)
                     if (self.cop_wake_ack_countdown == 0) {
@@ -456,6 +474,25 @@ pub const SystemController = struct {
                     }
                     if (self.cop_state == .sleeping) {
                         self.cop_state = .waking;
+                    }
+
+                    // COP WAKE RESPONSE: After kernel init, simulate COP's response
+                    // When Timer1 handler calls core_wake(COP), we need to simulate
+                    // COP calling core_wake(CPU) back, which adds threads to RTR queue.
+                    // Only trigger on actual wake requests (writing 0), not sleep requests.
+                    if (is_wake_request) {
+                        if (self.cop_wake_count <= 5 or self.cop_wake_count % 100 == 0) {
+                            std.debug.print("COP_CTL_WAKE: count={}, kernel_init={}, pending={}\n", .{
+                                self.cop_wake_count, self.kernel_init_complete, self.pending_thread_wakeup,
+                            });
+                        }
+                        // Wait longer (count >= 10) to ensure main firmware has initialized threads
+                        // Increased countdown to give scheduler time to set up
+                        if (self.kernel_init_complete and self.cop_wake_count >= 10 and !self.pending_thread_wakeup) {
+                            std.debug.print("COP WAKE RESPONSE TRIGGERED: Setting pending_thread_wakeup=true (after {} COP wakes)\n", .{self.cop_wake_count});
+                            self.pending_thread_wakeup = true;
+                            self.thread_wakeup_countdown = 50000; // Longer delay before wakeup
+                        }
                     }
                 }
             },

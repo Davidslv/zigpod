@@ -217,6 +217,68 @@ To get actual Rockbox LCD output, we need to solve the scheduler problem. The op
 
 ---
 
+## COP Wake Response Implementation (2026-01-15)
+
+### Overview
+
+The COP Wake Response mechanism was implemented to simulate COP's behavior when Timer1 handler calls `core_wake(COP)`. In real hardware, COP would respond by calling `core_wake(CPU)` to add threads to the RTR queue.
+
+### Implementation
+
+**Files Modified:**
+
+1. **`src/emulator/peripherals/system_ctrl.zig`**
+   - Added `pending_thread_wakeup: bool` field to track wake request
+   - Added `thread_wakeup_countdown: u32` for delayed response
+   - Modified COP_CTL write handler to detect wake requests (writing 0)
+   - Triggers after kernel_init_complete and cop_wake_count >= 10
+
+2. **`src/emulator/core.zig`**
+   - Added `performThreadWakeup()` function that:
+     - Scans SDRAM for TCB (Thread Control Block) structures
+     - Looks for valid SP (SDRAM stack pointer) and PC (code pointer)
+     - Adds found TCBs to RTR queue at correct offset (+0x18 for embedded linked list)
+   - Added wakeup check in `step()` function after countdown expires
+
+3. **`src/emulator/memory/bus.zig`**
+   - Added debug trace for RTR head writes (0x1012ACD8)
+
+### Key Technical Discoveries
+
+1. **RTR Queue Structure**: Rockbox uses embedded linked lists within TCBs. The RTR queue head points to `tcb + 0x18` (the thread_list structure), not the TCB base address. Initial attempts writing the TCB address were "corrected" by the scheduler to `tcb + 0x18`.
+
+2. **TCB Scanning**: Generic TCB scanning finds false positives (bootloader data, not valid threads). Real Rockbox threads need:
+   - SP pointing to valid SDRAM stack (0x10000000-0x11FFFFFF)
+   - PC pointing to valid code (IRAM 0x40000000+ or SDRAM code)
+   - Proper state field at correct offset
+
+3. **Timing**: The COP Wake Response must trigger after the main firmware (rockbox.ipod) has initialized its threads, not during bootloader execution.
+
+### Current Status: BLOCKED
+
+**What Works:**
+- COP Wake Response triggers correctly after kernel init
+- RTR queue structure is correctly understood (tcb + 0x18)
+- TCB scanner finds candidates
+- Firmware loading works ("Rockbox loaded." appears)
+
+**Blocking Issue:**
+The main Rockbox firmware (rockbox.ipod) crashes during execution:
+```
+BX: Mode switch to THUMB at PC=0x00003230, target=0x00003231
+BX: Mode switch to THUMB at PC=0x00000002, target=0x00000003
+Final PC: 0xFFFFFB42, Mode: undefined, Thumb: true
+```
+
+The execution jumps to invalid addresses (0x00000002 → 0xFFFFFB42), indicating a separate emulator bug that prevents the main firmware from running past early init.
+
+**Next Steps to Unblock:**
+1. Debug the BX to 0x00000002 - find what instruction leads there
+2. Check for missing ARM instruction emulation (MRS/MSR, coprocessor, etc.)
+3. Verify MMAP translation for low addresses doesn't cause issues
+
+---
+
 ## References
 
 - `docs/reverse-engineering/LCD_OUTPUT_PLAN.md` - Original LCD strategy

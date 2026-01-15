@@ -561,6 +561,208 @@ pub const Emulator = struct {
         return 0; // Will be updated when we trace the actual function
     }
 
+    /// COP Wake Response: Simulate COP's response to wake signal
+    /// When Timer1 handler calls core_wake(COP), COP would normally:
+    /// 1. Wake up and do some processing
+    /// 2. Call core_wake(CPU) which adds threads to RTR queue
+    /// Since COP isn't emulated, we simulate step 2 by directly adding threads to RTR queue
+    pub fn performThreadWakeup(self: *Self) void {
+        std.debug.print("\n=== COP WAKE RESPONSE: Adding threads to RTR queue ===\n", .{});
+
+        // RTR queue head (confirmed from RTR trace)
+        const rtr_head: u32 = 0x1012ACD8;
+
+        // Check current RTR queue state
+        const current_head = self.bus.read32(rtr_head);
+        std.debug.print("  RTR head at 0x{X:0>8}: value=0x{X:0>8}\n", .{ rtr_head, current_head });
+
+        // Only proceed if queue is empty
+        if (current_head != 0) {
+            std.debug.print("  RTR queue not empty (has 0x{X:0>8}), skipping\n", .{current_head});
+            return;
+        }
+
+        // SCAN SDRAM for actual TCBs with valid context
+        std.debug.print("  Scanning SDRAM for TCB structures...\n", .{});
+
+        // Rockbox thread structure (from rockbox/firmware/kernel/thread.c):
+        // struct thread_entry {
+        //     struct regs context;      // offset 0x00: register context
+        //                               // SP at offset 0x00, PC/LR at offset 0x04-0x08
+        //     struct thread_list l;     // offset ~0x18: linked list pointers (prev, next)
+        //     int8_t state;             // offset ~0x40: state field
+        //     ...
+        // }
+        // TCB size is typically 0x80-0x100 bytes
+
+        // For valid threads, look for:
+        // - SP pointing to SDRAM (stack): 0x10000000-0x11FFFFFF
+        // - PC/LR pointing to code: IRAM (0x40000000+) or SDRAM (0x10000000+)
+        const sdram_base: u32 = 0x10000000;
+        const sdram_end: u32 = 0x10400000; // First 4MB
+        const tcb_align: u32 = 0x40; // TCBs usually aligned to 64 bytes
+
+        var found_tcbs: [16]u32 = [_]u32{0} ** 16;
+        var found_count: usize = 0;
+
+        var addr = sdram_base;
+        while (addr < sdram_end and found_count < found_tcbs.len) : (addr += tcb_align) {
+            // Read potential TCB fields
+            const word0 = self.bus.read32(addr); // SP
+            _ = self.bus.read32(addr + 4); // Could be PC or R4 (checked in loop below)
+
+            // Score this candidate
+            var score: u32 = 0;
+
+            // SP should point to SDRAM (stack area)
+            const sp_valid = (word0 >= 0x10000000 and word0 < 0x12000000);
+            if (sp_valid) score += 10;
+
+            // Look for PC-like value (code pointer) in first few words
+            var has_code_ptr = false;
+            var code_ptr: u32 = 0;
+            for ([_]u32{ 4, 8, 0x3C }) |off| {
+                const w = self.bus.read32(addr + off);
+                // Valid code: IRAM (0x40000000-0x40020000) or SDRAM code (0x10000000-0x10100000)
+                const is_iram = (w >= 0x40000000 and w < 0x40020000);
+                const is_sdram_code = (w >= 0x10000000 and w < 0x10100000);
+                if (is_iram or is_sdram_code) {
+                    has_code_ptr = true;
+                    code_ptr = w;
+                    score += 20;
+                    break;
+                }
+            }
+
+            // Check state field at offset 0x40
+            const state = self.bus.read32(addr + 0x40);
+            const state_valid = (state >= 1 and state <= 4);
+            if (state_valid) score += 5;
+
+            // Non-zero content in context area
+            var non_zero_count: u32 = 0;
+            var i: u32 = 0;
+            while (i < 0x40) : (i += 4) {
+                if (self.bus.read32(addr + i) != 0) non_zero_count += 1;
+            }
+            if (non_zero_count >= 4) score += 5;
+
+            // Only accept if we have both valid SP AND code pointer
+            if (sp_valid and has_code_ptr and score >= 35) {
+                found_tcbs[found_count] = addr;
+                found_count += 1;
+
+                if (found_count <= 5) {
+                    std.debug.print("  Found TCB at 0x{X:0>8}: score={}, SP=0x{X:0>8}, codeptr=0x{X:0>8}, state=0x{X}\n", .{ addr, score, word0, code_ptr, state });
+                    // Dump structure
+                    std.debug.print("    Dump: ", .{});
+                    i = 0;
+                    while (i < 64) : (i += 4) {
+                        const w = self.bus.read32(addr + i);
+                        std.debug.print("{X:0>8} ", .{w});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
+        }
+
+        std.debug.print("  Found {} TCB candidates in SDRAM\n", .{found_count});
+
+        // If no TCBs found, try scanning for the scheduler's threads array
+        if (found_count == 0) {
+            std.debug.print("  No TCBs found, searching for threads array...\n", .{});
+
+            // Search for array of thread entries near scheduler data
+            // The scheduler globals are around 0x1012ACD8, so threads likely nearby
+            const sched_region_start: u32 = 0x10120000;
+            const sched_region_end: u32 = 0x10140000;
+
+            addr = sched_region_start;
+            while (addr < sched_region_end) : (addr += 4) {
+                const val = self.bus.read32(addr);
+                // Look for pointers into SDRAM that could be thread pointers
+                if (val >= 0x10000000 and val < 0x12000000) {
+                    // Check if this points to a TCB-like structure
+                    const sp = self.bus.read32(val);
+                    if (sp >= 0x10000000 and sp < 0x12000000) {
+                        std.debug.print("  Potential thread ptr at 0x{X:0>8} -> 0x{X:0>8} (SP=0x{X:0>8})\n", .{ addr, val, sp });
+                        if (found_count < found_tcbs.len) {
+                            found_tcbs[found_count] = val;
+                            found_count += 1;
+                        }
+                        if (found_count >= 5) break;
+                    }
+                }
+            }
+        }
+
+        // Now try to add found TCBs to RTR queue
+        if (found_count > 0) {
+            const tcb = found_tcbs[0];
+            std.debug.print("  Attempting to add TCB 0x{X:0>8} to RTR queue...\n", .{tcb});
+
+            // Try several state offset positions
+            const state_offsets = [_]u32{ 0x1C, 0x3C, 0x40 };
+            for (state_offsets) |off| {
+                const old_state = self.bus.read32(tcb + off);
+                if (old_state >= 1 and old_state <= 10) {
+                    // Found the state field - set to STATE_RUNNING (1) or leave as-is
+                    std.debug.print("  State at offset 0x{X}: 0x{X:0>8}\n", .{ off, old_state });
+                    break;
+                }
+            }
+
+            // Add to RTR queue - Rockbox uses embedded linked lists
+            // The RTR queue head points to thread_list structure at offset 0x18 within TCB
+            // So we write (tcb + 0x18) to RTR head, not the TCB base address
+            const list_offset: u32 = 0x18;
+            const rtr_entry = tcb + list_offset;
+
+            std.debug.print("  Writing RTR head: 0x{X:0>8} -> 0x{X:0>8} (TCB base=0x{X:0>8})\n", .{ rtr_head, rtr_entry, tcb });
+
+            // Before writing, set up the linked list structure:
+            // At tcb+0x18: prev pointer (set to 0 = no previous)
+            // At tcb+0x1C: next pointer (set to 0 = no next)
+            self.bus.write32(tcb + list_offset, 0); // prev = NULL
+            self.bus.write32(tcb + list_offset + 4, 0); // next = NULL
+
+            // Also need to set thread state to READY if not already
+            // Try common state field offsets
+            const state_offset: u32 = 0x40; // Found state=1 at offset 0x40 earlier
+            const current_state = self.bus.read32(tcb + state_offset);
+            if (current_state >= 1 and current_state <= 2) {
+                // States: 1=running, 2=blocked → make ready
+                self.bus.write32(tcb + state_offset, 1); // STATE_RUNNING = 1 in Rockbox
+                std.debug.print("  Set state at offset 0x{X} from 0x{X} to 1 (running)\n", .{ state_offset, current_state });
+            }
+
+            self.bus.write32(rtr_head, rtr_entry);
+            const verify = self.bus.read32(rtr_head);
+            std.debug.print("  Verify read: 0x{X:0>8}\n", .{verify});
+
+            if (verify == rtr_entry) {
+                std.debug.print("  SUCCESS: TCB 0x{X:0>8} (list at 0x{X:0>8}) added to RTR queue!\n", .{ tcb, rtr_entry });
+            } else {
+                std.debug.print("  FAILED: RTR write verification failed (got 0x{X:0>8})\n", .{verify});
+            }
+        } else {
+            std.debug.print("  WARNING: No valid TCBs found in SDRAM scan!\n", .{});
+
+            // Last resort: dump scheduler region to understand structure
+            std.debug.print("  Scheduler region dump (0x1012AC00-0x1012AD00):\n", .{});
+            addr = 0x1012AC00;
+            while (addr < 0x1012AD00) : (addr += 16) {
+                std.debug.print("    0x{X:0>8}: ", .{addr});
+                var i: u32 = 0;
+                while (i < 16) : (i += 4) {
+                    const w = self.bus.read32(addr + i);
+                    std.debug.print("{X:0>8} ", .{w});
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+    }
+
     /// Create CPU memory bus interface
     fn createCpuBus(self: *Self) arm_executor.MemoryBus {
         return .{
@@ -1182,6 +1384,24 @@ pub const Emulator = struct {
                 std.debug.print("KERNEL_INIT_COMPLETE: IRQ vector installed, Timer1 enabled by firmware\n", .{});
                 // Schedule framebuffer scan for 10 million cycles from now
                 self.fb_scan_trigger_cycles = self.total_cycles + 10_000_000;
+            }
+
+            // COP WAKE RESPONSE: Process pending thread wakeup
+            // This simulates COP responding to wake signal by adding threads to RTR queue
+            if (self.sys_ctrl.pending_thread_wakeup) {
+                if (self.sys_ctrl.thread_wakeup_countdown > 0) {
+                    self.sys_ctrl.thread_wakeup_countdown -= 1;
+                } else {
+                    // Execute thread wakeup
+                    self.performThreadWakeup();
+                    self.sys_ctrl.pending_thread_wakeup = false;
+
+                    // Reset switch_thread counter to give scheduler a fresh chance
+                    self.switch_thread_count = 0;
+                    self.total_sched_skips = 0;
+
+                    std.debug.print("COP WAKE RESPONSE: Thread wakeup complete, scheduler counters reset\n", .{});
+                }
             }
 
             // DIRECT LCD APPROACH: Trigger framebuffer scan after kernel init + delay
