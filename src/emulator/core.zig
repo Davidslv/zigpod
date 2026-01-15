@@ -215,6 +215,15 @@ pub const Emulator = struct {
     /// Flag: RTR trace has been reported
     rtr_trace_reported: bool,
 
+    /// Flag: Framebuffer scan has been done
+    fb_scan_done: bool,
+
+    /// Found framebuffer address (0 if not found)
+    fb_found_addr: u32,
+
+    /// Cycles at which to trigger framebuffer scan
+    fb_scan_trigger_cycles: u64,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -306,6 +315,9 @@ pub const Emulator = struct {
             .rtr_trace_vals = [_]u32{0} ** 32,
             .rtr_trace_count = 0,
             .rtr_trace_reported = false,
+            .fb_scan_done = false,
+            .fb_found_addr = 0,
+            .fb_scan_trigger_cycles = 0,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -384,6 +396,169 @@ pub const Emulator = struct {
         }
         self.total_cycles = 0;
         self.next_frame_cycles = self.cycles_per_frame;
+    }
+
+    /// Scan SDRAM for Rockbox framebuffer
+    /// The framebuffer is 320x240 RGB565 = 153,600 bytes
+    /// Returns the address if found, 0 otherwise
+    pub fn scanForFramebuffer(self: *Self) u32 {
+        const FB_SIZE: usize = 320 * 240 * 2; // 153,600 bytes
+        const sdram = self.sdram.slice();
+        const sdram_size = sdram.len;
+
+        std.debug.print("\n=== FRAMEBUFFER SCAN ===\n", .{});
+        std.debug.print("Scanning {} bytes of SDRAM for {}x{} RGB565 framebuffer...\n", .{ sdram_size, 320, 240 });
+
+        // Rockbox typically places framebuffer in upper SDRAM
+        // Scan in 4KB chunks, looking for regions with significant non-zero content
+        var best_addr: u32 = 0;
+        var best_score: u32 = 0;
+
+        // Start from higher addresses (framebuffer usually near end of used memory)
+        var offset: usize = if (sdram_size > FB_SIZE + 0x100000) sdram_size - FB_SIZE - 0x100000 else 0;
+        while (offset + FB_SIZE <= sdram_size) : (offset += 4096) {
+            // Count non-zero pixels in this region
+            var non_zero: u32 = 0;
+            var varied: u32 = 0;
+            var last_val: u16 = 0;
+
+            var i: usize = 0;
+            while (i < FB_SIZE) : (i += 2) {
+                const pixel = @as(u16, sdram[offset + i]) | (@as(u16, sdram[offset + i + 1]) << 8);
+                if (pixel != 0) {
+                    non_zero += 1;
+                }
+                if (pixel != last_val) {
+                    varied += 1;
+                }
+                last_val = pixel;
+            }
+
+            // Score based on having content and variation (not just solid color)
+            // A real framebuffer would have both non-zero pixels and variation
+            const total_pixels = FB_SIZE / 2;
+            if (non_zero > 1000 and varied > 100) {
+                const score = non_zero + varied;
+                if (score > best_score) {
+                    best_score = score;
+                    best_addr = @intCast(offset);
+                    std.debug.print("  Candidate at 0x{X:0>8}: {} non-zero pixels, {} variations\n", .{
+                        0x10000000 + offset, non_zero, varied,
+                    });
+                }
+            }
+
+            // Also check for Rockbox-specific patterns at known offsets
+            // Rockbox logo or boot splash might have specific signatures
+            _ = total_pixels;
+        }
+
+        if (best_addr != 0) {
+            std.debug.print("Best framebuffer candidate at SDRAM offset 0x{X:0>8} (addr 0x{X:0>8})\n", .{
+                best_addr, 0x10000000 + best_addr,
+            });
+        } else {
+            std.debug.print("No framebuffer found - checking if any LCD pixels were drawn...\n", .{});
+
+            // Check if Rockbox ever wrote to LCD via LCD2 bridge
+            const lcd_stats = lcd.Lcd2Bridge.debug_pixels_written;
+            std.debug.print("LCD2 Bridge stats: {} pixels written, {} block starts\n", .{
+                lcd_stats, lcd.Lcd2Bridge.debug_block_start_count,
+            });
+        }
+
+        self.fb_found_addr = if (best_addr != 0) 0x10000000 + best_addr else 0;
+        return self.fb_found_addr;
+    }
+
+    /// Copy found framebuffer to LCD controller
+    pub fn copyFramebufferToLcd(self: *Self) void {
+        if (self.fb_found_addr == 0) {
+            std.debug.print("No framebuffer address found, cannot copy\n", .{});
+            return;
+        }
+
+        const FB_SIZE: usize = 320 * 240 * 2;
+        std.debug.print("Copying framebuffer from 0x{X:0>8} to LCD controller...\n", .{self.fb_found_addr});
+
+        // Read from SDRAM and write to LCD framebuffer
+        var i: usize = 0;
+        while (i < FB_SIZE) : (i += 2) {
+            const lo = self.bus.read8(self.fb_found_addr + @as(u32, @intCast(i)));
+            const hi = self.bus.read8(self.fb_found_addr + @as(u32, @intCast(i + 1)));
+            self.lcd_ctrl.framebuffer[i] = lo;
+            self.lcd_ctrl.framebuffer[i + 1] = hi;
+        }
+
+        // Trigger display update
+        self.lcd_ctrl.debug_pixel_writes = 320 * 240;
+        self.lcd_ctrl.update();
+        std.debug.print("Framebuffer copied and LCD updated!\n", .{});
+    }
+
+    /// Draw a test pattern to verify LCD output works
+    pub fn drawTestPattern(self: *Self) void {
+        std.debug.print("Drawing test pattern to LCD...\n", .{});
+
+        // Draw color bars
+        const colors = [_]lcd.Color{
+            lcd.Color.fromRgb(255, 0, 0),   // Red
+            lcd.Color.fromRgb(0, 255, 0),   // Green
+            lcd.Color.fromRgb(0, 0, 255),   // Blue
+            lcd.Color.fromRgb(255, 255, 0), // Yellow
+            lcd.Color.fromRgb(255, 0, 255), // Magenta
+            lcd.Color.fromRgb(0, 255, 255), // Cyan
+            lcd.Color.fromRgb(255, 255, 255), // White
+            lcd.Color.fromRgb(128, 128, 128), // Gray
+        };
+
+        const bar_width = 320 / colors.len;
+        for (colors, 0..) |color, i| {
+            const x: u16 = @intCast(i * bar_width);
+            self.lcd_ctrl.fillRect(x, 0, @intCast(bar_width), 240, color);
+        }
+
+        // Draw "ZIGPOD" text area (simple rectangle for now)
+        const text_color = lcd.Color.fromRgb(255, 255, 255);
+        self.lcd_ctrl.fillRect(100, 100, 120, 40, text_color);
+
+        // Set pixel write count so PPM saving is triggered
+        self.lcd_ctrl.debug_pixel_writes = 320 * 240;
+
+        // Trigger update
+        self.lcd_ctrl.update();
+        std.debug.print("Test pattern drawn! LCD updates: {}, pixel_writes: {}\n", .{
+            self.lcd_ctrl.debug_update_count,
+            self.lcd_ctrl.debug_pixel_writes,
+        });
+    }
+
+    /// Direct LCD approach: Find and call lcd_update() in firmware
+    /// This scans for the function that writes to LCD2 bridge registers
+    pub fn findLcdUpdateFunction(self: *Self) u32 {
+        _ = self; // Will be used when we implement function tracing
+        // lcd_update() in Rockbox writes to:
+        // - LCD2_BLOCK_CTRL (0x70008A20) with 0x10000080 (init) or 0x34000000 (start)
+        // - LCD2_BLOCK_CONFIG (0x70008A24)
+        // - LCD2_BLOCK_DATA (0x70008B00+)
+        //
+        // The function pattern is:
+        // LDR Rx, =0x70008A20
+        // STR Ry, [Rx]
+        // ...
+        // LDR Rx, =0x70008B00
+        // STR loop...
+
+        // For now, we'll use tracing to find when these addresses are written
+        // and log the PC at that point
+        std.debug.print("LCD update function search - monitoring LCD2 writes...\n", .{});
+
+        // Check if we've seen any LCD2 writes
+        const ctrl_writes = lcd.Lcd2Bridge.debug_block_ctrl_writes;
+        const data_writes = lcd.Lcd2Bridge.debug_block_data_writes;
+        std.debug.print("LCD2 writes so far: {} ctrl, {} data\n", .{ ctrl_writes, data_writes });
+
+        return 0; // Will be updated when we trace the actual function
     }
 
     /// Create CPU memory bus interface
@@ -1005,6 +1180,31 @@ pub const Emulator = struct {
             if (irq_installed and self.bus.timer1_enabled_by_firmware and !self.sys_ctrl.isKernelInitComplete()) {
                 self.sys_ctrl.setKernelInitComplete();
                 std.debug.print("KERNEL_INIT_COMPLETE: IRQ vector installed, Timer1 enabled by firmware\n", .{});
+                // Schedule framebuffer scan for 10 million cycles from now
+                self.fb_scan_trigger_cycles = self.total_cycles + 10_000_000;
+            }
+
+            // DIRECT LCD APPROACH: Trigger framebuffer scan after kernel init + delay
+            if (!self.fb_scan_done and self.fb_scan_trigger_cycles > 0 and self.total_cycles >= self.fb_scan_trigger_cycles) {
+                std.debug.print("\n=== DIRECT LCD APPROACH TRIGGERED ===\n", .{});
+                std.debug.print("Kernel init complete + {} cycles elapsed\n", .{self.total_cycles - (self.fb_scan_trigger_cycles - 10_000_000)});
+
+                // First, check if LCD2 bridge has received any writes
+                _ = self.findLcdUpdateFunction();
+
+                // Scan for framebuffer in SDRAM
+                const fb_addr = self.scanForFramebuffer();
+
+                if (fb_addr != 0) {
+                    // Found a potential framebuffer, copy it to LCD
+                    self.copyFramebufferToLcd();
+                } else {
+                    // No framebuffer found - draw test pattern instead
+                    std.debug.print("No framebuffer found - drawing test pattern...\n", .{});
+                    self.drawTestPattern();
+                }
+
+                self.fb_scan_done = true;
             }
 
             // SWITCH_THREAD SKIP at 0x84B5C (inner scheduler function that loops)
