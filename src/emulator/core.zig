@@ -818,11 +818,51 @@ pub const Emulator = struct {
         //   0x00: Reset, 0x04: Undefined, 0x08: SWI, 0x0C: Prefetch Abort
         //   0x10: Data Abort, 0x14: Reserved, 0x18: IRQ, 0x1C: FIQ
         if (pc == 0x00000004) {
+            const lr = self.cpu.getReg(14);
+            const cpsr = self.cpu.regs.cpsr;
+            // In ARM mode, LR = fault_addr + 4; in Thumb mode, LR = fault_addr + 2
+            // Use wrapping subtraction to avoid overflow
+            const fault_addr = if (cpsr.thumb) lr -% 2 else lr -% 4;
+
             std.debug.print("\n!!! UNDEFINED INSTRUCTION EXCEPTION at cycle {} !!!\n", .{self.total_cycles});
-            std.debug.print("  LR=0x{X:0>8} (return address = fault location + 4)\n", .{self.cpu.getReg(14)});
+            std.debug.print("  LR=0x{X:0>8} Thumb={} => fault_addr=0x{X:0>8}\n", .{ lr, cpsr.thumb, fault_addr });
+
+            // Read the faulting instruction
+            if (cpsr.thumb) {
+                const fault_instr = self.bus.read16(fault_addr);
+                std.debug.print("  Faulting THUMB instr at 0x{X:0>8}: 0x{X:0>4}\n", .{ fault_addr, fault_instr });
+            } else {
+                const fault_instr = self.bus.read32(fault_addr);
+                std.debug.print("  Faulting ARM instr at 0x{X:0>8}: 0x{X:0>8}\n", .{ fault_addr, fault_instr });
+            }
+
             std.debug.print("  R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
                 self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3),
             });
+            std.debug.print("  R4=0x{X:0>8} R5=0x{X:0>8} R6=0x{X:0>8} R7=0x{X:0>8}\n", .{
+                self.cpu.getReg(4), self.cpu.getReg(5), self.cpu.getReg(6), self.cpu.getReg(7),
+            });
+            std.debug.print("  R8=0x{X:0>8} R9=0x{X:0>8} R10=0x{X:0>8} R11=0x{X:0>8}\n", .{
+                self.cpu.getReg(8), self.cpu.getReg(9), self.cpu.getReg(10), self.cpu.getReg(11),
+            });
+            std.debug.print("  R12=0x{X:0>8} SP=0x{X:0>8} PC_was=0x{X:0>8}\n", .{
+                self.cpu.getReg(12), self.cpu.getReg(13), fault_addr,
+            });
+
+            // Dump recent PC history if we have it
+            if (self.total_cycles > 10000000) {
+                std.debug.print("  MMAP enabled={}\n", .{self.bus.mmap_enabled});
+                // Try to read the code around fault address to see context
+                const ctx_start = fault_addr -% 32;
+                std.debug.print("  Code near 0x{X:0>8}:\n", .{ctx_start});
+                var i: u32 = 0;
+                while (i < 64) : (i += 4) {
+                    const ctx_addr = ctx_start +% i;
+                    const ctx_instr = self.bus.read32(ctx_addr);
+                    const marker: []const u8 = if (ctx_addr == fault_addr) " <-- FAULT" else "";
+                    std.debug.print("    0x{X:0>8}: 0x{X:0>8}{s}\n", .{ ctx_addr, ctx_instr, marker });
+                }
+            }
         }
         if (pc == 0x0000000C) {
             std.debug.print("\n!!! PREFETCH ABORT EXCEPTION at cycle {} !!!\n", .{self.total_cycles});
@@ -836,6 +876,16 @@ pub const Emulator = struct {
         if (self.total_cycles < 1_000_000 and self.total_cycles % 100_000 == 0) {
             std.debug.print("BOOT TRACE: cycle {} PC=0x{X:0>8} R0=0x{X:0>8}\n", .{
                 self.total_cycles, pc, self.cpu.getReg(0),
+            });
+        }
+
+        // CRASH REGION TRACE: Detect when PC enters suspicious low memory region
+        // This catches bad jumps into data sections or corrupted addresses
+        if (pc >= 0x00003000 and pc < 0x00006000 and self.total_cycles > 10000000) {
+            const instr = self.bus.read32(pc);
+            const thumb = self.cpu.regs.cpsr.thumb;
+            std.debug.print("CRASH_REGION: cycle={} PC=0x{X:0>8} instr=0x{X:0>8} LR=0x{X:0>8} SP=0x{X:0>8} Thumb={}\n", .{
+                self.total_cycles, pc, instr, self.cpu.getReg(14), self.cpu.getReg(13), thumb,
             });
         }
 
@@ -1107,8 +1157,9 @@ pub const Emulator = struct {
         }
         // Trace when execution enters SDRAM (0x10000000-0x12000000)
         if (pc >= 0x10000000 and pc < 0x12000000) {
-            std.debug.print("SDRAM EXEC: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
-                self.total_cycles, pc, self.cpu.getReg(0), self.cpu.getReg(14),
+            const instr = self.bus.read32(pc);
+            std.debug.print("SDRAM EXEC: cycle={} PC=0x{X:0>8} instr=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                self.total_cycles, pc, instr, self.cpu.getReg(0), self.cpu.getReg(14),
             });
         }
 

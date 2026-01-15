@@ -630,9 +630,7 @@ fn executeBranch(regs: *RegisterFile, instruction: u32) u32 {
 /// Execute branch and exchange
 fn executeBranchExchange(regs: *RegisterFile, instruction: u32) u32 {
     const bx = decoder.BranchExchange.decode(instruction);
-
     const target = regs.get(bx.rm);
-    const was_thumb = regs.cpsr.thumb;
 
     // Bit 0 determines ARM/Thumb state
     regs.cpsr.thumb = (target & 1) != 0;
@@ -642,15 +640,6 @@ fn executeBranchExchange(regs: *RegisterFile, instruction: u32) u32 {
         regs.r[15] = target & ~@as(u32, 1);
     } else {
         regs.r[15] = target & ~@as(u32, 3);
-    }
-
-    // Debug: Log mode switches
-    if (regs.cpsr.thumb != was_thumb) {
-        std.debug.print("BX: Mode switch to {s} at PC=0x{X:0>8}, target=0x{X:0>8}\n", .{
-            if (regs.cpsr.thumb) "THUMB" else "ARM",
-            regs.r[15],
-            target,
-        });
     }
 
     return 3;

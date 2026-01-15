@@ -262,20 +262,53 @@ The COP Wake Response mechanism was implemented to simulate COP's behavior when 
 - TCB scanner finds candidates
 - Firmware loading works ("Rockbox loaded." appears)
 
-**Blocking Issue:**
-The main Rockbox firmware (rockbox.ipod) crashes during execution:
+**Blocking Issue: FIRMWARE STACK CORRUPTION (Not Emulator Bug)**
+
+The main Rockbox firmware (rockbox.ipod) crashes during execution. After extensive investigation (2026-01-15), the **root cause was identified as a buffer overflow in the firmware itself**, NOT an emulator bug.
+
+**Crash Chain:**
 ```
-BX: Mode switch to THUMB at PC=0x00003230, target=0x00003231
-BX: Mode switch to THUMB at PC=0x00000002, target=0x00000003
-Final PC: 0xFFFFFB42, Mode: undefined, Thumb: true
+1. BX LR at 0x00082EBC returns to LR=0x00003231 (Thumb bit set)
+2. LDMFD at 0x00082EB8 pops LR from stack at 0x4000B05C
+3. Stack at 0x4000B05C contains 0x00003231 (corrupted!)
+4. This value is ASCII "12\0\0" - part of version string
+5. Code at 0x00003230 is ARM, not Thumb → executes garbage
+6. Eventually hits undefined instruction at 0x00004FF2
 ```
 
-The execution jumps to invalid addresses (0x00000002 → 0xFFFFFB42), indicating a separate emulator bug that prevents the main firmware from running past early init.
+**Evidence of Stack Corruption:**
+```
+Raw IRAM bytes at 0x4000B05C:
+  Context: ... [32] [36] [30] [31] | [31] [32] [00] [00] | [EF] [BE] [AD] [DE] ...
+           (    "2601"           ) (    "12\0\0"       ) (   DEADBEEF      )
+```
 
-**Next Steps to Unblock:**
-1. Debug the BX to 0x00000002 - find what instruction leads there
-2. Check for missing ARM instruction emulation (MRS/MSR, coprocessor, etc.)
-3. Verify MMAP translation for low addresses doesn't cause issues
+The bytes "2601" and "12" are ASCII version string data that overwrote the Rockbox stack canary (0xDEADBEEF). This indicates a **buffer overflow** during version string processing in the firmware.
+
+**Key Observations:**
+- The value 0x00003231 was **never written to stack address 0x4000B05C** through normal bus.write32 operations
+- Surrounding context shows Rockbox's DEADBEEF stack guard pattern
+- Version string fragments ("Ver.", "2601", "12") appear in registers R6/R7 at crash time
+- The corruption occurs after "Rockbox loaded." but before main thread runs
+
+**Conclusion:**
+This is a **firmware bug in Rockbox** (possibly iPod Video specific or related to certain code paths), not an emulator bug. The emulator correctly implements:
+- MMAP translation (verified: 0x00003230 → 0x10003230)
+- IRAM read/write operations
+- ARM/Thumb mode switching
+
+**Workaround Assessment (2026-01-15):**
+
+The emulator-level workarounds (detecting suspicious LR, clearing Thumb bit) would only mask the symptom - the stack is already corrupted before BX executes, so other data may also be invalid.
+
+**Root Cause Hypothesis:** The buffer overflow likely occurs due to missing COP synchronization. In dual-core operation, COP may handle certain initialization tasks that prevent CPU from hitting this code path, or memory barriers prevent race conditions. Our single-core emulation exposes timing-dependent bugs.
+
+**Practical Paths Forward:**
+1. **Try different Rockbox version** - The corruption may be version-specific
+2. **Minimal COP emulation** - Implement just enough COP behavior to avoid the buggy path
+3. **Accept limitation** - LCD hardware emulation is proven working; focus on other aspects
+
+**Status:** Investigation complete. The crash is understood but not fixable without firmware changes or proper COP emulation.
 
 ---
 

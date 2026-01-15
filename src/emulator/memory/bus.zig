@@ -757,6 +757,18 @@ pub const MemoryBus = struct {
         self.last_access_addr = translated_addr;
         self.last_access_region = region;
 
+        // DEBUG: Trace reads from crash region to understand MMAP translation
+        if (addr >= 0x00003200 and addr <= 0x00003240) {
+            std.debug.print("MMAP_DEBUG: addr=0x{X:0>8} -> fw=0x{X:0>8} -> final=0x{X:0>8} region={s} mmap_enabled={}\n", .{
+                addr, fw_translated, translated_addr, @tagName(region), self.mmap_enabled,
+            });
+            // Also dump MMAP config
+            for (self.mmap_logical, self.mmap_physical, 0..) |logical, physical, i| {
+                if ((physical & 0x0F00) != 0) {
+                    std.debug.print("  MMAP[{}]: logical=0x{X:0>8} physical=0x{X:0>8}\n", .{ i, logical, physical });
+                }
+            }
+        }
         // Flag ATA DATA register reads for tracking (value captured after read)
         const is_ata_data_read = region == .ata and (translated_addr - ATA_START) == 0x1E0;
 
@@ -1992,10 +2004,11 @@ pub const MemoryBus = struct {
     fn readIram(self: *const Self, addr: u32) u32 {
         const offset = addr - IRAM_START;
         if (offset + 3 < IRAM_SIZE) {
-            return @as(u32, self.iram[offset]) |
+            const value = @as(u32, self.iram[offset]) |
                 (@as(u32, self.iram[offset + 1]) << 8) |
                 (@as(u32, self.iram[offset + 2]) << 16) |
                 (@as(u32, self.iram[offset + 3]) << 24);
+            return value;
         }
         return 0;
     }
