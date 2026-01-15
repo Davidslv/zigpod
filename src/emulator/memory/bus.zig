@@ -264,6 +264,13 @@ pub const MemoryBus = struct {
     /// When firmware enables Timer1, kernel init is progressing
     timer1_enabled_by_firmware: bool,
 
+    /// RTR QUEUE TRACING: Track memory reads during switch_thread
+    /// to identify RTR queue head pointer location
+    rtr_trace_enabled: bool,
+    rtr_trace_count: u32,
+    rtr_trace_addrs: [64]u32,
+    rtr_trace_vals: [64]u32,
+
     const Self = @This();
 
     /// Boot ROM range
@@ -649,6 +656,10 @@ pub const MemoryBus = struct {
             .irq_vector_value = 0,
             .irq_vector_addr = 0,
             .timer1_enabled_by_firmware = false,
+            .rtr_trace_enabled = false,
+            .rtr_trace_count = 0,
+            .rtr_trace_addrs = [_]u32{0} ** 64,
+            .rtr_trace_vals = [_]u32{0} ** 64,
         };
     }
 
@@ -940,6 +951,27 @@ pub const MemoryBus = struct {
                 const first_byte = value & 0xFF;
                 const char: u8 = if (first_byte >= 0x20 and first_byte < 0x7F) @truncate(first_byte) else '.';
                 print("DIR_ENTRY[0x{X:0>8}]: first_byte=0x{X:0>2}('{c}'), val=0x{X:0>8}, lfn_writes={d}\n", .{ entry_addr, first_byte, char, value, self.debug_lfn_write_count });
+            }
+        }
+
+        // RTR QUEUE TRACING: Log ALL SDRAM reads during switch_thread
+        // Widen to capture all SDRAM data reads to find where RTR queue is stored
+        if (self.rtr_trace_enabled and region == .sdram) {
+            // Skip code region (0x10000000-0x10100000) but trace all data regions
+            if (translated_addr >= 0x10100000) {
+                // Check if this address is already in our trace array
+                var found = false;
+                for (self.rtr_trace_addrs[0..self.rtr_trace_count]) |traced_addr| {
+                    if (traced_addr == translated_addr) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found and self.rtr_trace_count < 64) {
+                    self.rtr_trace_addrs[self.rtr_trace_count] = translated_addr;
+                    self.rtr_trace_vals[self.rtr_trace_count] = value;
+                    self.rtr_trace_count += 1;
+                }
             }
         }
 
@@ -1474,6 +1506,41 @@ pub const MemoryBus = struct {
         std.debug.print("SDRAM DATA READ TRACING: Enabled\n", .{});
     }
 
+    /// Enable RTR queue tracing to find RTR queue head pointer
+    /// Logs all SDRAM reads in scheduler data region (0x10800000-0x10900000)
+    pub fn enableRtrTracing(self: *Self) void {
+        self.rtr_trace_enabled = true;
+        self.rtr_trace_count = 0;
+    }
+
+    /// Disable RTR queue tracing
+    pub fn disableRtrTracing(self: *Self) void {
+        self.rtr_trace_enabled = false;
+    }
+
+    /// Report RTR trace results
+    pub fn reportRtrTrace(self: *const Self) void {
+        if (self.rtr_trace_count == 0) {
+            std.debug.print("RTR TRACE: No reads from scheduler region captured\n", .{});
+            return;
+        }
+
+        std.debug.print("\n=== RTR TRACE REPORT ({} unique addresses) ===\n", .{self.rtr_trace_count});
+        for (self.rtr_trace_addrs[0..self.rtr_trace_count], self.rtr_trace_vals[0..self.rtr_trace_count]) |addr, val| {
+            // Flag likely RTR queue head candidates (values that are 0 or look like pointers)
+            const is_null = (val == 0);
+            const is_pointer = (val >= 0x10800000 and val < 0x10900000);
+            var marker: []const u8 = "";
+            if (is_null) {
+                marker = " <-- NULL (RTR empty?)";
+            } else if (is_pointer) {
+                marker = " <-- POINTER (RTR head?)";
+            }
+            std.debug.print("  0x{X:0>8} = 0x{X:0>8}{s}\n", .{ addr, val, marker });
+        }
+        std.debug.print("===========================================\n\n", .{});
+    }
+
     /// TCB Kickstart: Directly modify task state in RAM
     /// Based on SDRAM tracing, task control blocks are at:
     /// - 0x108701CC = task state (1=sleeping, 3=ready hypothesis)
@@ -1489,6 +1556,43 @@ pub const MemoryBus = struct {
             self.sdram[offset + 1] = @truncate(new_state >> 8);
             self.sdram[offset + 2] = @truncate(new_state >> 16);
             self.sdram[offset + 3] = @truncate(new_state >> 24);
+        }
+    }
+
+    /// RTR Queue Kickstart: Write thread pointer to suspected RTR queue head locations
+    /// Based on RTR trace analysis, potential RTR queue head addresses:
+    /// - 0x1012ACD8 (NULL in trace)
+    /// - 0x1012A424 (NULL in trace)
+    /// - 0x101363A8, 0x101363B0, 0x101363B4 (NULL cluster near CPU ID 0x00AA0055)
+    /// We try writing the main thread TCB address (0x10870100) to these to add a thread to RTR
+    pub fn rtrQueueKickstart(self: *Self) void {
+        // Main thread TCB is around 0x108701CC (state addr), base should be ~0x10870100
+        const thread_tcb: u32 = 0x10870100;
+
+        // Suspected RTR queue head addresses from trace
+        const rtr_candidates = [_]u32{
+            0x101363A8, // First in the cluster
+            0x101363B0, // Second in cluster (most likely)
+            0x1012ACD8, // Another NULL candidate
+        };
+
+        for (rtr_candidates) |rtr_addr| {
+            const offset = rtr_addr - SDRAM_START;
+            if (offset + 3 < self.sdram.len) {
+                const current = @as(u32, self.sdram[offset]) |
+                    (@as(u32, self.sdram[offset + 1]) << 8) |
+                    (@as(u32, self.sdram[offset + 2]) << 16) |
+                    (@as(u32, self.sdram[offset + 3]) << 24);
+
+                // Only write if currently NULL (empty queue)
+                if (current == 0) {
+                    self.sdram[offset] = @truncate(thread_tcb);
+                    self.sdram[offset + 1] = @truncate(thread_tcb >> 8);
+                    self.sdram[offset + 2] = @truncate(thread_tcb >> 16);
+                    self.sdram[offset + 3] = @truncate(thread_tcb >> 24);
+                    std.debug.print("RTR_KICKSTART: [0x{X:0>8}] = 0x{X:0>8} (was NULL)\n", .{ rtr_addr, thread_tcb });
+                }
+            }
         }
     }
 

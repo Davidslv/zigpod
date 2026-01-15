@@ -200,6 +200,21 @@ pub const Emulator = struct {
     /// Flag: .init copy loop has started
     init_copy_started: bool,
 
+    /// RTR queue tracing: active when in switch_thread
+    rtr_trace_active: bool,
+
+    /// RTR queue tracing: unique addresses read
+    rtr_trace_addrs: [32]u32,
+
+    /// RTR queue tracing: values at those addresses
+    rtr_trace_vals: [32]u32,
+
+    /// RTR queue tracing: count of unique addresses
+    rtr_trace_count: u32,
+
+    /// Flag: RTR trace has been reported
+    rtr_trace_reported: bool,
+
     /// Cycles per frame (at 60fps)
     cycles_per_frame: u64,
 
@@ -286,6 +301,11 @@ pub const Emulator = struct {
             .main_entered = false,
             .main_trace_count = 0,
             .init_copy_started = false,
+            .rtr_trace_active = false,
+            .rtr_trace_addrs = [_]u32{0} ** 32,
+            .rtr_trace_vals = [_]u32{0} ** 32,
+            .rtr_trace_count = 0,
+            .rtr_trace_reported = false,
             .cycles_per_frame = cycles_per_frame,
             .next_frame_cycles = cycles_per_frame,
         };
@@ -992,28 +1012,55 @@ pub const Emulator = struct {
             // Skip immediately by returning success code
             if (effective_pc == 0x10084B5C or pc == 0x84B5C or pc == 0x00084B5C) {
                 self.switch_thread_count += 1;
-                if (self.switch_thread_count == 1 or self.switch_thread_count % 50000 == 0) {
-                    std.debug.print("SWITCH_THREAD: iter={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
+
+                // Enable RTR tracing on first entry to capture scheduler reads
+                if (self.switch_thread_count == 1) {
+                    self.bus.enableRtrTracing();
+                    std.debug.print("SWITCH_THREAD_ENTER: iter={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8} - RTR tracing enabled\n", .{
+                        self.switch_thread_count, pc, self.cpu.getReg(0), self.cpu.getReg(14),
+                    });
+                    // Log register state
+                    std.debug.print("  Regs: R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8} R4=0x{X:0>8}\n", .{
+                        self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3), self.cpu.getReg(4),
+                    });
+                } else if (self.switch_thread_count <= 10 or self.switch_thread_count % 1000 == 0) {
+                    std.debug.print("SWITCH_THREAD_LOOP: iter={} PC=0x{X:0>8} R0=0x{X:0>8} LR=0x{X:0>8}\n", .{
                         self.switch_thread_count, pc, self.cpu.getReg(0), self.cpu.getReg(14),
                     });
                 }
-                // Skip after just 1000 iterations to let scheduler logic run but avoid blocking
+
+                // Report RTR trace early (after 100 iterations) to see what scheduler reads
+                if (self.switch_thread_count == 100 and !self.rtr_trace_reported) {
+                    std.debug.print("SWITCH_THREAD: 100 iterations, reporting RTR trace...\n", .{});
+                    self.bus.reportRtrTrace();
+                    self.rtr_trace_reported = true;
+                }
+
+                // Skip after 1000 iterations - directly return to caller
+                // (RTR kickstart removed - caused crashes due to incomplete linked list setup)
                 if (self.switch_thread_count > 1000) {
                     const lr = self.cpu.getReg(14);
                     self.sched_skip_count += 1;
-                    self.total_sched_skips += 1; // Cumulative counter for LCD bypass
+                    self.total_sched_skips += 1;
+
                     if (self.sched_skip_count <= 5 or self.sched_skip_count % 100 == 0) {
                         std.debug.print("SWITCH_THREAD_SKIP[{}]: returning to LR=0x{X:0>8} (total={})\n", .{
                             self.sched_skip_count, lr, self.total_sched_skips,
                         });
                     }
-                    // Return success - allow caller to continue
-                    self.cpu.setReg(0, 0);
+
+                    self.bus.disableRtrTracing();
+
+                    // Don't return 0 (no thread) - just return to caller and let it handle
+                    // Setting R0=1 to indicate "thread found" may help avoid infinite loop
+                    self.cpu.setReg(0, 1);
                     self.cpu.setReg(15, lr);
                     self.switch_thread_count = 0;
                     return 1;
                 }
             }
+
+            // Note: 0x89A40 tracing removed - was firing too early before scheduler reads
 
             // CALLER LOOP SKIP at 0x7C558 (caller of scheduler)
             // After multiple scheduler skips, the caller keeps calling it again.

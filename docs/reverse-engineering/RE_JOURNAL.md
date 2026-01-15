@@ -16,6 +16,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2026-01-14 | See below | In Progress | main() address investigation - binary layout issue |
 | 2026-01-15 | See below | **CRITICAL FIX** | Timer1 IRQ acknowledgment on READ - 1,782x perf improvement |
 | 2026-01-15 | See below | **CRITICAL FIX** | LDMIA exception return PC bug - kernel panic resolved |
+| 2026-01-15 | See below | In Progress | RTR Queue analysis - identified 0x1012ACD8 as likely queue head |
 
 ---
 
@@ -2375,6 +2376,64 @@ Updated `arm_executor.zig` to call `returnFromExceptionLdm()` for LDMIA with ^ a
 - Output reduced from ~2.3MB/30s to ~1.8MB/5s (still verbose but manageable)
 - Essential traces retained: PANICF detection, exception vectors, boot milestones
 - Kernel running correctly at PC=0x7C36C (idle loop) with Timer1 firing
+
+---
+
+### 2026-01-15: RTR Queue Analysis for Thread Scheduling
+
+**Goal**: Investigate why threads aren't being scheduled despite working IRQ handling
+
+**Context**: The kernel runs in an idle loop with Timer1 firing 200+ times, but no LCD output. The scheduler's RTR (Run-To-Run) queue appears empty.
+
+**Phase 1: RTR Queue Tracing**
+
+Added tracing to capture SDRAM reads during switch_thread execution at PC=0x84B5C.
+
+**Key Findings from RTR Trace**:
+```
+=== RTR TRACE REPORT (30 unique addresses) ===
+  0x1012ACD8 = 0x00000000 <-- NULL (RTR empty?)
+  0x1012A424 = 0x00000000 <-- NULL (RTR empty?)
+  0x101363B4 = 0x00000000 <-- NULL (RTR empty?)
+  0x101363BC = 0x00AA0055  (CPU/COP identifier)
+  0x101363B0 = 0x00000000 <-- NULL (RTR empty?)
+  0x101363A8 = 0x00000000 <-- NULL (RTR empty?)
+```
+
+**Critical discovery**: At switch_thread entry, R4=0x0012ACD8 (maps to 0x1012ACD8). This address contains NULL, strongly suggesting it IS the RTR queue head pointer.
+
+**Phase 2: RTR Queue Kickstart Attempt**
+
+Attempted to inject a thread by writing TCB pointer (0x10870100) to suspected RTR queue head addresses.
+
+**Result**: Caused system crash. The scheduler expects properly linked list nodes, not just a pointer. Writing an invalid thread pointer caused immediate data/prefetch aborts as the scheduler tried to access the malformed "thread" structure.
+
+**Phase 3: Current State**
+
+- switch_thread at 0x84B5C is being called correctly
+- The scheduler loops ~100 iterations, checking RTR queue
+- RTR queue is empty (all head pointers are NULL)
+- Timer1 continues firing (800+ interrupts observed)
+- System is stable but idle - no threads to run
+
+**Root Cause Analysis**:
+
+The Rockbox scheduler relies on dual-core cooperation:
+1. CPU runs threads from its RTR queue
+2. COP (coprocessor) would add threads to CPU's RTR via `core_wake()`
+3. Without COP, no threads are added to CPU's RTR queue
+
+Since our emulator doesn't implement COP properly, the normal thread wake mechanism never fires.
+
+**Potential Solutions** (not implemented due to time constraints):
+1. Directly manipulate the RTR linked list structure with proper next/prev pointers
+2. Modify the scheduler exit path to load thread context directly
+3. Implement minimal COP simulation to call `core_wake(CPU)`
+
+**Files Changed**:
+- `core.zig`: Added switch_thread tracing and RTR trace reporting
+- `bus.zig`: Added `rtrQueueKickstart()` function and RTR trace capture
+- Index updates at top of RE_JOURNAL.md
 
 ---
 
