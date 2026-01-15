@@ -15,6 +15,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2026-01-14 | [COP_WAKE_INVESTIGATION.md](COP_WAKE_INVESTIGATION.md) | **BLOCKING** | Detailed COP wake analysis with prioritized solutions |
 | 2026-01-14 | See below | In Progress | main() address investigation - binary layout issue |
 | 2026-01-15 | See below | **CRITICAL FIX** | Timer1 IRQ acknowledgment on READ - 1,782x perf improvement |
+| 2026-01-15 | See below | **CRITICAL FIX** | LDMIA exception return PC bug - kernel panic resolved |
 
 ---
 
@@ -2212,6 +2213,168 @@ The scheduler idle loop at 0x7C7E0 has no runnable threads. This is likely becau
 - `src/emulator/memory/bus.zig`: Simplified MBX_MSG_STAT to always return 0
 
 **Commit**: fix: Timer1 interrupt acknowledgment on READ, not WRITE
+
+---
+
+### 2026-01-15: Timer1 Auto-Protection and Kernel Panic Discovery
+
+**Goal**: Keep Timer1 enabled across firmware reloads and identify remaining blockers
+
+**Problem After Timer1 Fix**:
+With Timer1 acknowledgment fixed, the CPU no longer got stuck in IRQ mode. But with 100M cycles:
+- Final PC: 0x7C7E0 (scheduler idle loop)
+- 0 LCD writes
+- Timer1 only fired ~5 times before being disabled
+
+**Root Cause #1: Blanket Interrupt Disable**:
+Traced interrupt enable/disable sequence:
+```
+CPU_INT_EN: enabling 0x00000001 (Timer1 enabled)
+TIMER1_FIRE: #1 cpu_enable=0x00000001
+TIMER1_FIRE: #2 cpu_enable=0x00000001
+CPU_INT_DIS: disabling 0xFFFFFFFF (ALL interrupts disabled!)
+TIMER1_FIRE: #3 cpu_enable=0x00000000 (Timer1 disabled)
+```
+
+The main firmware's crt0 disables ALL interrupts but never re-enables Timer1.
+
+**Solution: Auto-Protect Timer1** (in `interrupt_ctrl.zig`):
+When firmware enables Timer1 via CPU_INT_EN, automatically add it to protected_mask.
+
+**Results After Auto-Protection**:
+| Metric | Before | After |
+|--------|--------|-------|
+| Timer1 cpu_enable | 0x00000000 | 0x00000001 (stays enabled!) |
+| Final PC | 0x7C7E0 (idle loop) | 0x40008928 (panic loop) |
+| CPU mode | supervisor | system |
+
+**Root Cause #2: Kernel Panic**:
+```
+!!! KERNEL PANIC DETECTED at cycle 15112695 !!!
+  Infinite loop installed at 0x40008928 (B .)
+  LR=0x0007B494 (panic source)
+  R2=0x60006000 R3=0x00000044
+```
+
+- Panic source: PC=0x7B494 in Rockbox kernel
+- Was accessing DEV_INIT2 (0x60006000 + 0x44) when panic occurred
+- Kernel installs infinite loop (`B . = 0xEAFFFFFE`) at 0x40008928
+
+**Analysis**:
+The kernel panics during system initialization while accessing DEV_INIT2 register. Possible causes:
+1. DEV_INIT2 returns unexpected value
+2. Device initialization timeout
+3. Missing hardware feature that kernel expects
+
+**Next Steps**:
+1. Trace what happens at PC=0x7B494 to understand panic trigger
+2. Check if DEV_INIT2 handling needs fixing
+3. Consider if there's a hardware detection issue
+
+**Files Changed**:
+- `interrupt_ctrl.zig`: Auto-protect Timer1 when first enabled
+- `timers.zig`: Improved Timer1 fire logging
+- `core.zig`: Added panic detection at 0x40008928
+
+**Commit**: feat: Auto-protect Timer1 interrupt from firmware disable
+
+---
+
+### 2026-01-15: LDMIA Exception Return Bug Fix - Kernel Panic Resolved
+
+**Goal**: Fix kernel panic caused by corrupted return addresses after IRQ handling
+
+**Problem Identified**:
+After Timer1 fixes, the kernel was calling panicf() at cycle ~15M. Detailed IRQ tracing revealed:
+- IRQ handler executed correctly
+- LDMIA {R0-R3, R12, PC}^ at 0x7C558 loaded correct return address from stack
+- But execution jumped back to 0x7C558 instead of the loaded address!
+- Second LDMIA used wrong stack (system SP instead of IRQ SP), loading garbage 0xB701C
+
+**Root Cause Analysis**:
+The bug was in `exceptions.zig:returnFromException()`:
+```zig
+// BEFORE (buggy):
+pub fn returnFromException(regs: *RegisterFile) void {
+    const return_addr = regs.r[14];  // Get LR
+    // ... restore CPSR from SPSR, switch mode ...
+    regs.set(15, return_addr);  // <-- WRONG! Overwrites PC that LDM already loaded!
+}
+```
+
+For LDMIA with ^ (S bit) and PC in register list:
+1. LDM loads PC from memory (correct return address)
+2. `returnFromException()` is called to restore CPSR
+3. But it ALSO sets PC from LR, overwriting the correct value!
+
+**Solution**:
+Created separate function for LDMIA exception return that preserves already-loaded PC:
+```zig
+/// Return from exception for LDM with PC and S bit
+/// PC was already loaded by LDM, so we only restore CPSR from SPSR
+pub fn returnFromExceptionLdm(regs: *RegisterFile) void {
+    returnFromExceptionWithPc(regs, true);  // true = preserve loaded PC
+}
+
+fn returnFromExceptionWithPc(regs: *RegisterFile, pc_already_loaded: bool) void {
+    if (regs.getSpsr()) |spsr| {
+        const loaded_pc = regs.r[15];  // Save PC before mode switch
+        const return_addr = regs.r[14];
+        // ... restore CPSR, switch mode ...
+        if (pc_already_loaded) {
+            regs.set(15, loaded_pc);  // Use PC from LDM
+        } else {
+            regs.set(15, return_addr);  // Use LR (for MOVS/SUBS PC, LR)
+        }
+    }
+}
+```
+
+Updated `arm_executor.zig` to call `returnFromExceptionLdm()` for LDMIA with ^ and PC.
+
+**Results**:
+| Metric | Before | After |
+|--------|--------|-------|
+| Kernel panic | Yes (panicf at 15M cycles) | No |
+| IRQ return | Corrupted (loops back to LDMIA) | Correct (returns to caller) |
+| Timer1 interrupts | ~5 before crash | 200+ and counting |
+| Final PC | 0x40008928 (panic loop) | 0x7C36C (idle loop) |
+
+**Files Changed**:
+- `exceptions.zig`: Added `returnFromExceptionLdm()` for LDMIA exception return
+- `arm_executor.zig`: Call new function for LDMIA with ^ and PC
+
+---
+
+### 2026-01-15: Debug Trace Cleanup
+
+**Goal**: Reduce verbose output that was flooding logs
+
+**Changes Made**:
+
+1. **arm7tdmi.zig**: Removed IRQ entry tracing and debug counter fields
+   - Removed `irq_trace_count`, `post_irq_trace_count`, `just_exited_irq` fields
+   - Removed verbose IRQ ENTRY trace
+
+2. **bus.zig**: Removed repetitive tracing
+   - Removed DRAM_START_READ32 trace (fires every boot cycle)
+   - Removed TCB KICKSTART trace (fires thousands of times)
+   - Removed BUS_COP_CTL_READ trace
+   - Removed `cop_ctl_bus_read_count` field
+
+3. **system_ctrl.zig**: Removed COP sync tracing
+   - Removed CPU_CTL WRITE auto-wake trace
+   - Removed COP_CTL READ trace
+   - Removed `cop_ctl_read_count` field
+
+4. **core.zig**: Removed periodic status traces
+   - Removed DEBUG @ trace (every 5M cycles)
+   - Removed PERIODIC trace (every 10M cycles)
+
+**Results**:
+- Output reduced from ~2.3MB/30s to ~1.8MB/5s (still verbose but manageable)
+- Essential traces retained: PANICF detection, exception vectors, boot milestones
+- Kernel running correctly at PC=0x7C36C (idle loop) with Timer1 firing
 
 ---
 

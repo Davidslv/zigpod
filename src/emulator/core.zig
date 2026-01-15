@@ -170,6 +170,9 @@ pub const Emulator = struct {
     /// Counter for IRAM loop iterations (0x40008928)
     iram_loop_count: u32,
 
+    /// Counter for IRAM entropy loop iterations (0x400071D0-0x40007200)
+    iram_entropy_loop_count: u32,
+
     /// Counter for switch_thread skip iterations
     switch_thread_count: u32,
 
@@ -178,6 +181,9 @@ pub const Emulator = struct {
 
     /// Flag: LCD bypass test has been done
     lcd_bypass_done: bool,
+
+    /// Flag: Kernel panic has been detected
+    panic_detected: bool,
 
     /// Counter for consecutive caller loop escape failures (zero-stack situations)
     caller_loop_escape_failures: u32,
@@ -270,9 +276,11 @@ pub const Emulator = struct {
             .sched_skip_count = 0,
             .idle_loop_count = 0,
             .iram_loop_count = 0,
+            .iram_entropy_loop_count = 0,
             .switch_thread_count = 0,
             .total_sched_skips = 0,
             .lcd_bypass_done = false,
+            .panic_detected = false,
             .caller_loop_escape_failures = 0,
             .timer1_enabled_by_emulator = false,
             .main_entered = false,
@@ -407,6 +415,27 @@ pub const Emulator = struct {
 
         // Boot phase tracing
         const pc = self.cpu.getPc();
+
+        // EXCEPTION VECTOR TRACING: Detect when CPU hits exception vectors
+        // ARM7TDMI exception vectors (low vectors at 0x00000000):
+        //   0x00: Reset, 0x04: Undefined, 0x08: SWI, 0x0C: Prefetch Abort
+        //   0x10: Data Abort, 0x14: Reserved, 0x18: IRQ, 0x1C: FIQ
+        if (pc == 0x00000004) {
+            std.debug.print("\n!!! UNDEFINED INSTRUCTION EXCEPTION at cycle {} !!!\n", .{self.total_cycles});
+            std.debug.print("  LR=0x{X:0>8} (return address = fault location + 4)\n", .{self.cpu.getReg(14)});
+            std.debug.print("  R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
+                self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3),
+            });
+        }
+        if (pc == 0x0000000C) {
+            std.debug.print("\n!!! PREFETCH ABORT EXCEPTION at cycle {} !!!\n", .{self.total_cycles});
+            std.debug.print("  LR=0x{X:0>8} (return address = fault location + 4)\n", .{self.cpu.getReg(14)});
+        }
+        if (pc == 0x00000010) {
+            std.debug.print("\n!!! DATA ABORT EXCEPTION at cycle {} !!!\n", .{self.total_cycles});
+            std.debug.print("  LR=0x{X:0>8} (return address = fault location + 8)\n", .{self.cpu.getReg(14)});
+        }
+
         if (self.total_cycles < 1_000_000 and self.total_cycles % 100_000 == 0) {
             std.debug.print("BOOT TRACE: cycle {} PC=0x{X:0>8} R0=0x{X:0>8}\n", .{
                 self.total_cycles, pc, self.cpu.getReg(0),
@@ -478,12 +507,7 @@ pub const Emulator = struct {
                 std.debug.print("FILENAME PATCHED: Changed apple_os.ipod to rockbox.ipod at 0x{X:0>8}\n", .{addr});
             }
         }
-        // Periodic trace to understand where we're spending time
-        if (self.total_cycles % 10_000_000 == 0 and self.total_cycles > 90_000_000) {
-            std.debug.print("PERIODIC: cycle={} PC=0x{X:0>8} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} LR=0x{X:0>8}\n", .{
-                self.total_cycles, pc, self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(14),
-            });
-        }
+        // Note: PERIODIC trace removed - kernel runs idle loop correctly at 0x7C36C
         // Key address tracing
         if (pc == 0x4000002C) {
             std.debug.print("BOOT: Reached post-copy code at 0x2C (cycle {})\n", .{self.total_cycles});
@@ -873,12 +897,51 @@ pub const Emulator = struct {
             }
         }
 
+        // PANICF DETECTION: Catch when Rockbox calls panicf() at 0x7B480
+        // This is the entry point of the panic handler in the firmware
+        if (pc == 0x7B480 or effective_pc == 0x1007B480) {
+            if (!self.panic_detected) {
+                self.panic_detected = true;
+                std.debug.print("\n!!! PANICF CALLED at cycle {} !!!\n", .{self.total_cycles});
+                std.debug.print("  PC=0x{X:0>8} (panicf entry)\n", .{pc});
+                std.debug.print("  LR=0x{X:0>8} (caller = WHO triggered panic)\n", .{self.cpu.getReg(14)});
+                std.debug.print("  R0=0x{X:0>8} (panic message ptr?)\n", .{self.cpu.getReg(0)});
+                std.debug.print("  R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
+                    self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3),
+                });
+                // Read potential panic message string
+                const msg_ptr = self.cpu.getReg(0);
+                if (msg_ptr > 0x10000 and msg_ptr < 0x20000000) {
+                    var msg_buf: [64]u8 = undefined;
+                    var i: usize = 0;
+                    while (i < 63) : (i += 1) {
+                        const b = self.bus.read8(@truncate(msg_ptr + i));
+                        if (b == 0 or b < 32 or b > 126) break;
+                        msg_buf[i] = b;
+                    }
+                    msg_buf[i] = 0;
+                    std.debug.print("  Panic message: \"{s}\"\n", .{msg_buf[0..i]});
+                }
+            }
+        }
+
         // IRAM LOOP DETECTION: Track if execution is stuck at 0x40008928
         // This address is in IRAM (bootloader area) and appears to be a wait loop
         if (pc == 0x40008928) {
             self.iram_loop_count += 1;
+            const instr = self.bus.read32(pc);
+            // Detect when instruction changes to panic infinite loop (B . = 0xEAFFFFFE)
+            // This happens when kernel installs its panic handler
+            if (instr == 0xEAFFFFFE and !self.panic_detected) {
+                self.panic_detected = true;
+                std.debug.print("\n!!! KERNEL PANIC DETECTED at cycle {} !!!\n", .{self.total_cycles});
+                std.debug.print("  Infinite loop installed at 0x40008928 (B .)\n", .{});
+                std.debug.print("  LR=0x{X:0>8} (panic source)\n", .{self.cpu.getReg(14)});
+                std.debug.print("  R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
+                    self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3),
+                });
+            }
             if (self.iram_loop_count == 1 or self.iram_loop_count % 100000 == 0) {
-                const instr = self.bus.read32(pc);
                 const cpsr = self.cpu.regs.cpsr;
                 std.debug.print("IRAM_LOOP[{}]: PC=0x{X:0>8} instr=0x{X:0>8} mode=0x{X:0>2} IRQ_dis={} FIQ_dis={}\n", .{
                     self.iram_loop_count,
@@ -892,6 +955,17 @@ pub const Emulator = struct {
                     self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3), self.cpu.getReg(14),
                 });
             }
+        }
+
+        // PANIC SOURCE TRACE: PC=0x7B494 is where the panic is triggered from
+        // This is in the Rockbox kernel and calls system_reboot() or similar
+        if (pc == 0x7B494 or pc == 0x0007B494 or effective_pc == 0x1007B494) {
+            std.debug.print("\n!!! PANIC SOURCE at 0x7B494 !!!\n", .{});
+            std.debug.print("  LR=0x{X:0>8} R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8}\n", .{
+                self.cpu.getReg(14), self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3),
+            });
+            const instr = self.bus.read32(pc);
+            std.debug.print("  instr=0x{X:0>8} cycle={}\n", .{instr, self.total_cycles});
         }
 
         // KERNEL INIT DETECTION: Check if kernel init has completed
@@ -1099,29 +1173,30 @@ pub const Emulator = struct {
                 }
             }
 
-            // IRAM LOOP SKIP at 0x400071DC-0x400071EC
+            // IRAM ENTROPY LOOP SKIP at 0x400071D0-0x40007200
             // This is an RNG/entropy loop that spins forever without hardware entropy
             // Skip it after 100000 iterations to allow kernel init to continue
+            // Uses separate counter to avoid reset when returning to caller
             if (pc >= 0x400071D0 and pc <= 0x40007200) {
-                self.wake_loop_iterations += 1;
-                if (self.wake_loop_iterations == 1 or self.wake_loop_iterations == 100) {
-                    std.debug.print("IRAM_LOOP: iter={} PC=0x{X:0>8} LR=0x{X:0>8}\n", .{
-                        self.wake_loop_iterations,
+                self.iram_entropy_loop_count += 1;
+                if (self.iram_entropy_loop_count == 1 or self.iram_entropy_loop_count == 100 or self.iram_entropy_loop_count == 10000) {
+                    std.debug.print("IRAM_ENTROPY: iter={} PC=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                        self.iram_entropy_loop_count,
                         pc,
                         self.cpu.getReg(14),
                     });
                 }
                 // Skip after 100000 iterations
-                if (self.wake_loop_iterations > 100000) {
+                if (self.iram_entropy_loop_count > 100000) {
                     const lr = self.cpu.getReg(14);
-                    std.debug.print("IRAM_LOOP_SKIP: Skipping after {} iterations, returning to 0x{X:0>8}\n", .{
-                        self.wake_loop_iterations,
+                    std.debug.print("IRAM_ENTROPY_SKIP: Skipping after {} iterations, returning to 0x{X:0>8}\n", .{
+                        self.iram_entropy_loop_count,
                         lr,
                     });
                     // Set R0 to a "success" value and return to caller
                     self.cpu.setReg(0, 0);
                     self.cpu.setReg(15, lr);
-                    self.wake_loop_iterations = 0;
+                    self.iram_entropy_loop_count = 0;
                     return 1;
                 }
             }
@@ -1201,10 +1276,10 @@ pub const Emulator = struct {
                     });
                 }
             } else {
-                // Include IRAM loop area in the "don't reset" check
+                // Check if we're in wake_core or idle_thread areas - don't reset counter there
+                // Note: IRAM entropy loop (0x400071D0) now has its own separate counter
                 const in_wake_area = (pc >= 0x769C and pc <= 0x76DC) or
-                    (effective_pc >= 0x1000769C and effective_pc <= 0x100076DC) or
-                    (pc >= 0x400071D0 and pc <= 0x40007200);
+                    (effective_pc >= 0x1000769C and effective_pc <= 0x100076DC);
                 if (!in_wake_area and self.wake_loop_iterations > 0) {
                     self.wake_loop_iterations = 0;
                 }
@@ -1563,19 +1638,7 @@ pub const Emulator = struct {
         //     self.int_ctrl.forceEnableCpuInterrupt(.timer1);
         // }
 
-        // Debug: Log PC, timer, and IRQ state periodically
-        if (self.total_cycles >= 80_000_000 and self.total_cycles % 5_000_000 == 0 and self.total_cycles < 150_000_000) {
-            std.debug.print("DEBUG @ {}: PC=0x{X:0>8}, Mode={s}, IRQ_disabled={}, Timer1_enabled={}, IRQ_pending={}, R0=0x{X:0>8}, R2=0x{X:0>8}\n", .{
-                self.total_cycles,
-                self.cpu.regs.r[15],
-                @tagName(self.cpu.regs.cpsr.getMode() orelse .user),
-                self.cpu.regs.cpsr.irq_disable,
-                self.timer.timer1.isEnabled(),
-                self.int_ctrl.hasPendingIrq(),
-                self.cpu.regs.r[0],
-                self.cpu.regs.r[2],
-            });
-        }
+        // Note: Periodic DEBUG trace removed - kernel idle loop working correctly at 0x7C36C
 
         // NOTE: Earlier attempts at IRQ kickstart crashed because:
         // 1. Firmware enters scheduler wait loop at ~3000 cycles

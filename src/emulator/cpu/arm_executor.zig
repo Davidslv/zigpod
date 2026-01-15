@@ -598,9 +598,10 @@ fn executeBlockTransfer(regs: *RegisterFile, bus: *const MemoryBus, instruction:
         regs.set(bt.rn, new_base);
     }
 
-    // Load PSR if S bit set and PC in list
+    // Load PSR if S bit set and PC in list (LDM with ^ and PC)
+    // Use returnFromExceptionLdm since PC was already loaded from memory
     if (bt.is_load and bt.load_psr and (bt.register_list & 0x8000) != 0) {
-        exceptions.returnFromException(regs);
+        exceptions.returnFromExceptionLdm(regs);
     }
 
     // Cycles: n + 2 for load, n + 1 for store

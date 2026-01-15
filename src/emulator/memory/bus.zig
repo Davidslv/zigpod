@@ -231,7 +231,6 @@ pub const MemoryBus = struct {
     debug_int_ctrl_accesses: u32,
     debug_mailbox_accesses: u32,
     debug_dev_init_accesses: u32,
-    cop_ctl_bus_read_count: u32,
 
     /// Debug: track which device_init offsets are being accessed
     debug_dev_init_offset_counts: [32]u32, // Histogram of accesses to offsets 0x00-0x7C (32 dwords)
@@ -529,7 +528,6 @@ pub const MemoryBus = struct {
             .debug_int_ctrl_accesses = 0,
             .debug_mailbox_accesses = 0,
             .debug_dev_init_accesses = 0,
-            .cop_ctl_bus_read_count = 0,
             .debug_dev_init_offset_counts = [_]u32{0} ** 32,
             .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
             .debug_fw_write_sum = 0,
@@ -636,7 +634,6 @@ pub const MemoryBus = struct {
             .debug_int_ctrl_accesses = 0,
             .debug_mailbox_accesses = 0,
             .debug_dev_init_accesses = 0,
-            .cop_ctl_bus_read_count = 0,
             .debug_dev_init_offset_counts = [_]u32{0} ** 32,
             .debug_int_ctrl_offset_counts = [_]u32{0} ** 64,
             .debug_fw_write_sum = 0,
@@ -765,13 +762,7 @@ pub const MemoryBus = struct {
             self.debug_part0_reads += 1;
         }
 
-        // Debug: trace COP_CTL reads at address level
-        if (addr == 0x60007004) {
-            self.cop_ctl_bus_read_count += 1;
-            if (self.cop_ctl_bus_read_count <= 50) {
-                std.debug.print("BUS_COP_CTL_READ #{}: addr=0x{X:0>8}\n", .{ self.cop_ctl_bus_read_count, addr });
-            }
-        }
+        // Note: COP_CTL read tracing removed - working correctly
 
         // Track peripheral access counts for debugging
         switch (region) {
@@ -844,10 +835,8 @@ pub const MemoryBus = struct {
             std.debug.print("*** FW_BUFFER_READ32: 0x{X:0>8} = 0x{X:0>8} ***\n", .{ translated_addr, value });
         }
 
-        // Track reads from DRAM_START (0x10000000 - 0x10000020) where firmware should be
-        if (translated_addr >= 0x10000000 and translated_addr < 0x10000020) {
-            std.debug.print("*** DRAM_START_READ32: 0x{X:0>8} = 0x{X:0>8} ***\n", .{ translated_addr, value });
-        }
+        // Note: DRAM_START reads (0x10000000-0x10000020) happen frequently during boot
+        // Tracing removed to reduce noise - firmware loading verified working
 
         // Track 32-bit reads from firmware buffer region (0x110001D0 - 0x110BD3EC)
         // This catches checksum loops that use LDR + byte extraction
@@ -1494,20 +1483,12 @@ pub const MemoryBus = struct {
         const offset = tcb_state_addr - SDRAM_START;
 
         if (offset + 3 < self.sdram.len) {
-            // Read current value
-            const current = @as(u32, self.sdram[offset]) |
-                (@as(u32, self.sdram[offset + 1]) << 8) |
-                (@as(u32, self.sdram[offset + 2]) << 16) |
-                (@as(u32, self.sdram[offset + 3]) << 24);
-
             // Change state from 1 (sleeping) to 3 (ready)
             const new_state: u32 = 0x00000003;
             self.sdram[offset] = @truncate(new_state);
             self.sdram[offset + 1] = @truncate(new_state >> 8);
             self.sdram[offset + 2] = @truncate(new_state >> 16);
             self.sdram[offset + 3] = @truncate(new_state >> 24);
-
-            std.debug.print("TCB KICKSTART: Modified 0x{X:0>8} from 0x{X:0>8} to 0x{X:0>8}\n", .{ tcb_state_addr, current, new_state });
         }
     }
 

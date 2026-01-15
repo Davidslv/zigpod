@@ -14,7 +14,7 @@
 //! - 0x38: PLL_DIV - PLL divider
 //! - 0x3C: PLL_STATUS - PLL lock status (read-only)
 //! - 0x40: DEV_INIT1 - Device init 1
-//! - 0x44: DEV_INIT2 - Device init 2
+//! - 0x44: CACHE_PRIORITY - Cache priority configuration
 //! - 0x80: CACHE_CTL - Cache control
 //!
 //! Additional registers for hardware identification:
@@ -69,9 +69,9 @@ pub const SystemController = struct {
     dev_en: u32,
     dev_en2: u32,
 
-    /// Device init registers
+    /// Device init / cache registers
     dev_init1: u32,
-    dev_init2: u32,
+    cache_priority: u32,
 
     /// Clock configuration
     clock_source: u32,
@@ -94,9 +94,6 @@ pub const SystemController = struct {
 
     /// Counter for COP wake requests (helps distinguish boot vs kernel wake)
     cop_wake_count: u32,
-
-    /// Counter for COP_CTL reads (used for kernel init detection)
-    cop_ctl_read_count: u32,
 
     /// Countdown for fake COP wake acknowledgment
     /// When > 0, COP_CTL reads return PROC_SLEEP=0 (COP awake/acknowledged)
@@ -129,8 +126,8 @@ pub const SystemController = struct {
     const REG_PLL_CONTROL: u32 = 0x34;
     const REG_PLL_DIV: u32 = 0x38;
     const REG_PLL_STATUS: u32 = 0x3C;
-    const REG_DEV_INIT1: u32 = 0x40;
-    const REG_DEV_INIT2: u32 = 0x44;
+    const REG_DEV_INIT1: u32 = 0x40; // Unknown purpose, not the same as 0x70000010
+    const REG_CACHE_PRIORITY: u32 = 0x44; // CACHE_PRIORITY register
     const REG_CACHE_CTL: u32 = 0x80;
 
     /// Processor control registers (base 0x60007000, offset 0x1000 from sys_ctrl)
@@ -159,7 +156,7 @@ pub const SystemController = struct {
             .dev_en = 0,
             .dev_en2 = 0,
             .dev_init1 = 0,
-            .dev_init2 = 0,
+            .cache_priority = 0x3F, // Default: all priorities enabled
             .clock_source = 0,
             .pll_control = 0,
             .pll_div = 1,
@@ -170,7 +167,6 @@ pub const SystemController = struct {
             .cop_ctl = DEFAULT_COP_CTL,
             .cop_state = .disabled,
             .cop_wake_count = 0,
-            .cop_ctl_read_count = 0,
             .cop_wake_ack_countdown = 0,
             .kernel_init_complete = false,
             .reset_callback = null,
@@ -319,15 +315,11 @@ pub const SystemController = struct {
             REG_PLL_DIV => self.pll_div,
             REG_PLL_STATUS => self.clock_status, // PLL locked status
             REG_DEV_INIT1 => self.dev_init1,
-            REG_DEV_INIT2 => self.dev_init2,
+            REG_CACHE_PRIORITY => self.cache_priority,
             REG_CACHE_CTL => self.cache_ctl,
             REG_CPU_CTL => blk: {
                 // CPU should always appear AWAKE (bit 31 = 0)
-                const result = self.cpu_ctl & ~@as(u32, 0x80000000);
-                if (self.cop_ctl_read_count < 50 or self.cop_ctl_read_count % 10000 == 0) {
-                    std.debug.print("CPU_CTL READ: 0x{X:0>8} (stored=0x{X:0>8})\n", .{ result, self.cpu_ctl });
-                }
-                break :blk result;
+                break :blk self.cpu_ctl & ~@as(u32, 0x80000000);
             },
             // COP_CTL: ALWAYS return SLEEPING (bit 31 = 1)
             //
@@ -346,18 +338,9 @@ pub const SystemController = struct {
             // PREVIOUS BUG: We returned AWAKE after kernel_init, which caused
             // wake_core() to spin forever waiting for COP to go back to sleep.
             REG_COP_CTL => blk: {
-                self.cop_ctl_read_count += 1;
                 // Always return SLEEPING - COP is not emulated, it's permanently "done"
-                const result: u32 = 0xC000FE00; // bit 31 = 1 (SLEEPING), ready flags
-
-                // Debug: trace COP_CTL reads
-                if (self.cop_ctl_read_count <= 20 or self.cop_ctl_read_count % 50000 == 0) {
-                    std.debug.print("COP_CTL READ #{}: 0x{X:0>8} (ALWAYS SLEEPING)\n", .{
-                        self.cop_ctl_read_count,
-                        result,
-                    });
-                }
-                break :blk result;
+                // Value: bit 31 = 1 (SLEEPING), ready flags
+                break :blk 0xC000FE00;
             },
             else => 0,
         };
@@ -371,10 +354,7 @@ pub const SystemController = struct {
     /// Mark kernel initialization as complete
     /// After this, COP_CTL will return "sleeping" (bit 31 = 1) so wake_core exits
     pub fn setKernelInitComplete(self: *Self) void {
-        if (!self.kernel_init_complete) {
-            self.kernel_init_complete = true;
-            std.debug.print("KERNEL_INIT: Marked complete after {} COP_CTL reads\n", .{self.cop_ctl_read_count});
-        }
+        self.kernel_init_complete = true;
     }
 
     /// Check if kernel init is complete
@@ -431,7 +411,7 @@ pub const SystemController = struct {
             },
             REG_DEV_EN2 => self.dev_en2 = value,
             REG_DEV_INIT1 => self.dev_init1 = value,
-            REG_DEV_INIT2 => self.dev_init2 = value,
+            REG_CACHE_PRIORITY => self.cache_priority = value,
             REG_CLOCK_SOURCE => self.clock_source = value,
             REG_PLL_CONTROL => {
                 self.pll_control = value;
@@ -449,8 +429,7 @@ pub const SystemController = struct {
                 const PROC_SLEEP: u32 = 0x80000000;
                 if ((value & PROC_SLEEP) != 0) {
                     // CPU trying to sleep - immediately wake it (simulate COP writing 0)
-                    std.debug.print("CPU_CTL WRITE: value=0x{X:0>8} (SLEEP) -> auto-wake to 0\n", .{value});
-                    self.cpu_ctl = 0; // Auto-wake
+                    self.cpu_ctl = 0; // Auto-wake (COP sync bypass)
                 } else {
                     self.cpu_ctl = value;
                 }
@@ -461,12 +440,6 @@ pub const SystemController = struct {
                 // Writing 0x80000000 (PROC_SLEEP=1) is a wake signal to COP
                 // After wake signal, COP wakes up, acknowledges (PROC_SLEEP=0), then sleeps again
                 const PROC_SLEEP: u32 = 0x80000000;
-                const old = self.cop_ctl;
-
-                // Trace COP_CTL writes to understand the pattern
-                if (self.cop_wake_count < 20) {
-                    std.debug.print("COP_CTL WRITE: value=0x{X:0>8}, old=0x{X:0>8}, wake_count={}, ack_countdown={}\n", .{ value, old, self.cop_wake_count, self.cop_wake_ack_countdown });
-                }
 
                 // Store non-sleep bits
                 self.cop_ctl = value;
