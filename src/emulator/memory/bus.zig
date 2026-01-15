@@ -1599,19 +1599,12 @@ pub const MemoryBus = struct {
         const offset = addr - MAILBOX_START;
         return switch (offset) {
             MBX_MSG_STAT_OFFSET => blk: {
-                // Check if we need to auto-clear COP wake bit (fake COP response)
-                if (self.mbx_cop_clear_countdown > 0) {
-                    self.mbx_cop_clear_countdown -= 1;
-                    if (self.mbx_cop_clear_countdown == 0) {
-                        // COP has "responded" - clear the wake bit
-                        const old_stat = self.mbx_msg_stat;
-                        self.mbx_msg_stat &= ~MBX_COP_WAKE_BIT;
-                        if ((old_stat & MBX_COP_WAKE_BIT) != 0) {
-                            std.debug.print("MBX: Fake COP response - cleared bit 3, stat 0x{X:0>8} -> 0x{X:0>8}\n", .{ old_stat, self.mbx_msg_stat });
-                        }
-                    }
-                }
-                break :blk self.mbx_msg_stat;
+                // AGGRESSIVE FIX: Always return 0 for MBX_MSG_STAT
+                // This bypasses ALL COP synchronization loops since we don't emulate COP.
+                // The kernel polls this register waiting for COP to clear/set bits.
+                // With no COP running, we just say "all clear" immediately.
+                _ = self.mbx_cop_clear_countdown; // suppress unused warning
+                break :blk 0;
             },
             CPU_QUEUE_OFFSET => blk: {
                 // COP reading CPU_QUEUE clears bit 29
@@ -1878,6 +1871,7 @@ pub const MemoryBus = struct {
                 self.first_sdram_write_addr = addr;
                 self.first_sdram_write_value = value;
             }
+
             self.sdram[offset] = @truncate(value);
             self.sdram[offset + 1] = @truncate(value >> 8);
             self.sdram[offset + 2] = @truncate(value >> 16);

@@ -329,62 +329,32 @@ pub const SystemController = struct {
                 }
                 break :blk result;
             },
-            // COP_CTL: Always return SLEEPING (bit 31 = 1)
+            // COP_CTL: ALWAYS return SLEEPING (bit 31 = 1)
             //
-            // ANALYSIS: Both crt0 sync loops AND wake_core exit when PROC_SLEEP=1:
+            // CRITICAL: Both boot sync loops AND wake_core() exit when PROC_SLEEP=1:
             // - crt0 sync loops: `while (!(COP_CTL & 0x80000000))` - exit when sleeping
             // - wake_core: `if (COP_CTL & PROC_SLEEP) return` - exit when sleeping
             //
-            // By always returning SLEEPING, all COP synchronization loops will exit
-            // immediately. This allows kernel init to proceed naturally. The kernel will:
-            // 1. Pass all crt0 sync loops (COP appears sleeping)
+            // By ALWAYS returning SLEEPING, all COP synchronization code exits
+            // immediately. This is correct because we don't emulate COP - it's
+            // effectively always "done" (sleeping). The kernel will:
+            // 1. Pass all crt0 sync loops instantly (COP appears sleeping)
             // 2. Run kernel_init() including thread creation
-            // 3. Install IRQ handlers at 0x40000018
-            // 4. Enable Timer1 for scheduler ticks
-            // 5. wake_core() returns immediately (COP sleeping, nothing to wake)
+            // 3. wake_core() returns immediately (COP sleeping = nothing to wake)
+            // 4. Scheduler runs, main thread progresses to LCD init
             //
-            // Note: The idle thread will still loop calling wake_core, but that's
-            // expected - it has nothing to do until Timer1 interrupts start
-            // triggering scheduler ticks to switch to other threads.
+            // PREVIOUS BUG: We returned AWAKE after kernel_init, which caused
+            // wake_core() to spin forever waiting for COP to go back to sleep.
             REG_COP_CTL => blk: {
                 self.cop_ctl_read_count += 1;
-                const ready_flags: u32 = 0x4000FE00 | (self.cop_ctl & 0x1FF);
+                // Always return SLEEPING - COP is not emulated, it's permanently "done"
+                const result: u32 = 0xC000FE00; // bit 31 = 1 (SLEEPING), ready flags
 
-                // Context-aware COP_CTL responses:
-                //
-                // CRT0 startup: COP is expected to complete init and go to sleep
-                // - Returns SLEEPING (bit 31 = 1) after brief AWAKE period
-                //
-                // Kernel operation: COP is expected to be awake and responsive
-                // - After kernel_init_complete, return AWAKE (bit 31 = 0)
-                //
-                // The transition happens when kernel enables Timer1 (detected externally)
-                var result: u32 = ready_flags;
-                var sleep_state: []const u8 = "SLEEPING";
-
-                if (self.kernel_init_complete) {
-                    // Kernel phase: COP should appear awake and responsive
-                    result = ready_flags; // bit 31 = 0 (awake)
-                    sleep_state = "AWAKE";
-                } else if (self.cop_wake_ack_countdown > 0) {
-                    // COP is "busy" processing wake request during startup
-                    self.cop_wake_ack_countdown -= 1;
-                    result = ready_flags; // bit 31 = 0 (awake/busy)
-                    sleep_state = "AWAKE";
-                } else {
-                    // CRT0 startup: COP has "finished" and is sleeping
-                    result = ready_flags | 0x80000000; // bit 31 = 1 (sleeping)
-                    sleep_state = "SLEEPING";
-                }
-
-                // Debug: trace ALL COP_CTL reads during initial investigation
-                if (self.cop_ctl_read_count <= 100 or self.cop_ctl_read_count % 10000 == 0) {
-                    std.debug.print("COP_CTL READ #{}: 0x{X:0>8} ({s}, ack_countdown={}, kernel_init={})\n", .{
+                // Debug: trace COP_CTL reads
+                if (self.cop_ctl_read_count <= 20 or self.cop_ctl_read_count % 50000 == 0) {
+                    std.debug.print("COP_CTL READ #{}: 0x{X:0>8} (ALWAYS SLEEPING)\n", .{
                         self.cop_ctl_read_count,
                         result,
-                        sleep_state,
-                        self.cop_wake_ack_countdown,
-                        self.kernel_init_complete,
                     });
                 }
                 break :blk result;

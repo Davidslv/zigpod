@@ -216,11 +216,29 @@ pub const Timers = struct {
 
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
+        // Need mutable self for timer acknowledgment side effects
+        const self_mut = @constCast(self);
+
         const value = switch (offset) {
             REG_TIMER1_CFG => self.timer1.config,
-            REG_TIMER1_VAL => self.timer1.value,
+            REG_TIMER1_VAL => blk: {
+                // CRITICAL FIX: Reading TIMER1_VAL acknowledges the interrupt!
+                // Rockbox does: TIMER1_VAL; /* Read value to ack IRQ */
+                self_mut.timer1.acknowledge();
+                if (self_mut.int_ctrl) |ctrl| {
+                    ctrl.clearInterrupt(.timer1);
+                }
+                break :blk self.timer1.value;
+            },
             REG_TIMER2_CFG => self.timer2.config,
-            REG_TIMER2_VAL => self.timer2.value,
+            REG_TIMER2_VAL => blk: {
+                // Reading TIMER2_VAL also acknowledges the interrupt
+                self_mut.timer2.acknowledge();
+                if (self_mut.int_ctrl) |ctrl| {
+                    ctrl.clearInterrupt(.timer2);
+                }
+                break :blk self.timer2.value;
+            },
             REG_USEC_TIMER => self.usec_timer,
             REG_RTC => self.rtc,
             else => 0,
@@ -232,8 +250,6 @@ pub const Timers = struct {
             if (self.debug_usec_reads < 5 or value > 0x1000000) {
                 print("USEC_TIMER READ: value=0x{X:0>8} usec_cycles={}\n", .{ value, self.usec_cycles });
             }
-            // Increment counter using pointer cast to bypass const
-            const self_mut = @constCast(self);
             self_mut.debug_usec_reads += 1;
         }
         return value;
