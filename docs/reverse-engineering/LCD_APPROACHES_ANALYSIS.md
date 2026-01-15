@@ -304,11 +304,36 @@ The emulator-level workarounds (detecting suspicious LR, clearing Thumb bit) wou
 **Root Cause Hypothesis:** The buffer overflow likely occurs due to missing COP synchronization. In dual-core operation, COP may handle certain initialization tasks that prevent CPU from hitting this code path, or memory barriers prevent race conditions. Our single-core emulation exposes timing-dependent bugs.
 
 **Practical Paths Forward:**
-1. **Try different Rockbox version** - The corruption may be version-specific
+1. ~~**Try different Rockbox version**~~ - Tested, same bug (see below)
 2. **Minimal COP emulation** - Implement just enough COP behavior to avoid the buggy path
 3. **Accept limitation** - LCD hardware emulation is proven working; focus on other aspects
 
 **Status:** Investigation complete. The crash is understood but not fixable without firmware changes or proper COP emulation.
+
+### Multi-Version Testing (2026-01-15)
+
+Tested multiple Rockbox iPod Video builds to determine if the bug is version-specific:
+
+| Build | Date | Crash Location | Corrupt Value |
+|-------|------|----------------|---------------|
+| Daily | 2026-01-12 | LR=0x00003231 | ASCII "12\0\0" |
+| Daily | 2026-01-08 | PC=0xDEADBEEE | Stack canary |
+
+**Key Finding:** Both builds crash due to stack corruption, just in different ways:
+- Jan 12 build: Return address corrupted with version string fragment
+- Jan 8 build: Return address jumps into DEADBEEF stack canary
+
+This confirms the bug is **not version-specific** but rather **systemic** to single-core iPod Video emulation. The stack corruption likely occurs because:
+1. COP normally synchronizes certain initialization sequences
+2. Without COP, CPU races ahead and corrupts shared memory
+3. Different timing = different corruption patterns
+
+**Conclusion:** The bug cannot be fixed by using a different Rockbox version. Options are:
+- Full COP emulation (significant effort)
+- Identify and patch specific COP sync points (medium effort)
+- Accept LCD test pattern as proof of working hardware emulation
+
+**Note for Rockbox Reporting:** This bug may be specific to emulator timing and not reproducible on real hardware where dual-core synchronization works correctly.
 
 ---
 
