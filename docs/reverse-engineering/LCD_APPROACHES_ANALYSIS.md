@@ -337,6 +337,55 @@ This confirms the bug is **not version-specific** but rather **systemic** to sin
 
 ---
 
+## COP Init Simulation Fix (2026-01-15)
+
+### Problem Solved
+
+The stack corruption crash has been **FIXED** by implementing minimal COP init simulation.
+
+**Root Cause:** During kernel initialization, CPU calls `sleep_core(CPU)` to wait for COP to finish init. Our emulator auto-woke CPU immediately, causing it to race ahead with uninitialized structures.
+
+### Solution Implemented
+
+**Files Modified:**
+- `src/emulator/peripherals/system_ctrl.zig` - Added `CopInitState` enum and countdown fields
+- `src/emulator/core.zig` - Added COP init countdown processing, removed risky RTR manipulation
+
+**How It Works:**
+1. When CPU first wakes COP (`cop_wake_count == 1`), set `cop_init_state = .in_progress`
+2. When CPU tries to sleep during COP init, start countdown (100K cycles)
+3. During countdown, CPU remains in sleep state
+4. After countdown expires, wake CPU and set `cop_init_state = .complete`
+
+**Old Code Removed:**
+- `performThreadWakeup()` - This function directly manipulated RTR queue at `0x1012ACD8` and caused stack corruption. Replaced with a stub that logs a warning.
+
+### Results
+
+**Before Fix:**
+```
+CRASH_REGION: cycle=13219963 PC=0x00003730 ...
+Final PC: 0xDEADBEEE, Mode: system, Thumb: true
+```
+
+**After Fix:**
+```
+COP_INIT: Simulated COP initialization complete, CPU waking
+CRASH_REGION count: 0
+Final PC: 0x0007C36C, Mode: system, Thumb: false
+Executed 200000000 cycles (clean exit at limit)
+```
+
+### Remaining Work
+
+The LCD still doesn't receive Rockbox pixel writes (LCD2 bridge has 0 writes) because:
+- Scheduler threads aren't running (RTR queue issue remains)
+- This requires deeper scheduler emulation beyond COP init
+
+**Status:** Stack corruption fixed. LCD test pattern proves hardware emulation works. Full scheduler emulation is a separate task.
+
+---
+
 ## References
 
 - `docs/reverse-engineering/LCD_OUTPUT_PLAN.md` - Original LCD strategy

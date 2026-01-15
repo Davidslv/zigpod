@@ -39,6 +39,17 @@ pub const CopState = enum {
     halted,
 };
 
+/// COP initialization state machine
+/// Tracks simulated COP kernel initialization progress
+pub const CopInitState = enum {
+    /// COP init hasn't started yet
+    not_started,
+    /// COP is doing simulated initialization work
+    in_progress,
+    /// COP init is complete, CPU can proceed
+    complete,
+};
+
 /// Device enable bits (DEV_EN)
 pub const Device = enum(u5) {
     timer1 = 0,
@@ -113,6 +124,16 @@ pub const SystemController = struct {
     /// Gives firmware time to settle before we manipulate RTR queue
     thread_wakeup_countdown: u32,
 
+    /// COP initialization state machine
+    /// Simulates COP doing kernel init work while CPU waits
+    cop_init_state: CopInitState,
+
+    /// Cycles until COP init completes (simulated)
+    cop_init_countdown: u32,
+
+    /// Set when CPU tries to sleep during COP init
+    cpu_waiting_for_cop_init: bool,
+
     /// Device reset callback (called when a device is reset)
     reset_callback: ?*const fn (Device) void,
 
@@ -179,6 +200,9 @@ pub const SystemController = struct {
             .kernel_init_complete = false,
             .pending_thread_wakeup = false,
             .thread_wakeup_countdown = 0,
+            .cop_init_state = .not_started,
+            .cop_init_countdown = 0,
+            .cpu_waiting_for_cop_init = false,
             .reset_callback = null,
             .enable_callback = null,
             .is_cop_access = false,
@@ -435,11 +459,20 @@ pub const SystemController = struct {
                 // CPU_CTL handles CPU sleep/wake state
                 // When CPU writes 0x80000000 (PROC_SLEEP), it's putting itself to sleep
                 // and waiting for COP to wake it by writing 0
-                // Since we don't emulate COP, immediately auto-wake the CPU
                 const PROC_SLEEP: u32 = 0x80000000;
                 if ((value & PROC_SLEEP) != 0) {
-                    // CPU trying to sleep - immediately wake it (simulate COP writing 0)
-                    self.cpu_ctl = 0; // Auto-wake (COP sync bypass)
+                    // CPU trying to sleep
+                    if (self.cop_init_state == .in_progress) {
+                        // CPU is waiting for COP to finish init
+                        // Start countdown before waking CPU
+                        self.cpu_waiting_for_cop_init = true;
+                        self.cop_init_countdown = 100_000; // ~100K cycles for COP to "init"
+                        self.cpu_ctl = value; // Keep CPU in sleep state
+                        std.debug.print("COP_INIT: CPU sleeping, waiting for simulated COP init ({} cycles)\n", .{self.cop_init_countdown});
+                    } else {
+                        // Normal case: immediately wake CPU (COP sync bypass)
+                        self.cpu_ctl = 0; // Auto-wake
+                    }
                 } else {
                     self.cpu_ctl = value;
                 }
@@ -476,23 +509,24 @@ pub const SystemController = struct {
                         self.cop_state = .waking;
                     }
 
-                    // COP WAKE RESPONSE: After kernel init, simulate COP's response
-                    // When Timer1 handler calls core_wake(COP), we need to simulate
-                    // COP calling core_wake(CPU) back, which adds threads to RTR queue.
-                    // Only trigger on actual wake requests (writing 0), not sleep requests.
+                    // COP INIT SIMULATION: When CPU first wakes COP, start simulated init
+                    // This happens during core_thread_init() when CPU does wake_core(COP)
                     if (is_wake_request) {
                         if (self.cop_wake_count <= 5 or self.cop_wake_count % 100 == 0) {
-                            std.debug.print("COP_CTL_WAKE: count={}, kernel_init={}, pending={}\n", .{
-                                self.cop_wake_count, self.kernel_init_complete, self.pending_thread_wakeup,
+                            std.debug.print("COP_CTL_WAKE: count={}, cop_init_state={s}, kernel_init={}\n", .{
+                                self.cop_wake_count, @tagName(self.cop_init_state), self.kernel_init_complete,
                             });
                         }
-                        // Wait longer (count >= 10) to ensure main firmware has initialized threads
-                        // Increased countdown to give scheduler time to set up
-                        if (self.kernel_init_complete and self.cop_wake_count >= 10 and !self.pending_thread_wakeup) {
-                            std.debug.print("COP WAKE RESPONSE TRIGGERED: Setting pending_thread_wakeup=true (after {} COP wakes)\n", .{self.cop_wake_count});
-                            self.pending_thread_wakeup = true;
-                            self.thread_wakeup_countdown = 50000; // Longer delay before wakeup
+
+                        // Start COP init on first wake request (during kernel init)
+                        if (self.cop_init_state == .not_started and self.cop_wake_count == 1) {
+                            self.cop_init_state = .in_progress;
+                            std.debug.print("COP_INIT: Starting simulated COP initialization\n", .{});
                         }
+
+                        // NOTE: The old pending_thread_wakeup mechanism is DISABLED
+                        // It directly manipulated RTR queue and caused stack corruption
+                        // Instead, we rely on COP init simulation to delay CPU appropriately
                     }
                 }
             },
