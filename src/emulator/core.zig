@@ -167,6 +167,9 @@ pub const Emulator = struct {
     /// Counter for idle loop iterations
     idle_loop_count: u32,
 
+    /// Counter for IRAM loop iterations (0x40008928)
+    iram_loop_count: u32,
+
     /// Counter for switch_thread skip iterations
     switch_thread_count: u32,
 
@@ -266,6 +269,7 @@ pub const Emulator = struct {
             .wake_loop_iterations = 0,
             .sched_skip_count = 0,
             .idle_loop_count = 0,
+            .iram_loop_count = 0,
             .switch_thread_count = 0,
             .total_sched_skips = 0,
             .lcd_bypass_done = false,
@@ -866,6 +870,27 @@ pub const Emulator = struct {
             if (effective_pc == 0x10007694) {
                 self.timer1_enabled_by_emulator = true;
                 std.debug.print("KERNEL_FIX: DISABLED\n", .{});
+            }
+        }
+
+        // IRAM LOOP DETECTION: Track if execution is stuck at 0x40008928
+        // This address is in IRAM (bootloader area) and appears to be a wait loop
+        if (pc == 0x40008928) {
+            self.iram_loop_count += 1;
+            if (self.iram_loop_count == 1 or self.iram_loop_count % 100000 == 0) {
+                const instr = self.bus.read32(pc);
+                const cpsr = self.cpu.regs.cpsr;
+                std.debug.print("IRAM_LOOP[{}]: PC=0x{X:0>8} instr=0x{X:0>8} mode=0x{X:0>2} IRQ_dis={} FIQ_dis={}\n", .{
+                    self.iram_loop_count,
+                    pc,
+                    instr,
+                    cpsr.mode,
+                    cpsr.irq_disable,
+                    cpsr.fiq_disable,
+                });
+                std.debug.print("  R0=0x{X:0>8} R1=0x{X:0>8} R2=0x{X:0>8} R3=0x{X:0>8} LR=0x{X:0>8}\n", .{
+                    self.cpu.getReg(0), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3), self.cpu.getReg(14),
+                });
             }
         }
 

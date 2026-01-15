@@ -186,9 +186,9 @@ pub const Timers = struct {
         if (self.timer1.tick(cpu_cycles, self.cpu_freq_mhz)) {
             if (self.int_ctrl) |ctrl| {
                 ctrl.assertInterrupt(.timer1);
-                // Debug: print when Timer1 fires (only first 5 times)
-                if (ctrl.debug_timer1_fires < 5) {
-                    ctrl.debug_timer1_fires += 1;
+                ctrl.debug_timer1_fires += 1;
+                // Debug: print when Timer1 fires (first 5, then every 100)
+                if (ctrl.debug_timer1_fires <= 5 or ctrl.debug_timer1_fires % 100 == 0) {
                     std.debug.print("TIMER1_FIRE: #{} raw_status=0x{X:0>8} cpu_enable=0x{X:0>8}\n", .{
                         ctrl.debug_timer1_fires, ctrl.raw_status, ctrl.cpu_enable,
                     });

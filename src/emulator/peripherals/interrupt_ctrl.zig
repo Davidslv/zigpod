@@ -330,6 +330,14 @@ pub const InterruptController = struct {
             REG_CPU_INT_EN => {
                 std.debug.print("CPU_INT_EN: enabling 0x{X:0>8} (was 0x{X:0>8})\n", .{ value, self.cpu_enable });
                 self.cpu_enable |= value;
+                // AUTO-PROTECT Timer1: When firmware enables Timer1, protect it from
+                // being disabled by blanket CPU_INT_DIS writes (like crt0 does).
+                // This ensures the RTOS scheduler tick continues working.
+                const timer1_mask = Interrupt.timer1.mask();
+                if ((value & timer1_mask) != 0 and (self.protected_mask & timer1_mask) == 0) {
+                    self.protected_mask |= timer1_mask;
+                    std.debug.print("CPU_INT_EN: AUTO-PROTECTING Timer1 (protected_mask=0x{X:0>8})\n", .{self.protected_mask});
+                }
                 self.updateLines();
             },
             REG_CPU_INT_DIS => {

@@ -14,6 +14,7 @@ This document tracks the chronological journey of reverse engineering Apple iPod
 | 2026-01-14 | See below | In Progress | RTOS scheduler - Timer1/idle loop investigation |
 | 2026-01-14 | [COP_WAKE_INVESTIGATION.md](COP_WAKE_INVESTIGATION.md) | **BLOCKING** | Detailed COP wake analysis with prioritized solutions |
 | 2026-01-14 | See below | In Progress | main() address investigation - binary layout issue |
+| 2026-01-15 | See below | **CRITICAL FIX** | Timer1 IRQ acknowledgment on READ - 1,782x perf improvement |
 
 ---
 
@@ -2135,6 +2136,82 @@ Still no LCD because kernel is stuck in scheduler waiting for something.
 - `src/emulator/peripherals/system_ctrl.zig`: Added CPU_CTL auto-wake logic
 
 **Commit**: feat: CPU_CTL auto-wake for RTOS scheduler bypass
+
+---
+
+### 2026-01-15: Timer1 Interrupt Acknowledgment Fix (CRITICAL)
+
+**Goal**: Fix Timer1 IRQ handler tight loop causing millions of spurious accesses
+
+**Problem**:
+After the CPU_CTL auto-wake fix, the emulator was still showing:
+- 2,125,426 Mailbox accesses
+- 1,416,810 Sys Ctrl accesses
+- CPU stuck in IRQ mode at 0x89A2C (Timer1 IRQ handler)
+- Scheduler only getting 298 iterations despite millions of cycles
+
+**Root Cause Analysis**:
+Traced the Timer1 IRQ handler in Rockbox source (`firmware/target/arm/pp/kernel-pp.c:26-56`):
+
+```c
+void TIMER1(void) {
+    TIMER1_VAL;  /* Read value to ACK IRQ */
+    // ... tick handling code ...
+}
+```
+
+**The bug**: Our `timers.zig` only cleared the Timer1 interrupt on WRITE to TIMER1_VAL:
+```zig
+REG_TIMER1_VAL => {
+    self.timer1.acknowledge();
+    if (self.int_ctrl) |ctrl| {
+        ctrl.clearInterrupt(.timer1);  // Only on WRITE!
+    }
+},
+```
+
+But Rockbox acknowledges by READING TIMER1_VAL, not writing! The IRQ was never cleared, so the IRQ handler kept being called in a tight loop.
+
+**Solution** (in `timers.zig:224-231`):
+```zig
+REG_TIMER1_VAL => blk: {
+    // CRITICAL FIX: Reading TIMER1_VAL acknowledges the interrupt!
+    // Rockbox does: TIMER1_VAL; /* Read value to ack IRQ */
+    self_mut.timer1.acknowledge();
+    if (self_mut.int_ctrl) |ctrl| {
+        ctrl.clearInterrupt(.timer1);
+    }
+    break :blk self.timer1.value;
+},
+```
+
+Same fix applied to TIMER2_VAL read handler.
+
+**Results** (200M cycles test):
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Mailbox accesses | 2,125,426 | 1,192 | **1,782x reduction** |
+| Sys Ctrl accesses | 1,416,810 | 655 | **2,163x reduction** |
+| Final PC | 0x00089A2C (IRQ mode) | 0x0007C7E0 (supervisor) | CPU escaped IRQ loop |
+| LCD pixel writes | 0 | 0 | Still blocked |
+
+**Analysis of New State**:
+- PC 0x7C7E0 is in `switch_thread()` scheduler idle loop
+- CPU mode changed from IRQ to supervisor - major progress
+- Timer1 fires properly with one interrupt per tick
+- Bootloader still successfully loads rockbox.ipod
+
+**Current Blocking Issue**:
+The scheduler idle loop at 0x7C7E0 has no runnable threads. This is likely because:
+1. COP threads never initialized (COP not emulated)
+2. Main/GUI thread in blocked state waiting for something
+3. Thread wake signals from COP never arrive
+
+**Files Changed**:
+- `src/emulator/peripherals/timers.zig`: Added interrupt clearing on READ
+- `src/emulator/memory/bus.zig`: Simplified MBX_MSG_STAT to always return 0
+
+**Commit**: fix: Timer1 interrupt acknowledgment on READ, not WRITE
 
 ---
 
