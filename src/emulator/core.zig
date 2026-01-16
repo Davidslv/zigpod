@@ -218,6 +218,12 @@ pub const Emulator = struct {
     /// Flag: Framebuffer scan has been done
     fb_scan_done: bool,
 
+    /// Flag: Thread wake simulation has been done
+    thread_wake_done: bool,
+
+    /// Found main thread TCB address (0 if not found)
+    main_thread_tcb: u32,
+
     /// Found framebuffer address (0 if not found)
     fb_found_addr: u32,
 
@@ -316,6 +322,8 @@ pub const Emulator = struct {
             .rtr_trace_count = 0,
             .rtr_trace_reported = false,
             .fb_scan_done = false,
+            .thread_wake_done = false,
+            .main_thread_tcb = 0,
             .fb_found_addr = 0,
             .fb_scan_trigger_cycles = 0,
             .cycles_per_frame = cycles_per_frame,
@@ -396,6 +404,274 @@ pub const Emulator = struct {
         }
         self.total_cycles = 0;
         self.next_frame_cycles = self.cycles_per_frame;
+    }
+
+    // =========================================================================
+    // Thread Wake Simulation
+    // =========================================================================
+    // After kernel init, threads exist but aren't in the RTR queue because
+    // COP never calls core_wake(CPU). This simulates adding a thread to RTR.
+
+    /// Rockbox TCB (Thread Control Block) offsets for iPod Video
+    const TCB_THREAD_LIST_OFFSET: u32 = 0x18; // Embedded linked list for RTR queue
+    const TCB_STATE_OFFSET: u32 = 0x40; // Thread state (1=sleeping, 3=ready)
+    const TCB_SP_OFFSET: u32 = 0x00; // Saved stack pointer
+    const TCB_PC_OFFSET: u32 = 0x3C; // Saved program counter (approx)
+
+    /// RTR queue head address (discovered via RTR tracing)
+    const RTR_QUEUE_HEAD: u32 = 0x1012ACD8;
+
+    /// Find the main thread TCB in SDRAM
+    /// Returns TCB address or 0 if not found
+    pub fn findMainThreadTcb(self: *Self) u32 {
+        const SDRAM_BASE: u32 = 0x10000000;
+        const IRAM_BASE: u32 = 0x40000000;
+        const CODE_BASE: u32 = 0x00000000; // Firmware code is also loaded at low addresses
+
+        std.debug.print("\n=== FINDING MAIN THREAD TCB ===\n", .{});
+
+        // Rockbox creates threads in SDRAM. The main thread is typically
+        // one of the first allocated. TCBs are usually 64-128 bytes aligned.
+        // Scan for structures that look like valid TCBs.
+
+        var best_tcb: u32 = 0;
+        var candidates_found: u32 = 0;
+        var with_valid_context: u32 = 0;
+
+        // Scan first 2MB of SDRAM where kernel structures are likely to be
+        var offset: u32 = 0;
+        while (offset < 0x200000) : (offset += 64) {
+            const addr = SDRAM_BASE + offset;
+
+            // Read potential TCB fields
+            const sp = self.bus.read32(addr + TCB_SP_OFFSET);
+            const list_prev = self.bus.read32(addr + TCB_THREAD_LIST_OFFSET);
+            const list_next = self.bus.read32(addr + TCB_THREAD_LIST_OFFSET + 4);
+            const state = self.bus.read32(addr + TCB_STATE_OFFSET);
+
+            // Check for valid TCB signature:
+            // 1. SP should point to SDRAM or IRAM stack area
+            // 2. State should be small value (0-10)
+            // 3. List pointers should be NULL or valid addresses
+
+            const sp_valid = (sp >= SDRAM_BASE and sp < SDRAM_BASE + 0x02000000) or
+                (sp >= IRAM_BASE and sp < IRAM_BASE + 0x00020000);
+            const state_valid = state <= 10;
+            const list_valid = (list_prev == 0 and list_next == 0) or
+                (list_prev >= SDRAM_BASE and list_next >= SDRAM_BASE);
+
+            if (sp_valid and state_valid and list_valid) {
+                candidates_found += 1;
+
+                // Try to find saved context - Rockbox stores registers at SP
+                // When a thread is sleeping, its context is on its stack
+                // Try reading LR from stack to see if context exists
+                const stack_lr = self.bus.read32(sp - 4); // LR typically at SP-4 or SP+offset
+
+                // Check if context has valid return address (code pointer)
+                const lr_valid = (stack_lr >= CODE_BASE and stack_lr < 0x00100000) or // Low firmware
+                    (stack_lr >= SDRAM_BASE and stack_lr < SDRAM_BASE + 0x01000000) or // SDRAM code
+                    (stack_lr >= IRAM_BASE and stack_lr < IRAM_BASE + 0x00020000); // IRAM code
+
+                // Log candidates with some detail
+                if (candidates_found <= 10) {
+                    std.debug.print("TCB candidate #{}: addr=0x{X:0>8} SP=0x{X:0>8} state={} stack_LR=0x{X:0>8}{s}\n", .{
+                        candidates_found,
+                        addr,
+                        sp,
+                        state,
+                        stack_lr,
+                        if (lr_valid) " (valid)" else "",
+                    });
+                }
+
+                if (lr_valid) {
+                    with_valid_context += 1;
+                }
+
+                // Prefer TCB with state=1 (sleeping) AND valid stack context
+                if (state == 1 and lr_valid and (best_tcb == 0 or addr < best_tcb)) {
+                    best_tcb = addr;
+                }
+            }
+        }
+
+        // If no sleeping threads with valid context, try running (state=0) threads
+        if (best_tcb == 0) {
+            std.debug.print("No sleeping threads with valid context, trying running threads...\n", .{});
+            offset = 0;
+            while (offset < 0x200000) : (offset += 64) {
+                const addr = SDRAM_BASE + offset;
+                const sp = self.bus.read32(addr + TCB_SP_OFFSET);
+                const state = self.bus.read32(addr + TCB_STATE_OFFSET);
+                const list_prev = self.bus.read32(addr + TCB_THREAD_LIST_OFFSET);
+                const list_next = self.bus.read32(addr + TCB_THREAD_LIST_OFFSET + 4);
+
+                const sp_valid = (sp >= SDRAM_BASE and sp < SDRAM_BASE + 0x02000000) or
+                    (sp >= IRAM_BASE and sp < IRAM_BASE + 0x00020000);
+                const state_valid = state <= 10;
+                const list_valid = (list_prev == 0 and list_next == 0) or
+                    (list_prev >= SDRAM_BASE and list_next >= SDRAM_BASE);
+
+                if (sp_valid and state_valid and list_valid and state == 0) {
+                    const stack_lr = self.bus.read32(sp - 4);
+                    const lr_valid = (stack_lr >= CODE_BASE and stack_lr < 0x00100000) or
+                        (stack_lr >= SDRAM_BASE and stack_lr < SDRAM_BASE + 0x01000000) or
+                        (stack_lr >= IRAM_BASE and stack_lr < IRAM_BASE + 0x00020000);
+
+                    if (lr_valid and best_tcb == 0) {
+                        best_tcb = addr;
+                        std.debug.print("Using running thread: addr=0x{X:0>8} SP=0x{X:0>8} stack_LR=0x{X:0>8}\n", .{
+                            addr, sp, stack_lr,
+                        });
+                    }
+                }
+            }
+        }
+
+        std.debug.print("Summary: {} candidates, {} with valid context\n", .{ candidates_found, with_valid_context });
+
+        if (best_tcb != 0) {
+            // Dump TCB contents for debugging
+            std.debug.print("Selected TCB at 0x{X:0>8} (found {} candidates)\n", .{ best_tcb, candidates_found });
+
+            // Read and display TCB fields
+            const tcb_sp = self.bus.read32(best_tcb + TCB_SP_OFFSET);
+            const tcb_pc = self.bus.read32(best_tcb + TCB_PC_OFFSET);
+            const tcb_state = self.bus.read32(best_tcb + TCB_STATE_OFFSET);
+            const tcb_list_prev = self.bus.read32(best_tcb + TCB_THREAD_LIST_OFFSET);
+            const tcb_list_next = self.bus.read32(best_tcb + TCB_THREAD_LIST_OFFSET + 4);
+
+            std.debug.print("  TCB dump: SP=0x{X:0>8} PC=0x{X:0>8} state={}\n", .{ tcb_sp, tcb_pc, tcb_state });
+            std.debug.print("  list_prev=0x{X:0>8} list_next=0x{X:0>8}\n", .{ tcb_list_prev, tcb_list_next });
+
+            // Dump first 64 bytes of TCB
+            std.debug.print("  TCB raw bytes:\n", .{});
+            var i: u32 = 0;
+            while (i < 64) : (i += 16) {
+                std.debug.print("    +0x{X:0>2}:", .{i});
+                var j: u32 = 0;
+                while (j < 16) : (j += 4) {
+                    const val = self.bus.read32(best_tcb + i + j);
+                    std.debug.print(" {X:0>8}", .{val});
+                }
+                std.debug.print("\n", .{});
+            }
+
+            self.main_thread_tcb = best_tcb;
+        } else if (candidates_found > 0) {
+            // Fall back to any valid TCB if none are sleeping
+            std.debug.print("No sleeping threads found, {} candidates total\n", .{candidates_found});
+        } else {
+            std.debug.print("No valid TCBs found!\n", .{});
+        }
+
+        return best_tcb;
+    }
+
+    /// Simulate waking a thread by adding it to the RTR queue
+    /// This mimics what core_wake(CPU) would do
+    ///
+    /// NOTE: This approach is currently DISABLED because:
+    /// 1. Threads created without COP don't have valid saved context
+    /// 2. When scheduler tries to restore context from TCB, it jumps to garbage
+    /// 3. Proper thread scheduling requires either:
+    ///    a. Full COP emulation to complete thread initialization, or
+    ///    b. Synthesizing valid thread context (complex and version-dependent)
+    ///
+    /// The LCD test pattern proves hardware emulation works.
+    /// Full Rockbox thread scheduling is a future enhancement.
+    pub fn simulateThreadWake(self: *Self) void {
+        // DISABLED - see note above
+        // Enable this to experiment with thread injection
+        const ENABLE_THREAD_INJECTION = false;
+
+        // Only run once
+        if (self.thread_wake_done) return;
+
+        // Wait for kernel init complete
+        if (!self.sys_ctrl.kernel_init_complete) return;
+
+        // Wait for enough Timer1 ticks (threads need time to initialize)
+        if (self.int_ctrl.debug_timer1_fires < 100) return;
+
+        if (!ENABLE_THREAD_INJECTION) {
+            self.thread_wake_done = true;
+            std.debug.print("\n=== THREAD WAKE SIMULATION SKIPPED ===\n", .{});
+            std.debug.print("Thread injection disabled - threads lack valid saved context.\n", .{});
+            std.debug.print("Full scheduling requires COP emulation or context synthesis.\n", .{});
+            return;
+        }
+
+        std.debug.print("\n=== SIMULATING THREAD WAKE ===\n", .{});
+        std.debug.print("Timer1 fires: {}, attempting thread injection...\n", .{self.int_ctrl.debug_timer1_fires});
+
+        // Find a thread TCB
+        const tcb = self.findMainThreadTcb();
+        if (tcb == 0) {
+            std.debug.print("No TCB found, cannot inject thread\n", .{});
+            self.thread_wake_done = true;
+            return;
+        }
+
+        // Read current RTR queue state
+        const current_rtr_head = self.bus.read32(RTR_QUEUE_HEAD);
+        std.debug.print("Current RTR head: 0x{X:0>8}\n", .{current_rtr_head});
+
+        // The RTR queue uses embedded linked lists within TCBs
+        // The queue head points to (tcb + TCB_THREAD_LIST_OFFSET), not tcb itself
+        const list_entry = tcb + TCB_THREAD_LIST_OFFSET;
+
+        if (current_rtr_head == 0) {
+            // Empty queue - set up circular list with single element
+            std.debug.print("RTR queue empty, creating single-thread circular list\n", .{});
+
+            // prev and next both point to self (circular list with one element)
+            self.bus.write32(list_entry, list_entry); // prev = self
+            self.bus.write32(list_entry + 4, list_entry); // next = self
+
+            // Set RTR queue head to this thread's list entry
+            self.bus.write32(RTR_QUEUE_HEAD, list_entry);
+
+            std.debug.print("Wrote RTR head: 0x{X:0>8} -> 0x{X:0>8}\n", .{ RTR_QUEUE_HEAD, list_entry });
+        } else {
+            // Queue already has entries - insert at head
+            std.debug.print("RTR queue non-empty, inserting at head\n", .{});
+
+            // Read old head's prev/next
+            const old_head = current_rtr_head;
+            const old_prev = self.bus.read32(old_head);
+            const old_next = self.bus.read32(old_head + 4);
+
+            std.debug.print("Old head: prev=0x{X:0>8} next=0x{X:0>8}\n", .{ old_prev, old_next });
+
+            // Insert new entry before old head
+            self.bus.write32(list_entry, old_prev); // new.prev = old.prev
+            self.bus.write32(list_entry + 4, old_head); // new.next = old_head
+            self.bus.write32(old_head, list_entry); // old.prev = new
+            if (old_prev != 0) {
+                self.bus.write32(old_prev + 4, list_entry); // old_prev.next = new
+            }
+
+            // Set new head
+            self.bus.write32(RTR_QUEUE_HEAD, list_entry);
+        }
+
+        // Set thread state to READY (3)
+        const old_state = self.bus.read32(tcb + TCB_STATE_OFFSET);
+        self.bus.write32(tcb + TCB_STATE_OFFSET, 3);
+        std.debug.print("Changed thread state: {} -> 3 (ready)\n", .{old_state});
+
+        // Verify write
+        const verify_head = self.bus.read32(RTR_QUEUE_HEAD);
+        const verify_prev = self.bus.read32(list_entry);
+        const verify_next = self.bus.read32(list_entry + 4);
+        std.debug.print("Verification: RTR head=0x{X:0>8} entry.prev=0x{X:0>8} entry.next=0x{X:0>8}\n", .{
+            verify_head, verify_prev, verify_next,
+        });
+
+        self.thread_wake_done = true;
+        std.debug.print("=== THREAD WAKE COMPLETE ===\n\n", .{});
     }
 
     /// Scan SDRAM for Rockbox framebuffer
@@ -1268,6 +1544,10 @@ pub const Emulator = struct {
             // It directly manipulated RTR queue and caused stack corruption
             // The pending_thread_wakeup flag is no longer used
 
+            // THREAD WAKE SIMULATION: Add threads to RTR queue after kernel init
+            // This is called every step but only acts once after 100 Timer1 ticks
+            self.simulateThreadWake();
+
             // DIRECT LCD APPROACH: Trigger framebuffer scan after kernel init + delay
             if (!self.fb_scan_done and self.fb_scan_trigger_cycles > 0 and self.total_cycles >= self.fb_scan_trigger_cycles) {
                 std.debug.print("\n=== DIRECT LCD APPROACH TRIGGERED ===\n", .{});
@@ -1320,16 +1600,49 @@ pub const Emulator = struct {
                     self.rtr_trace_reported = true;
                 }
 
-                // Skip after 1000 iterations - directly return to caller
-                // (RTR kickstart removed - caused crashes due to incomplete linked list setup)
-                if (self.switch_thread_count > 1000) {
+                // Check if thread was injected into RTR queue
+                if (self.thread_wake_done and self.main_thread_tcb != 0) {
+                    // Thread injection was attempted - check if RTR queue has our thread
+                    const rtr_head = self.bus.read32(RTR_QUEUE_HEAD);
+                    const expected_entry = self.main_thread_tcb + TCB_THREAD_LIST_OFFSET;
+
+                    if (rtr_head == expected_entry) {
+                        // Great! Our injected thread is at the head of RTR queue
+                        // Log this once and let scheduler continue naturally
+                        if (self.switch_thread_count == 10) {
+                            std.debug.print("SWITCH_THREAD: Injected thread found at RTR head! Letting scheduler run...\n", .{});
+                        }
+                        // Don't skip - let scheduler process the thread
+                    } else if (rtr_head != 0) {
+                        // RTR has something, but not our thread (scheduler may have processed it)
+                        if (self.switch_thread_count == 10) {
+                            std.debug.print("SWITCH_THREAD: RTR head=0x{X:0>8} (not our injected thread 0x{X:0>8})\n", .{
+                                rtr_head, expected_entry,
+                            });
+                        }
+                    } else {
+                        // RTR is still empty after injection - something's wrong
+                        if (self.switch_thread_count == 50) {
+                            std.debug.print("SWITCH_THREAD: RTR still empty after thread injection! Checking...\n", .{});
+                            std.debug.print("  Expected at 0x{X:0>8}, actual head=0x{X:0>8}\n", .{
+                                expected_entry, rtr_head,
+                            });
+                        }
+                    }
+                }
+
+                // Skip after many iterations - fallback if thread injection didn't work
+                // Increased threshold to give injected thread more chance to be found
+                if (self.switch_thread_count > 5000) {
                     const lr = self.cpu.getReg(14);
                     self.sched_skip_count += 1;
                     self.total_sched_skips += 1;
 
                     if (self.sched_skip_count <= 5 or self.sched_skip_count % 100 == 0) {
-                        std.debug.print("SWITCH_THREAD_SKIP[{}]: returning to LR=0x{X:0>8} (total={})\n", .{
-                            self.sched_skip_count, lr, self.total_sched_skips,
+                        // Log RTR queue state when skipping
+                        const rtr_head = self.bus.read32(RTR_QUEUE_HEAD);
+                        std.debug.print("SWITCH_THREAD_SKIP[{}]: LR=0x{X:0>8} total={} RTR_head=0x{X:0>8}\n", .{
+                            self.sched_skip_count, lr, self.total_sched_skips, rtr_head,
                         });
                     }
 

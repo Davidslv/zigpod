@@ -386,6 +386,76 @@ The LCD still doesn't receive Rockbox pixel writes (LCD2 bridge has 0 writes) be
 
 ---
 
+## Thread Injection Investigation (2026-01-16)
+
+### Overview
+
+After COP init simulation was working, we investigated directly injecting threads into the RTR (Ready-To-Run) queue to get the scheduler running.
+
+### Implementation
+
+**Files Modified:**
+- `src/emulator/core.zig` - Added thread wake simulation:
+  - `findMainThreadTcb()` - Scans SDRAM for valid Thread Control Blocks
+  - `simulateThreadWake()` - Adds thread to RTR queue with proper circular linked list
+  - `thread_wake_done` and `main_thread_tcb` fields for tracking
+
+**Approach:**
+1. Wait for kernel init complete + 100 Timer1 ticks
+2. Scan SDRAM for TCB candidates (valid SP, state, list pointers)
+3. Create circular linked list at TCB + 0x18 (thread_list offset)
+4. Set RTR queue head at 0x1012ACD8 to point to thread_list entry
+5. Change thread state from 1 (sleeping) to 3 (ready)
+
+### Results: FAILED
+
+**What Happened:**
+```
+=== FINDING MAIN THREAD TCB ===
+TCB candidate #1: addr=0x1010A180 SP=0x10600000 state=0 stack_LR=0x00000000
+TCB candidate #2: addr=0x10111D00 SP=0x10600000 state=1 stack_LR=0x00000000
+Selected TCB at 0x10111D00 (found 2 candidates)
+
+=== THREAD WAKE COMPLETE ===
+RTR head set to 0x10111D18
+
+SDRAM EXEC: PC=0x10111D18 instr=0x10111D18 (linked list pointer as instruction!)
+!!! UNDEFINED INSTRUCTION EXCEPTION !!!
+```
+
+**Root Cause:**
+The scheduler reads the RTR head and uses it to access thread context, then attempts to restore saved registers and jump to the thread's saved PC. However:
+
+1. **Threads never ran** - Without COP completing initialization, threads were never scheduled
+2. **No saved context** - TCBs don't have valid saved SP, LR, PC from previous execution
+3. **Garbage execution** - Scheduler jumps to garbage addresses stored in TCB
+
+**Key Discovery:**
+The TCB at 0x10111D00 has:
+- `+0x00`: SP = 0x10600000 (looks valid, but stack is empty)
+- `+0x3C`: PC = 0x1906530E (garbage, not code address)
+- `+0x40`: state = 1 (sleeping)
+
+The thread was allocated but never executed, so its saved context is uninitialized.
+
+### Conclusion
+
+Thread injection cannot work without one of:
+
+1. **Full COP emulation** - Let COP complete thread initialization so threads have valid context
+2. **Context synthesis** - Manually construct valid register context for threads (complex, version-dependent)
+3. **Accept limitation** - LCD hardware emulation is proven working; full Rockbox output requires proper dual-core emulation
+
+### Current Status
+
+Thread injection is **DISABLED** in the code. The emulator:
+- Runs 200M+ cycles without crashing
+- Reaches idle loop at 0x0007C7E0
+- LCD test pattern proves hardware works
+- Full Rockbox LCD output remains blocked by scheduler/COP dependency
+
+---
+
 ## References
 
 - `docs/reverse-engineering/LCD_OUTPUT_PLAN.md` - Original LCD strategy
