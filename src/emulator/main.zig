@@ -134,7 +134,7 @@ pub fn main() !void {
     var iram_firmware_path: ?[]const u8 = null;
     var sdram_firmware_path: ?[]const u8 = null;
     var disk_path: ?[]const u8 = null;
-    var sdram_mb: usize = 32;
+    var sdram_mb: usize = 32; // Default to 32MB for 30GB iPod 5G (Rockbox auto-detects RAM size at runtime)
     var headless = false;
     var debug = false;
     var trace_count: u64 = 0;
@@ -223,17 +223,27 @@ pub fn main() !void {
 
     // Load firmware if provided (loaded as boot ROM at address 0)
     var firmware: ?[]u8 = null;
+    var firmware_data: ?[]const u8 = null;
     if (firmware_path) |path| {
         print("Loading firmware: {s}\n", .{path});
-        firmware = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-        print("Loaded {d} bytes\n", .{firmware.?.len});
+        firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+
+        // Check for iPod bootloader header ("ipvd" signature at offset 4)
+        var fw = firmware.?;
+        if (fw.len >= 8 and fw[4] == 'i' and fw[5] == 'p' and fw[6] == 'v' and fw[7] == 'd') {
+            print("Detected iPod bootloader header, skipping 8-byte header\n", .{});
+            firmware_data = fw[8..];
+        } else {
+            firmware_data = fw;
+        }
+        print("Loaded {d} bytes\n", .{firmware_data.?.len});
     }
     defer if (firmware) |fw| allocator.free(fw);
 
     var emu = try Emulator.init(allocator, .{
         .sdram_size = sdram_mb * 1024 * 1024,
         .cpu_freq_mhz = 80,
-        .boot_rom = firmware,
+        .boot_rom = firmware_data,
         .enable_cop = enable_cop,
     });
 
@@ -267,8 +277,32 @@ pub fn main() !void {
     if (sdram_firmware_path) |path| {
         print("Loading SDRAM firmware: {s}\n", .{path});
         sdram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024); // 16MB max for large firmware
-        print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{sdram_firmware.?.len});
-        emu.loadSdram(0, sdram_firmware.?);
+
+        // Check for iPod firmware header (model identifier at offset 4)
+        // Format: 4 bytes checksum + 4 bytes model ("ipvd", "ipod", "ip6g", etc.) + firmware data
+        var fw_data = sdram_firmware.?;
+        if (fw_data.len >= 8 and (std.mem.eql(u8, fw_data[4..8], "ipvd") or
+            std.mem.eql(u8, fw_data[4..8], "ipod") or
+            std.mem.eql(u8, fw_data[4..8], "ip3g") or
+            std.mem.eql(u8, fw_data[4..8], "ip4g") or
+            std.mem.eql(u8, fw_data[4..8], "ip5g") or
+            std.mem.eql(u8, fw_data[4..8], "ip6g")))
+        {
+            print("Detected iPod firmware header (model: {s}), skipping 8-byte header\n", .{fw_data[4..8]});
+            fw_data = fw_data[8..];
+        }
+
+        print("Loaded {d} bytes at SDRAM (0x10000000)\n", .{fw_data.len});
+        emu.loadSdram(0, fw_data);
+
+        // For Apple firmware (osos.bin), emulate Boot ROM initialization:
+        // Copy SWI handler and other code from firmware to IRAM
+        // This is what real Boot ROM does before jumping to firmware entry point
+        emu.bus.initAppleFirmwareIram();
+
+        // Initialize FAT32 disk buffer with iPod_Control directory
+        // The firmware scans for this directory during boot
+        emu.bus.initFat32DiskBuffer();
     }
     defer if (sdram_firmware) |fw| allocator.free(fw);
 
@@ -277,8 +311,31 @@ pub fn main() !void {
     if (iram_firmware_path) |path| {
         print("Loading IRAM firmware: {s}\n", .{path});
         iram_firmware = try std.fs.cwd().readFileAlloc(allocator, path, 96 * 1024); // IRAM is 96KB
-        print("Loaded {d} bytes at IRAM (0x40000000)\n", .{iram_firmware.?.len});
-        emu.loadIram(iram_firmware.?);
+
+        // Check for iPod bootloader header ("ipvd" signature at offset 4)
+        var fw_data = iram_firmware.?;
+        if (fw_data.len >= 8 and fw_data[4] == 'i' and fw_data[5] == 'p' and fw_data[6] == 'v' and fw_data[7] == 'd') {
+            print("Detected iPod bootloader header, skipping 8-byte header\n", .{});
+            fw_data = fw_data[8..];
+        }
+
+        print("Loaded {d} bytes at IRAM (0x40000000)\n", .{fw_data.len});
+        emu.loadIram(fw_data);
+
+        // BOOTLOADER PATCH: The Rockbox bootloader contains a self-copy routine that
+        // expects to run from ROM and copy itself to IRAM. When loaded directly to IRAM,
+        // it copies itself over itself, then jumps via LDR PC at offset 0x28 which loads
+        // from [0x2D4] = 0x40000024 (back into the copy loop).
+        //
+        // We can't patch the data at 0x2D4 because the copy loop overwrites it.
+        // Instead, NOP the LDR PC instruction at 0x28 so execution falls through
+        // to the real boot code at 0x2C.
+        const ldr_pc_addr: u32 = 0x40000028;
+        const ldr_pc_instr = emu.bus.read32(ldr_pc_addr);
+        if (ldr_pc_instr == 0xE59FF2A4) { // LDR PC, [PC, #0x2A4]
+            emu.bus.write32(ldr_pc_addr, 0xE1A00000); // NOP
+            print("BOOTLOADER PATCH: NOP'd LDR PC at 0x{X:0>8} (was 0x{X:0>8})\n", .{ ldr_pc_addr, ldr_pc_instr });
+        }
     }
     defer if (iram_firmware) |fw| allocator.free(fw);
 
@@ -299,12 +356,49 @@ pub fn main() !void {
         emu.cpu.setPc(0x40000000);
         print("PC set to 0x40000000 (IRAM)\n", .{});
     } else if (sdram_firmware_path != null) {
-        emu.cpu.setPc(0x10000000);
-        print("PC set to 0x10000000 (SDRAM)\n", .{});
-        // Initialize COP at same entry point for dual-core firmware
-        if (enable_cop) {
-            emu.initCop(0x10000000);
-            print("COP PC set to 0x10000000 (same entry point)\n", .{});
+        // Apple firmware has a 0x800 byte header; entry point is at 0x10000800
+        // Check for "portalplayer" signature in header to detect Apple firmware
+        const is_apple_firmware = sdram_firmware != null and sdram_firmware.?.len > 0x830 and
+            std.mem.eql(u8, sdram_firmware.?[0x820..0x82C], "portalplayer");
+
+        if (is_apple_firmware) {
+            emu.cpu.setPc(0x10000800);
+            print("PC set to 0x10000800 (Apple firmware entry)\n", .{});
+            if (enable_cop) {
+                emu.initCop(0x10000800);
+                print("COP PC set to 0x10000800 (Apple firmware entry)\n", .{});
+            }
+        } else {
+            // Rockbox firmware - let crt0 configure MMAP itself
+            // Rockbox is linked at DRAMORIG=0x00000000 (virtual address 0)
+            // Physical SDRAM starts at 0x10000000
+            //
+            // IMPORTANT: Do NOT pre-enable MMAP! The crt0 code at 0x17C does:
+            //   r6 = pc & 0xFF000000
+            // When running from physical 0x1000017C, r6 = 0x10000000 (correct)
+            // When running from virtual 0x17C, r6 = 0x00000000 (wrong!)
+            //
+            // So we must start from physical address 0x10000000 (the actual entry point).
+            emu.bus.mmap_enabled = false;
+            emu.rockbox_restart_count = 1; // Skip COP sync detection since we're loading directly
+            print("MMAP disabled - crt0 will configure it\n", .{});
+
+            // Set PC to physical entry point (0x10000000 = SDRAM start, actual crt0 entry)
+            const rockbox_entry: u32 = 0x10000000;
+            emu.cpu.setPc(rockbox_entry);
+
+            // Initialize LR to 0 - Rockbox doesn't return to bootloader
+            emu.cpu.regs.r[14] = 0;
+
+            // Initialize SP (R13) to physical stack location in SDRAM
+            emu.cpu.regs.r[13] = 0x11FFFFE0;
+
+            print("PC set to physical 0x{X:0>8}\n", .{rockbox_entry});
+            print("LR=0x0 (halt on invalid return), SP=0x11FFFFE0 (physical)\n", .{});
+            if (enable_cop) {
+                emu.initCop(rockbox_entry);
+                print("COP PC set to 0x{X:0>8} (same entry point)\n", .{rockbox_entry});
+            }
         }
     }
 
@@ -569,6 +663,110 @@ pub fn main() !void {
         emu.bus.debug_mbr_value_last_addr,
         emu.bus.debug_mbr_value_last_val,
     });
+
+    // Dump MBR partition table area in IRAM (at 0x4000E7FC + 0x1BE = 0x4000E9BA)
+    print("=== MBR Partition Table in IRAM ===\n", .{});
+    const mbr_base: u32 = 0x4000E7FC;
+    const part_table_offset: u32 = 0x1BE;
+    const part1_addr = mbr_base + part_table_offset;
+    print("  MBR base: 0x{X:0>8}, Part1 at: 0x{X:0>8}\n", .{ mbr_base, part1_addr });
+    print("  Partition 1 raw bytes: ", .{});
+    var pb: u32 = 0;
+    while (pb < 16) : (pb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(part1_addr + pb)});
+    }
+    print("\n", .{});
+    // Decode partition entry
+    const p1_boot = emu.bus.read8(part1_addr + 0);
+    const p1_type = emu.bus.read8(part1_addr + 4);
+    const p1_lba = emu.bus.read32(part1_addr + 8);
+    const p1_size = emu.bus.read32(part1_addr + 12);
+    print("  Partition 1: boot=0x{X:0>2}, type=0x{X:0>2}, lba=0x{X:0>8}, size=0x{X:0>8}\n", .{
+        p1_boot, p1_type, p1_lba, p1_size,
+    });
+    // Also dump boot signature area
+    const boot_sig_addr = mbr_base + 0x1FE;
+    print("  Boot signature at 0x{X:0>8}: 0x{X:0>4}\n", .{
+        boot_sig_addr,
+        emu.bus.read16(boot_sig_addr),
+    });
+
+    // Comprehensive search for MBR in IRAM
+    print("=== Searching IRAM for MBR boot signature (0xAA55) ===\n", .{});
+    var mbr_found: u32 = 0;
+    var iram_search: u32 = 0x40000000;
+    while (iram_search < 0x40017FFC) : (iram_search += 2) {
+        const word = emu.bus.read16(iram_search);
+        if (word == 0xAA55) {
+            mbr_found += 1;
+            if (mbr_found <= 5) {
+                // Check if this looks like end of MBR (offset 0x1FE from start)
+                const potential_mbr_start = iram_search - 0x1FE;
+                const first_bytes = emu.bus.read32(potential_mbr_start);
+                print("  0xAA55 at 0x{X:0>8}, potential MBR at 0x{X:0>8} (first bytes: 0x{X:0>8})\n", .{
+                    iram_search, potential_mbr_start, first_bytes,
+                });
+                // Dump partition 1 from potential MBR
+                print("    Part1 (@+0x1BE): ", .{});
+                var pbi: u32 = 0;
+                while (pbi < 16) : (pbi += 1) {
+                    print("{X:0>2} ", .{emu.bus.read8(potential_mbr_start + 0x1BE + pbi)});
+                }
+                print("\n", .{});
+            }
+        }
+    }
+    print("  Total 0xAA55 found in IRAM: {d}\n", .{mbr_found});
+
+    // Dump key regions of supposed MBR location to understand the issue
+    print("=== Memory dump at 0x4000E7FC (supposed MBR) ===\n", .{});
+    print("  First 32 bytes: ", .{});
+    var mb: u32 = 0;
+    while (mb < 32) : (mb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x4000E7FC + mb)});
+    }
+    print("\n", .{});
+    print("  Offset 0x1BE (partition): ", .{});
+    mb = 0;
+    while (mb < 16) : (mb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x4000E7FC + 0x1BE + mb)});
+    }
+    print("\n", .{});
+    print("  Offset 0x1FE (boot sig): ", .{});
+    mb = 0;
+    while (mb < 2) : (mb += 1) {
+        print("{X:0>2} ", .{emu.bus.read8(0x4000E7FC + 0x1FE + mb)});
+    }
+    print("\n", .{});
+
+    // Also search SDRAM for MBR
+    print("=== Searching SDRAM for MBR boot signature (0xAA55) ===\n", .{});
+    var sdram_mbr_found: u32 = 0;
+    var sdram_search: u32 = 0x10000000;
+    while (sdram_search < 0x12000000) : (sdram_search += 2) {
+        const word = emu.bus.read16(sdram_search);
+        if (word == 0xAA55) {
+            sdram_mbr_found += 1;
+            if (sdram_mbr_found <= 5) {
+                const potential_mbr_start = sdram_search - 0x1FE;
+                const first_bytes = emu.bus.read32(potential_mbr_start);
+                print("  0xAA55 at 0x{X:0>8}, potential MBR at 0x{X:0>8} (first bytes: 0x{X:0>8})\n", .{
+                    sdram_search, potential_mbr_start, first_bytes,
+                });
+                // If first bytes are EB 58 90 00, this is likely the MBR
+                if ((first_bytes & 0xFFFF) == 0x58EB) {
+                    print("    ** This looks like a valid MBR! **\n", .{});
+                    print("    Part1 (@+0x1BE): ", .{});
+                    var pbi: u32 = 0;
+                    while (pbi < 16) : (pbi += 1) {
+                        print("{X:0>2} ", .{emu.bus.read8(potential_mbr_start + 0x1BE + pbi)});
+                    }
+                    print("\n", .{});
+                }
+            }
+        }
+    }
+    print("  Total 0xAA55 found in SDRAM: {d}\n", .{sdram_mbr_found});
     print("Region 0x11002xxx writes: {d}, first: 0x{X:0>8} = 0x{X:0>8}\n", .{
         emu.bus.debug_region_writes,
         emu.bus.debug_region_first_addr,

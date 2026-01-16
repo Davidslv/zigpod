@@ -58,6 +58,10 @@ pub const I2cController = struct {
     /// Current register address for multi-byte ops
     current_reg: u8,
 
+    /// I2C transfer tracing
+    trace_enabled: bool,
+    transfer_count: u64,
+
     const Self = @This();
 
     /// Initialize I2C controller
@@ -70,6 +74,8 @@ pub const I2cController = struct {
             .pcf_regs = [_]u8{0} ** 256,
             .wm_regs = [_]u16{0} ** 256,
             .current_reg = 0,
+            .trace_enabled = false,
+            .transfer_count = 0,
         };
 
         // Initialize PCF50605 with default values
@@ -82,49 +88,123 @@ pub const I2cController = struct {
     }
 
     /// Initialize PCF50605 power management defaults
+    /// Register map based on PCF50605 datasheet and Rockbox sources
     fn initPcf50605(self: *Self) void {
         // ID register (0x00) - PCF50605 identification
         self.pcf_regs[0x00] = 0x35; // PCF50605 ID
 
         // OOCS register (0x01) - On/Off control status
-        self.pcf_regs[0x01] = 0x00;
+        // Bit 0: ONKEY state (1 = pressed)
+        // Bit 1: EXTON1 state
+        // Bit 2: EXTON2 state
+        // Bit 3: EXTON3 state
+        self.pcf_regs[0x01] = 0x00; // All inputs inactive
 
-        // INT1-INT3 registers (0x02-0x04) - Interrupt status
-        self.pcf_regs[0x02] = 0x00;
-        self.pcf_regs[0x03] = 0x00;
-        self.pcf_regs[0x04] = 0x00;
+        // INT1-INT3 registers (0x02-0x04) - Interrupt status (read-to-clear)
+        // Set some bits to indicate power is ready during boot
+        // INT1 bits: 0=ONKEY1S, 1=ONKEYR, 2=ONKEYF, 3=ONKEY30S, 4=HIGHTMP, 5=LOWBAT, 6=reserved, 7=SECOND
+        // INT2 bits: 0=ALARM, 1=PSSC, 2=reserved, 3=reserved, 4=reserved, 5=CHGINS, 6=CHGREM, 7=CHGOV
+        // INT3 bits: 0=APTS, 1=reserved, 2=ONKEY30S, 3=reserved, 4=BGMODE, 5=reserved, 6=reserved, 7=THLDA
+        self.pcf_regs[0x02] = 0x02; // INT1: ONKEYR (key released = boot complete)
+        self.pcf_regs[0x03] = 0x02; // INT2: PSSC (power supply status change = power ready)
+        self.pcf_regs[0x04] = 0x00; // INT3: No pending interrupts
 
-        // OOCC1-OOCC2 (0x05-0x06) - On/Off control config
-        self.pcf_regs[0x05] = 0x00;
-        self.pcf_regs[0x06] = 0x00;
+        // INT1M-INT3M registers (0x05-0x07) - Interrupt masks
+        // 1 = masked (disabled), 0 = unmasked (enabled)
+        // Unmask power-related interrupts to allow firmware to see events
+        self.pcf_regs[0x05] = 0xFD; // INT1M: Unmask ONKEYR (bit 1)
+        self.pcf_regs[0x06] = 0xFD; // INT2M: Unmask PSSC (bit 1)
+        self.pcf_regs[0x07] = 0xFF; // INT3M: All masked
+
+        // OOCC1-OOCC2 (0x08-0x09) - On/Off control config
+        self.pcf_regs[0x08] = 0x00; // OOCC1
+        self.pcf_regs[0x09] = 0x00; // OOCC2
 
         // RTC registers (0x0A-0x11)
-        self.pcf_regs[0x0A] = 0; // seconds
-        self.pcf_regs[0x0B] = 0; // minutes
-        self.pcf_regs[0x0C] = 12; // hours
-        self.pcf_regs[0x0D] = 1; // weekday
-        self.pcf_regs[0x0E] = 1; // day
-        self.pcf_regs[0x0F] = 1; // month
-        self.pcf_regs[0x10] = 24; // year (2024 - 2000)
+        self.pcf_regs[0x0A] = 0; // RTCSC: seconds
+        self.pcf_regs[0x0B] = 0; // RTCMN: minutes
+        self.pcf_regs[0x0C] = 12; // RTCHR: hours
+        self.pcf_regs[0x0D] = 1; // RTCWD: weekday
+        self.pcf_regs[0x0E] = 1; // RTCDT: day
+        self.pcf_regs[0x0F] = 1; // RTCMT: month
+        self.pcf_regs[0x10] = 24; // RTCYR: year (2024 - 2000)
 
-        // GPOOD register (0x39) - GPIO state
-        self.pcf_regs[0x39] = 0xFF; // All GPIOs high
+        // PSSC register (0x14) - Power supply status control
+        // Set bits to indicate all power rails are good
+        // Bits indicate which regulators are supplying power
+        self.pcf_regs[0x14] = 0xFF; // All power rails OK
 
-        // ADC results (0x30-0x31)
-        self.pcf_regs[0x30] = 0x80; // ADC low byte
-        self.pcf_regs[0x31] = 0x03; // ADC high byte (battery ~3.8V)
+        // PWROKM register (0x15) - PWROK mask
+        self.pcf_regs[0x15] = 0x00;
 
-        // DCDCTIM (various regulator timing)
-        self.pcf_regs[0x20] = 0x00;
+        // Voltage regulator registers - critical for boot!
+        // DCDC1 (0x1B) - Core voltage 1.2V
+        // Bits 7:5 = ON, Bits 4:0 = voltage setting
+        self.pcf_regs[0x1B] = 0xEC; // ON + 1.2V
+
+        // DCDC2 (0x1C) - Usually OFF on iPod
+        self.pcf_regs[0x1C] = 0x0C;
+
+        // DCDEC1 (0x1D) - DCDC error control
+        self.pcf_regs[0x1D] = 0x00;
+
+        // DCDEC2 (0x1E) - DCDC2 error control
+        self.pcf_regs[0x1E] = 0x00;
+
+        // DCUDC1 (0x20) - 1.8V for various
+        self.pcf_regs[0x20] = 0xE3; // ON + 1.8V
+
+        // DCUDC2 (0x21)
+        self.pcf_regs[0x21] = 0x0F;
+
+        // IOREGC (0x23) - IO voltage 3.0V
+        self.pcf_regs[0x23] = 0xF5; // ON + 3.0V
+
+        // D1REGC1 (0x24) - Codec voltage 2.5V
+        self.pcf_regs[0x24] = 0xF0; // ON + 2.5V
+
+        // D2REGC1 (0x25)
+        self.pcf_regs[0x25] = 0xE8;
+
+        // D3REGC1 (0x26) - LCD/ATA voltage 2.6V
+        self.pcf_regs[0x26] = 0xF1; // ON + 2.6V
+
+        // LPREGC1 (0x27) - Low power regulator
+        self.pcf_regs[0x27] = 0xE8;
+
+        // ADC control registers (0x2F-0x32)
+        // ADCC1 (0x2F) - ADC control 1
+        self.pcf_regs[0x2F] = 0x00;
+
+        // ADCC2 (0x30) - ADC control 2
+        self.pcf_regs[0x30] = 0x00;
+
+        // ADCS1 (0x31) - ADC result low byte (battery reading)
+        self.pcf_regs[0x31] = 0x80;
+
+        // ADCS2 (0x32) - ADC result high byte
+        self.pcf_regs[0x32] = 0x03; // ~3.8V battery
+
+        // ADCS3 (0x33) - ADC status
+        // Bit 7: ADCRDY (1 = conversion complete)
+        self.pcf_regs[0x33] = 0x80; // Conversion always ready
+
+        // ACDC1 (0x34) - Accessory detect
+        self.pcf_regs[0x34] = 0x00;
+
+        // BVMC (0x35) - Battery voltage monitor
+        self.pcf_regs[0x35] = 0x00;
 
         // LEDC registers (0x36-0x37) - LED driver for backlight
-        // LEDC1: LED control 1 - bits control PWM mode
-        self.pcf_regs[0x36] = 0x00; // Off initially
-        // LEDC2: LED control 2 - brightness level
-        self.pcf_regs[0x37] = 0x00; // Zero brightness initially
+        self.pcf_regs[0x36] = 0x00; // LEDC1: Off initially
+        self.pcf_regs[0x37] = 0x00; // LEDC2: Zero brightness
 
-        // BVMC register (battery voltage monitor)
-        self.pcf_regs[0x32] = 0x00;
+        // GPOC1-GPOC5 (0x38-0x3C) - GPIO config
+        self.pcf_regs[0x38] = 0x00;
+        self.pcf_regs[0x39] = 0xFF; // GPOOD: All GPIOs high
+        self.pcf_regs[0x3A] = 0x00;
+        self.pcf_regs[0x3B] = 0x00;
+        self.pcf_regs[0x3C] = 0x00;
     }
 
     /// Initialize WM8758 audio codec defaults
@@ -224,10 +304,60 @@ pub const I2cController = struct {
         }
     }
 
+    /// Enable I2C tracing for debugging
+    pub fn enableTracing(self: *Self) void {
+        self.trace_enabled = true;
+    }
+
+    /// Get device name for tracing
+    fn getDeviceName(addr: u8) []const u8 {
+        return switch (addr) {
+            I2C_ADDR_PCF50605 => "PCF50605",
+            I2C_ADDR_WM8758 => "WM8758",
+            else => "UNKNOWN",
+        };
+    }
+
+    /// Get PCF50605 register name for tracing
+    fn getPcfRegName(reg: u8) []const u8 {
+        return switch (reg) {
+            0x00 => "ID",
+            0x01 => "OOCS",
+            0x02 => "INT1",
+            0x03 => "INT2",
+            0x04 => "INT3",
+            0x05 => "INT1M",
+            0x06 => "INT2M",
+            0x07 => "INT3M",
+            0x08 => "OOCC1",
+            0x09 => "OOCC2",
+            0x0A => "RTCSC",
+            0x0B => "RTCMN",
+            0x0C => "RTCHR",
+            0x1B => "DCDC1",
+            0x1C => "DCDC2",
+            0x20 => "DCUDC1",
+            0x23 => "IOREGC",
+            0x24 => "D1REGC1",
+            0x26 => "D3REGC1",
+            0x2F => "ADCC1",
+            0x30 => "ADCC2",
+            0x31 => "ADCS1",
+            0x32 => "ADCS2",
+            0x33 => "ADCS3",
+            0x36 => "LEDC1",
+            0x37 => "LEDC2",
+            0x39 => "GPOOD",
+            else => "REG",
+        };
+    }
+
     /// Execute I2C transfer based on control register
     fn executeTransfer(self: *Self) void {
         const slave_addr: u8 = @truncate(self.addr & 0x7F);
         const is_read = (self.addr & 0x80) != 0;
+
+        self.transfer_count += 1;
 
         // Set busy, then immediately complete (no real I2C timing)
         self.status = STATUS_BUSY;
@@ -239,6 +369,16 @@ pub const I2cController = struct {
             self.data[1] = self.i2cDeviceRead(slave_addr, reg_addr +% 1);
             self.data[2] = self.i2cDeviceRead(slave_addr, reg_addr +% 2);
             self.data[3] = self.i2cDeviceRead(slave_addr, reg_addr +% 3);
+
+            if (self.trace_enabled) {
+                std.debug.print("I2C READ  #{d}: {s} reg 0x{X:0>2} ({s}) = 0x{X:0>2}\n", .{
+                    self.transfer_count,
+                    getDeviceName(slave_addr),
+                    reg_addr,
+                    if (slave_addr == I2C_ADDR_PCF50605) getPcfRegName(reg_addr) else "REG",
+                    self.data[0],
+                });
+            }
         } else {
             // Write operation - first byte is register address
             self.current_reg = @truncate(self.data[0] & 0xFF);
@@ -257,7 +397,25 @@ pub const I2cController = struct {
                         else => 0,
                     };
                     self.i2cDeviceWrite(slave_addr, self.current_reg +% (i - 1), data_byte);
+
+                    if (self.trace_enabled) {
+                        std.debug.print("I2C WRITE #{d}: {s} reg 0x{X:0>2} ({s}) = 0x{X:0>2}\n", .{
+                            self.transfer_count,
+                            getDeviceName(slave_addr),
+                            self.current_reg +% (i - 1),
+                            if (slave_addr == I2C_ADDR_PCF50605) getPcfRegName(self.current_reg +% (i - 1)) else "REG",
+                            data_byte,
+                        });
+                    }
                 }
+            } else if (self.trace_enabled) {
+                // Just setting register address for a read
+                std.debug.print("I2C ADDR  #{d}: {s} set reg 0x{X:0>2} ({s})\n", .{
+                    self.transfer_count,
+                    getDeviceName(slave_addr),
+                    self.current_reg,
+                    if (slave_addr == I2C_ADDR_PCF50605) getPcfRegName(self.current_reg) else "REG",
+                });
             }
         }
 

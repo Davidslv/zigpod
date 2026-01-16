@@ -120,6 +120,9 @@ pub const Timers = struct {
     /// RTC seconds counter
     rtc: u32,
 
+    /// Debug: count of USEC_TIMER reads
+    debug_usec_reads: u32,
+
     /// Accumulated cycles for USEC_TIMER
     usec_cycles: u64,
 
@@ -148,6 +151,7 @@ pub const Timers = struct {
             .timer2 = Timer.init(),
             .usec_timer = 0,
             .rtc = 0,
+            .debug_usec_reads = 0,
             .usec_cycles = 0,
             .rtc_usec = 0,
             .cpu_freq_mhz = cpu_freq_mhz,
@@ -182,6 +186,13 @@ pub const Timers = struct {
         if (self.timer1.tick(cpu_cycles, self.cpu_freq_mhz)) {
             if (self.int_ctrl) |ctrl| {
                 ctrl.assertInterrupt(.timer1);
+                ctrl.debug_timer1_fires += 1;
+                // Debug: print when Timer1 fires (first 5, then every 100)
+                if (ctrl.debug_timer1_fires <= 5 or ctrl.debug_timer1_fires % 100 == 0) {
+                    std.debug.print("TIMER1_FIRE: #{} raw_status=0x{X:0>8} cpu_enable=0x{X:0>8}\n", .{
+                        ctrl.debug_timer1_fires, ctrl.raw_status, ctrl.cpu_enable,
+                    });
+                }
             }
         }
 
@@ -193,23 +204,67 @@ pub const Timers = struct {
         }
     }
 
+    /// Force fire a timer1 IRQ (for RTOS kickstart debugging)
+    pub fn forceTimerIrq(self: *Self) void {
+        if (self.int_ctrl) |ctrl| {
+            std.debug.print("TIMER: Forcing timer1 IRQ assertion\n", .{});
+            ctrl.assertInterrupt(.timer1);
+        } else {
+            std.debug.print("TIMER: Cannot force IRQ - no interrupt controller\n", .{});
+        }
+    }
+
     /// Read register
     pub fn read(self: *const Self, offset: u32) u32 {
-        return switch (offset) {
+        // Need mutable self for timer acknowledgment side effects
+        const self_mut = @constCast(self);
+
+        const value = switch (offset) {
             REG_TIMER1_CFG => self.timer1.config,
-            REG_TIMER1_VAL => self.timer1.value,
+            REG_TIMER1_VAL => blk: {
+                // CRITICAL FIX: Reading TIMER1_VAL acknowledges the interrupt!
+                // Rockbox does: TIMER1_VAL; /* Read value to ack IRQ */
+                self_mut.timer1.acknowledge();
+                if (self_mut.int_ctrl) |ctrl| {
+                    ctrl.clearInterrupt(.timer1);
+                }
+                break :blk self.timer1.value;
+            },
             REG_TIMER2_CFG => self.timer2.config,
-            REG_TIMER2_VAL => self.timer2.value,
+            REG_TIMER2_VAL => blk: {
+                // Reading TIMER2_VAL also acknowledges the interrupt
+                self_mut.timer2.acknowledge();
+                if (self_mut.int_ctrl) |ctrl| {
+                    ctrl.clearInterrupt(.timer2);
+                }
+                break :blk self.timer2.value;
+            },
             REG_USEC_TIMER => self.usec_timer,
             REG_RTC => self.rtc,
             else => 0,
         };
+        // Debug: trace USEC_TIMER reads
+        if (offset == REG_USEC_TIMER) {
+            const print = std.debug.print;
+            // Only print first few and when value is high
+            if (self.debug_usec_reads < 5 or value > 0x1000000) {
+                print("USEC_TIMER READ: value=0x{X:0>8} usec_cycles={}\n", .{ value, self.usec_cycles });
+            }
+            self_mut.debug_usec_reads += 1;
+        }
+        return value;
     }
 
     /// Write register
     pub fn write(self: *Self, offset: u32, value: u32) void {
         switch (offset) {
-            REG_TIMER1_CFG => self.timer1.setConfig(value),
+            REG_TIMER1_CFG => {
+                const enabled = (value & Timer.ENABLE_BIT) != 0;
+                const repeat = (value & Timer.REPEAT_BIT) != 0;
+                const count = value & Timer.COUNT_MASK;
+                std.debug.print("TIMER1_CFG: value=0x{X:0>8} enabled={} repeat={} count={}\n", .{ value, enabled, repeat, count });
+                self.timer1.setConfig(value);
+            },
             REG_TIMER1_VAL => {
                 self.timer1.acknowledge();
                 if (self.int_ctrl) |ctrl| {

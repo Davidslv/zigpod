@@ -12,7 +12,23 @@
       "Bash(grep:*)",
       "Bash(zig build:*)",
       "Bash(echo:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(ffmpeg:*)",
+      "Bash(ffprobe:*)",
+      "Bash(xargs:*)",
+      "Bash(/tmp/convert_dsd_to_aiff.sh)",
+      "Bash(/tmp/convert_dsd.sh)",
+      "Bash(__NEW_LINE_5ec4e8b98a5091c5__ echo \"\")",
+      "Bash(# Check if AtomicParsley or kid3-cli is available for embedding artwork which AtomicParsley kid3-cli eyeD3 || echo \"\"No tagging tools found\"\" # Try using ffmpeg to embed artwork with ID3v2 SRC=\"\"/Volumes/music/DSD/Chasing The Dragon - Audiophile Recordings/TRIBUTE TO ELLA FITZGERALD BY CLARE TEAL AND THE SYD LAWRENCE ORCHESTRA 24 192\"\" DST=\"\"/Volumes/music/AIFF/Chasing The Dragon - Audiophile Recordings/TRIBUTE TO ELLA FITZGERALD BY CLARE TEAL AND THE SYD LAWRENCE ORCHESTRA 24 192\"\" COVER=\"\"$SRC/cover.jpg\"\" # Test on one file with embedded artwork ffmpeg -y -hide_banner -loglevel error \\\\ -i \"\"$SRC/01 I''ve Got You Under My Skin.wav\"\" \\\\ -i \"\"$COVER\"\" \\\\ -map 0:a -map 1:0 \\\\ -map_metadata 0 \\\\ -c:a pcm_s32be \\\\ -c:v copy \\\\ -id3v2_version 3 \\\\ -metadata:s:v title=\"\"Album cover\"\" \\\\ -metadata:s:v comment=\"\"Cover \\(front\\)\"\" \\\\ \"\"/tmp/test_with_cover.aiff\"\" </dev/null 2>&1 echo \"\"Checking streams...\"\" ffprobe \"\"/tmp/test_with_cover.aiff\"\" 2>&1)",
+      "Bash(# Quick check if kid3 is available via brew brew search kid3)",
+      "Bash(brew install:*)",
+      "Bash(__NEW_LINE_17b02cdd64f67de0__ echo \"\")",
+      "Bash(__NEW_LINE_e273849fe46fca69__ echo \"\")",
+      "Bash(__NEW_LINE_f18bd9e4cd8d820b__ echo \"\")",
+      "Bash(system_profiler:*)",
+      "Bash(diskutil list:*)",
+      "Bash(xxd:*)",
+      "Bash(binwalk:*)"
     ]
   }
 }

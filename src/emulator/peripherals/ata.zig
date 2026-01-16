@@ -344,15 +344,15 @@ pub const AtaController = struct {
             }
             debug_disk_read_success += 1;
 
-            // Debug: dump directory entries for sectors 2055 and 2056
-            if (lba == 2055 or lba == 2056 or lba == 2057) {
+            // Debug: dump directory entries for root dir and .rockbox dir
+            if (lba == 6144 or lba == 6145 or lba == 6146) {
                 std.debug.print("=== Sector {} ", .{lba});
-                if (lba == 2055) {
+                if (lba == 6144) {
                     std.debug.print("(ROOT DIR) ===\n", .{});
-                } else if (lba == 2056) {
+                } else if (lba == 6145) {
                     std.debug.print("(.ROCKBOX DIR) ===\n", .{});
                 } else {
-                    std.debug.print("(FILE CONTENT) ===\n", .{});
+                    std.debug.print("(ROCKBOX.IPOD FILE DATA) ===\n", .{});
                     // Hex dump first 32 bytes of file content
                     std.debug.print("  First 32 bytes: ", .{});
                     for (self.data_buffer[0..32]) |b| {
@@ -360,7 +360,7 @@ pub const AtaController = struct {
                     }
                     std.debug.print("\n", .{});
                 }
-                if (lba != 2057) {
+                if (lba != 6146) {
                     var entry_idx: usize = 0;
                     while (entry_idx < 8) : (entry_idx += 1) {
                         const offset = entry_idx * 32;
@@ -459,6 +459,13 @@ pub const AtaController = struct {
                     (@as(u32, self.data_buffer[0x1CB]) << 8) |
                     (@as(u32, self.data_buffer[0x1CC]) << 16) |
                     (@as(u32, self.data_buffer[0x1CD]) << 24);
+                // Debug: print MBR info immediately when sector 0 is loaded
+                std.debug.print("ATA SECTOR 0 LOADED: MBR sig=0x{X:0>4}, part1 type=0x{X:0>2}, lba={d}, sectors={d}\n", .{
+                    debug_mbr_sig,
+                    debug_part1_type,
+                    debug_part1_lba,
+                    debug_part1_sectors,
+                });
             } else {
                 debug_sector0_in_buffer = false;
             }
@@ -558,6 +565,12 @@ pub const AtaController = struct {
     pub var debug_s0_word_at_1c2: u16 = 0; // Word at 0x1C2 (type byte)
     pub var debug_s0_word_at_1fe: u16 = 0; // Word at 0x1FE (boot sig)
 
+    // Firmware checksum tracking (for debugging Bad checksum issue)
+    pub var debug_fw_checksum: u64 = 0; // Running sum of all firmware bytes
+    pub var debug_fw_bytes_counted: u64 = 0; // Total bytes counted
+    pub var debug_fw_tracking_active: bool = false; // Whether we're tracking firmware data
+    pub var debug_fw_header_skipped: bool = false; // Whether we've skipped the 8-byte header
+
     /// Read register
     pub fn read(self: *Self, offset: u32) u32 {
         return switch (offset) {
@@ -589,9 +602,69 @@ pub const AtaController = struct {
                     0;
                 const word: u32 = @as(u32, lo) | (@as(u32, hi) << 8);
 
+                // Track firmware checksum (LBA 13215 is header, 13216+ is firmware data)
+                const current_lba = self.getLba();
+                if (current_lba == 13215 and self.buffer_pos == 0) {
+                    // Start tracking from the header sector
+                    debug_fw_tracking_active = true;
+                    debug_fw_header_skipped = false;
+                    debug_fw_checksum = 0;
+                    debug_fw_bytes_counted = 0;
+                    // Print first 16 bytes of header sector
+                    std.debug.print("\n*** FW HEADER SECTOR (LBA 13215) ***\n", .{});
+                    std.debug.print("  First 16 bytes: ", .{});
+                    for (self.data_buffer[0..16]) |b| {
+                        std.debug.print("{X:0>2} ", .{b});
+                    }
+                    std.debug.print("\n", .{});
+                }
+                if (debug_fw_tracking_active and current_lba >= 13000) {
+                    // Only track bytes from firmware LBAs (>=13000), not FAT table reads
+                    // Skip first 8 bytes (header: checksum + model)
+                    if (current_lba == 13215 and self.buffer_pos < 8) {
+                        // Still in header, don't count
+                    } else {
+                        // Count these bytes
+                        debug_fw_checksum += @as(u64, lo);
+                        debug_fw_bytes_counted += 1;
+                        if (self.buffer_pos + 1 < self.buffer_len) {
+                            debug_fw_checksum += @as(u64, hi);
+                            debug_fw_bytes_counted += 1;
+                        }
+                        // Print first 32 bytes of firmware data
+                        if (debug_fw_bytes_counted <= 32) {
+                            std.debug.print("FW[{}]: lo=0x{X:0>2} hi=0x{X:0>2}\n", .{ debug_fw_bytes_counted - 2, lo, hi });
+                        }
+                    }
+                    // Print each byte from 2240 to 2310 to find exact divergence point
+                    if (debug_fw_bytes_counted >= 2240 and debug_fw_bytes_counted <= 2310) {
+                        std.debug.print("ATA[{}]: lo=0x{X:0>2} hi=0x{X:0>2} sum=0x{X:0>8}\n", .{
+                            debug_fw_bytes_counted,
+                            lo,
+                            hi,
+                            @as(u32, @truncate(debug_fw_checksum)),
+                        });
+                    }
+                    // Print final checksum when we reach the expected firmware size (774004 bytes)
+                    // Add MODEL_NUMBER (5) to match Rockbox's calculation
+                    if (debug_fw_bytes_counted >= 774004 and debug_fw_bytes_counted < 774006) {
+                        const final_sum = @as(u32, @truncate(debug_fw_checksum)) + 5; // +5 for MODEL_NUMBER
+                        std.debug.print("\n*** ATA FIRMWARE CHECKSUM COMPLETE ***\n", .{});
+                        std.debug.print("  Bytes counted: {}\n", .{debug_fw_bytes_counted});
+                        std.debug.print("  Raw sum: 0x{X:0>8}\n", .{@as(u32, @truncate(debug_fw_checksum))});
+                        std.debug.print("  With MODEL_NUMBER (5): 0x{X:0>8}\n", .{final_sum});
+                        std.debug.print("  Expected: 0x04D7ABD6\n", .{});
+                        std.debug.print("  Difference: {d}\n", .{@as(i64, final_sum) - 0x04D7ABD6});
+                    }
+                }
+
                 // Track partition-related word returns for sector 0
                 if (debug_sector0_in_buffer) {
                     debug_s0_words_read += 1;
+                    // Debug: print partition table area words when reading sector 0
+                    if (self.buffer_pos >= 0x1BE and self.buffer_pos <= 0x1CE) {
+                        std.debug.print("S0 DATA @0x{X:0>3}: 0x{X:0>4}\n", .{ self.buffer_pos, word });
+                    }
                     // Capture first 8 words of first sector 0 read
                     if (!debug_first_8_captured and self.buffer_pos < 16) {
                         debug_first_8_words[self.buffer_pos / 2] = @truncate(word);
@@ -624,7 +697,7 @@ pub const AtaController = struct {
                 // Check if sector is complete
                 if (self.buffer_pos >= self.buffer_len) {
                     const completed_lba = self.getLba();
-                    if (completed_lba == 2055 or completed_lba == 2056 or completed_lba == 2057) {
+                    if (completed_lba == 6144 or completed_lba == 6145 or completed_lba == 6146) {
                         std.debug.print("ATA: Completed reading sector {}, {} words read\n", .{ completed_lba, self.buffer_len / 2 });
                     }
                     if (self.sectors_remaining > 0) {

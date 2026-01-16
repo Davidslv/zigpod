@@ -14,7 +14,7 @@
 //! - 0x38: PLL_DIV - PLL divider
 //! - 0x3C: PLL_STATUS - PLL lock status (read-only)
 //! - 0x40: DEV_INIT1 - Device init 1
-//! - 0x44: DEV_INIT2 - Device init 2
+//! - 0x44: CACHE_PRIORITY - Cache priority configuration
 //! - 0x80: CACHE_CTL - Cache control
 //!
 //! Additional registers for hardware identification:
@@ -37,6 +37,17 @@ pub const CopState = enum {
     running,
     /// COP halted due to error or debug
     halted,
+};
+
+/// COP initialization state machine
+/// Tracks simulated COP kernel initialization progress
+pub const CopInitState = enum {
+    /// COP init hasn't started yet
+    not_started,
+    /// COP is doing simulated initialization work
+    in_progress,
+    /// COP init is complete, CPU can proceed
+    complete,
 };
 
 /// Device enable bits (DEV_EN)
@@ -69,9 +80,9 @@ pub const SystemController = struct {
     dev_en: u32,
     dev_en2: u32,
 
-    /// Device init registers
+    /// Device init / cache registers
     dev_init1: u32,
-    dev_init2: u32,
+    cache_priority: u32,
 
     /// Clock configuration
     clock_source: u32,
@@ -91,6 +102,37 @@ pub const SystemController = struct {
 
     /// COP state machine
     cop_state: CopState,
+
+    /// Counter for COP wake requests (helps distinguish boot vs kernel wake)
+    cop_wake_count: u32,
+
+    /// Countdown for fake COP wake acknowledgment
+    /// When > 0, COP_CTL reads return PROC_SLEEP=0 (COP awake/acknowledged)
+    /// Simulates COP waking up, acknowledging, and going back to sleep
+    cop_wake_ack_countdown: u32,
+
+    /// Flag: Kernel initialization is complete
+    /// When false: COP_CTL returns "awake" (bit 31 = 0) to let kernel init complete
+    /// When true: COP_CTL returns "sleeping" (bit 31 = 1) so wake_core can exit
+    kernel_init_complete: bool,
+
+    /// Flag: Thread wakeup is pending (COP wake response simulation)
+    /// Set when COP receives wake signal after kernel_init_complete
+    pending_thread_wakeup: bool,
+
+    /// Counter: Cycles until thread wakeup executes
+    /// Gives firmware time to settle before we manipulate RTR queue
+    thread_wakeup_countdown: u32,
+
+    /// COP initialization state machine
+    /// Simulates COP doing kernel init work while CPU waits
+    cop_init_state: CopInitState,
+
+    /// Cycles until COP init completes (simulated)
+    cop_init_countdown: u32,
+
+    /// Set when CPU tries to sleep during COP init
+    cpu_waiting_for_cop_init: bool,
 
     /// Device reset callback (called when a device is reset)
     reset_callback: ?*const fn (Device) void,
@@ -113,8 +155,8 @@ pub const SystemController = struct {
     const REG_PLL_CONTROL: u32 = 0x34;
     const REG_PLL_DIV: u32 = 0x38;
     const REG_PLL_STATUS: u32 = 0x3C;
-    const REG_DEV_INIT1: u32 = 0x40;
-    const REG_DEV_INIT2: u32 = 0x44;
+    const REG_DEV_INIT1: u32 = 0x40; // Unknown purpose, not the same as 0x70000010
+    const REG_CACHE_PRIORITY: u32 = 0x44; // CACHE_PRIORITY register
     const REG_CACHE_CTL: u32 = 0x80;
 
     /// Processor control registers (base 0x60007000, offset 0x1000 from sys_ctrl)
@@ -143,7 +185,7 @@ pub const SystemController = struct {
             .dev_en = 0,
             .dev_en2 = 0,
             .dev_init1 = 0,
-            .dev_init2 = 0,
+            .cache_priority = 0x3F, // Default: all priorities enabled
             .clock_source = 0,
             .pll_control = 0,
             .pll_div = 1,
@@ -153,6 +195,14 @@ pub const SystemController = struct {
             .cpu_ctl = 0,
             .cop_ctl = DEFAULT_COP_CTL,
             .cop_state = .disabled,
+            .cop_wake_count = 0,
+            .cop_wake_ack_countdown = 0,
+            .kernel_init_complete = false,
+            .pending_thread_wakeup = false,
+            .thread_wakeup_countdown = 0,
+            .cop_init_state = .not_started,
+            .cop_init_countdown = 0,
+            .cpu_waiting_for_cop_init = false,
             .reset_callback = null,
             .enable_callback = null,
             .is_cop_access = false,
@@ -287,7 +337,7 @@ pub const SystemController = struct {
     }
 
     /// Read register
-    pub fn read(self: *const Self, offset: u32) u32 {
+    pub fn read(self: *Self, offset: u32) u32 {
         return switch (offset) {
             REG_CHIP_ID => CHIP_ID_PP5021C,
             REG_DEV_RS => self.dev_rs,
@@ -299,10 +349,33 @@ pub const SystemController = struct {
             REG_PLL_DIV => self.pll_div,
             REG_PLL_STATUS => self.clock_status, // PLL locked status
             REG_DEV_INIT1 => self.dev_init1,
-            REG_DEV_INIT2 => self.dev_init2,
+            REG_CACHE_PRIORITY => self.cache_priority,
             REG_CACHE_CTL => self.cache_ctl,
-            REG_CPU_CTL => self.cpu_ctl,
-            REG_COP_CTL => self.cop_ctl,
+            REG_CPU_CTL => blk: {
+                // CPU should always appear AWAKE (bit 31 = 0)
+                break :blk self.cpu_ctl & ~@as(u32, 0x80000000);
+            },
+            // COP_CTL: ALWAYS return SLEEPING (bit 31 = 1)
+            //
+            // CRITICAL: Both boot sync loops AND wake_core() exit when PROC_SLEEP=1:
+            // - crt0 sync loops: `while (!(COP_CTL & 0x80000000))` - exit when sleeping
+            // - wake_core: `if (COP_CTL & PROC_SLEEP) return` - exit when sleeping
+            //
+            // By ALWAYS returning SLEEPING, all COP synchronization code exits
+            // immediately. This is correct because we don't emulate COP - it's
+            // effectively always "done" (sleeping). The kernel will:
+            // 1. Pass all crt0 sync loops instantly (COP appears sleeping)
+            // 2. Run kernel_init() including thread creation
+            // 3. wake_core() returns immediately (COP sleeping = nothing to wake)
+            // 4. Scheduler runs, main thread progresses to LCD init
+            //
+            // PREVIOUS BUG: We returned AWAKE after kernel_init, which caused
+            // wake_core() to spin forever waiting for COP to go back to sleep.
+            REG_COP_CTL => blk: {
+                // Always return SLEEPING - COP is not emulated, it's permanently "done"
+                // Value: bit 31 = 1 (SLEEPING), ready flags
+                break :blk 0xC000FE00;
+            },
             else => 0,
         };
     }
@@ -310,6 +383,17 @@ pub const SystemController = struct {
     /// Read PROC_ID - returns different value for CPU vs COP
     pub fn readProcId(self: *const Self) u32 {
         return if (self.is_cop_access) PROC_ID_COP else PROC_ID_CPU;
+    }
+
+    /// Mark kernel initialization as complete
+    /// After this, COP_CTL will return "sleeping" (bit 31 = 1) so wake_core exits
+    pub fn setKernelInitComplete(self: *Self) void {
+        self.kernel_init_complete = true;
+    }
+
+    /// Check if kernel init is complete
+    pub fn isKernelInitComplete(self: *const Self) bool {
+        return self.kernel_init_complete;
     }
 
     /// Write register
@@ -361,7 +445,7 @@ pub const SystemController = struct {
             },
             REG_DEV_EN2 => self.dev_en2 = value,
             REG_DEV_INIT1 => self.dev_init1 = value,
-            REG_DEV_INIT2 => self.dev_init2 = value,
+            REG_CACHE_PRIORITY => self.cache_priority = value,
             REG_CLOCK_SOURCE => self.clock_source = value,
             REG_PLL_CONTROL => {
                 self.pll_control = value;
@@ -371,27 +455,78 @@ pub const SystemController = struct {
             REG_PLL_DIV => self.pll_div = value,
             REG_PLL_STATUS => {}, // Read-only
             REG_CACHE_CTL => self.cache_ctl = value,
-            REG_CPU_CTL => self.cpu_ctl = value,
+            REG_CPU_CTL => {
+                // CPU_CTL handles CPU sleep/wake state
+                // When CPU writes 0x80000000 (PROC_SLEEP), it's putting itself to sleep
+                // and waiting for COP to wake it by writing 0
+                const PROC_SLEEP: u32 = 0x80000000;
+                if ((value & PROC_SLEEP) != 0) {
+                    // CPU trying to sleep
+                    if (self.cop_init_state == .in_progress) {
+                        // CPU is waiting for COP to finish init
+                        // Start countdown before waking CPU
+                        self.cpu_waiting_for_cop_init = true;
+                        self.cop_init_countdown = 100_000; // ~100K cycles for COP to "init"
+                        self.cpu_ctl = value; // Keep CPU in sleep state
+                        std.debug.print("COP_INIT: CPU sleeping, waiting for simulated COP init ({} cycles)\n", .{self.cop_init_countdown});
+                    } else {
+                        // Normal case: immediately wake CPU (COP sync bypass)
+                        self.cpu_ctl = 0; // Auto-wake
+                    }
+                } else {
+                    self.cpu_ctl = value;
+                }
+            },
             REG_COP_CTL => {
-                const old = self.cop_ctl;
-                self.cop_ctl = value;
-
-                // PROC_SLEEP bit (bit 31)
+                // COP_CTL handles coprocessor sleep/wake state
+                // Bit 31 (PROC_SLEEP) indicates COP is sleeping
+                // Writing 0 clears the sleep bit = wake request
+                // Writing 0x80000000 sets the sleep bit = put to sleep
                 const PROC_SLEEP: u32 = 0x80000000;
 
-                // Check for wake request (clearing PROC_SLEEP)
-                if ((old & PROC_SLEEP) != 0 and (value & PROC_SLEEP) == 0) {
-                    // Wake COP: sleeping -> waking
+                // Debug: Log ALL writes to COP_CTL
+                if (self.cop_wake_count < 10 or self.cop_wake_count % 100 == 0) {
+                    std.debug.print("COP_CTL_WRITE: value=0x{X:0>8}, kernel_init={}\n", .{ value, self.kernel_init_complete });
+                }
+
+                // Store the value
+                self.cop_ctl = value;
+
+                // Handle wake request
+                // In Rockbox, wake_core() writes 0 to clear sleep bit (wake the core)
+                // We detect ANY write to COP_CTL as a potential wake signal
+                const is_wake_request = (value & PROC_SLEEP) == 0; // Writing 0 = wake
+                const is_sleep_request = (value & PROC_SLEEP) != 0; // Writing 0x80000000 = sleep
+
+                if (is_wake_request or is_sleep_request) {
+                    self.cop_wake_count += 1;
+                    // Only start countdown if not already counting (prevents reset on every write)
+                    if (self.cop_wake_ack_countdown == 0) {
+                        // COP will appear "awake" for 5 reads then go back to sleep
+                        self.cop_wake_ack_countdown = 5;
+                    }
                     if (self.cop_state == .sleeping) {
                         self.cop_state = .waking;
                     }
-                }
 
-                // Check for sleep request (setting PROC_SLEEP)
-                if ((old & PROC_SLEEP) == 0 and (value & PROC_SLEEP) != 0) {
-                    // Sleep COP: running/waking -> sleeping
-                    if (self.cop_state == .running or self.cop_state == .waking) {
-                        self.cop_state = .sleeping;
+                    // COP INIT SIMULATION: When CPU first wakes COP, start simulated init
+                    // This happens during core_thread_init() when CPU does wake_core(COP)
+                    if (is_wake_request) {
+                        if (self.cop_wake_count <= 5 or self.cop_wake_count % 100 == 0) {
+                            std.debug.print("COP_CTL_WAKE: count={}, cop_init_state={s}, kernel_init={}\n", .{
+                                self.cop_wake_count, @tagName(self.cop_init_state), self.kernel_init_complete,
+                            });
+                        }
+
+                        // Start COP init on first wake request (during kernel init)
+                        if (self.cop_init_state == .not_started and self.cop_wake_count == 1) {
+                            self.cop_init_state = .in_progress;
+                            std.debug.print("COP_INIT: Starting simulated COP initialization\n", .{});
+                        }
+
+                        // NOTE: The old pending_thread_wakeup mechanism is DISABLED
+                        // It directly manipulated RTR queue and caused stack corruption
+                        // Instead, we rely on COP init simulation to delay CPU appropriately
                     }
                 }
             },
@@ -409,7 +544,7 @@ pub const SystemController = struct {
     }
 
     fn readWrapper(ctx: *anyopaque, offset: u32) u32 {
-        const self: *const Self = @ptrCast(@alignCast(ctx));
+        const self: *Self = @ptrCast(@alignCast(ctx));
         return self.read(offset);
     }
 

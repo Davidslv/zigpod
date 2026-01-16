@@ -67,11 +67,19 @@ pub const Exception = enum(u3) {
 
     /// Calculate the return address offset
     /// This is subtracted from PC to get the actual return address
+    ///
+    /// NOTE: Our emulator increments PC by 4 (ARM) or 2 (Thumb) BEFORE executing
+    /// the instruction. So when we enter exception, PC already points to the
+    /// next instruction. For SWI, we want LR = next instruction, so offset = 0.
+    /// For other exceptions, the offset accounts for whether we want to re-execute
+    /// the faulting instruction (Data Abort) or continue after it.
     pub fn returnOffset(self: Exception, is_thumb: bool) u32 {
         return switch (self) {
             .reset => 0,
             .undefined => if (is_thumb) 2 else 4,
-            .swi => if (is_thumb) 2 else 4,
+            // SWI: PC is already at next instruction, so no offset needed
+            // LR should point to instruction after SWI
+            .swi => 0,
             .prefetch_abort => 4,
             .data_abort => 8,
             .irq => 4,
@@ -119,16 +127,26 @@ pub fn enterException(regs: *RegisterFile, exception: Exception) u32 {
     return 3;
 }
 
-/// Return from exception
-/// Restores CPSR from SPSR and returns to saved address
-/// Call this when executing:
-/// - MOVS PC, LR
-/// - SUBS PC, LR, #offset
-/// - LDM with PC and S bit
+/// Return from exception (for MOVS PC, LR and SUBS PC, LR, #offset)
+/// Restores CPSR from SPSR and returns to saved address in LR
 pub fn returnFromException(regs: *RegisterFile) void {
+    returnFromExceptionWithPc(regs, false);
+}
+
+/// Return from exception for LDM with PC and S bit
+/// PC was already loaded by LDM, so we only restore CPSR from SPSR
+pub fn returnFromExceptionLdm(regs: *RegisterFile) void {
+    returnFromExceptionWithPc(regs, true);
+}
+
+/// Internal: return from exception, optionally preserving a PC that was already loaded
+fn returnFromExceptionWithPc(regs: *RegisterFile, pc_already_loaded: bool) void {
     // Get SPSR
     if (regs.getSpsr()) |spsr| {
-        // Get return address from current LR
+        // Save the PC that was loaded by LDM (before mode switch might change it)
+        const loaded_pc = regs.r[15];
+
+        // Get return address from current LR (only used if PC wasn't loaded by LDM)
         const return_addr = regs.r[14];
 
         // Restore CPSR from SPSR (this also changes mode)
@@ -141,8 +159,14 @@ pub fn returnFromException(regs: *RegisterFile) void {
         // Fully restore CPSR
         regs.cpsr = new_psr;
 
-        // Set PC to return address
-        regs.set(15, return_addr);
+        // Set PC to return address (either the one loaded by LDM or from LR)
+        if (pc_already_loaded) {
+            // LDM already loaded PC, just restore it after mode switch
+            regs.set(15, loaded_pc);
+        } else {
+            // MOVS/SUBS - use LR as return address
+            regs.set(15, return_addr);
+        }
     }
 }
 
