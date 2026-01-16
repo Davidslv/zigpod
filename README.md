@@ -1,12 +1,14 @@
-# ZigPod OS
+# ZigPod
 
 > **WARNING: This project is under active development and is NOT ready for general use.**
 >
-> Hardware support is incomplete. Audio playback does not work yet. Storage access is being debugged.
-> If you flash this to your iPod, expect it to not function as a music player.
-> The simulator works for development purposes. See [Current Status](#current-status) below.
+> This repository contains two related projects:
+> 1. **ZigPod OS** - A custom operating system for iPod (early development, not functional)
+> 2. **PP5021C Emulator** - An iPod hardware emulator (functional, runs Rockbox firmware)
+>
+> **Neither component is ready for end-user use.** See [Current Status](#current-status) for details.
 
-A custom operating system for the Apple iPod Video (5th Generation), written entirely in Zig.
+A custom operating system and hardware emulator for the Apple iPod Video (5th Generation), written entirely in Zig.
 
 <p align="center">
   <img src="docs/assets/zigpod-simulator.png" alt="ZigPod Simulator - RetroFlow Design" width="500">
@@ -14,56 +16,102 @@ A custom operating system for the Apple iPod Video (5th Generation), written ent
   <em>ZigPod Simulator with RetroFlow design - featuring animated waveform visualizer</em>
 </p>
 
+## What Actually Works Today
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **PP5021C Emulator** | ✅ Partial | Boots Rockbox, LCD works, threads blocked by missing COP |
+| **ZigPod OS** | ❌ Early Dev | UI framework exists, not bootable on real hardware |
+| **Simulator** | ✅ Works | SDL2 GUI displays output |
+| **Hardware Flash** | ⚠️ Risky | Untested, may brick device |
+
+**Read the full development journey: [JOURNEY.md](JOURNEY.md)**
+
 ## Features
 
-### Audio Playback
+> **Note**: Features marked with 🚧 are implemented but not fully tested or working end-to-end.
+
+### PP5021C Emulator
+- ✅ **ARM7TDMI CPU**: Full 32-bit ARM and 16-bit Thumb instruction sets
+- ✅ **Memory System**: SDRAM (32/64MB), IRAM (128KB), Boot ROM
+- ✅ **LCD Display**: 320x240 RGB565 via SDL2 window
+- ✅ **Storage**: ATA controller reads FAT32 disk images
+- ✅ **Peripherals**: Timers, GPIO, I2C, I2S, DMA, Interrupt Controller
+- ✅ **Firmware Boot**: Loads and executes Rockbox bootloader + main firmware
+- 🚧 **COP Emulation**: Not implemented - blocks thread scheduling
+
+### ZigPod OS (Planned Features)
+
+These features are implemented in code but **not functional on real hardware**:
+
+#### Audio Playback 🚧
 - **Multiple Formats**: WAV, AIFF, FLAC, and MP3 support
 - **Gapless Playback**: Seamless track transitions with dual-decoder architecture
 - **DSP Effects**: 5-band EQ, bass boost, stereo widening, volume ramping
 - **Playlist Support**: M3U and PLS playlist parsing
 
-### Music Library
+#### Music Library 🚧
 - **Library Browser**: Browse by Artists, Albums, or Songs
 - **Music Database**: Scan and index tracks with metadata extraction
 - **Shuffle & Repeat**: All playback modes (off, one, all)
 - **Playback Queue**: Full queue management with next/previous navigation
 
-### Album Art
+#### Album Art 🚧
 - **Embedded Art Extraction**: ID3v2 (MP3), FLAC PICTURE, M4A covr atoms
 - **Image Decoding**: BMP and JPEG with optimized IDCT
 - **Smart Scaling**: Bilinear interpolation to 80x80 with Floyd-Steinberg dithering
 - **Caching System**: Persistent cache with idle-time pre-loading
 
-### User Interface
+#### User Interface 🚧
 - **iPod-like Navigation**: Click wheel with acceleration, 5-button input
 - **Now Playing Screen**: Real-time position, metadata, album art display
 - **Settings Menus**: Display, Audio, Playback, System with persistence
 - **Volume Overlay**: Global volume control from any screen
 - **Theme Support**: Customizable UI themes
 
-### Hardware Support
-- **Full Hardware Integration**: LCD, click wheel, audio codec, storage
-- **DMA Audio Pipeline**: Interrupt-driven output for smooth playback
-- **Storage Detection**: Auto-detect HDD vs iFlash with optimized buffering
-- **Power Management**: PCF50605 PMU integration
+#### Hardware Support 🚧
+- **LCD Driver**: BCM2722 interface written
+- **Click Wheel**: Input handling implemented
+- **Audio Codec**: WM8758 driver written
+- **Storage**: ATA driver in progress
+- **Power Management**: PCF50605 PMU integration planned
 
 ### Developer Experience
-- **Complete Simulator**: PP5021C emulator with SDL2 GUI
-- **Extensive Tests**: 820+ unit tests across all modules
-- **Clean Codebase**: ~67,000 lines of documented Zig code
+- ✅ **PP5021C Emulator**: Runs Rockbox firmware with SDL2 GUI
+- ✅ **ZigPod Simulator**: Test ZigPod OS in simulation
+- ✅ **Extensive Tests**: 820+ unit tests across all modules
+- ✅ **Clean Codebase**: ~67,000 lines of documented Zig code
 
 ## Current Status
 
+### PP5021C Emulator (runs Rockbox firmware)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| ARM7TDMI CPU | ✅ Working | Full ARM + Thumb instruction sets |
+| Memory Bus | ✅ Working | SDRAM, IRAM, Boot ROM mapping |
+| LCD Controller | ✅ Working | 320x240 output via SDL2 |
+| ATA/Storage | ✅ Working | Reads FAT32 disk images |
+| Timer/IRQ | ✅ Working | Timer1 fires, interrupts handled |
+| Firmware Loading | ✅ Working | Boots Rockbox bootloader + main firmware |
+| **COP (Coprocessor)** | ❌ Not Emulated | **Blocks thread scheduling** |
+| Thread Scheduling | ❌ Blocked | Needs COP to wake threads |
+| Rockbox UI | ❌ Blocked | Needs threads to run |
+
+**Current blocker**: The iPod has dual ARM cores (CPU + COP). Rockbox's scheduler requires both cores. Without COP emulation, threads cannot be scheduled, so the Rockbox UI never renders. LCD hardware is proven working via test patterns.
+
+### ZigPod OS (custom firmware)
+
 | Component | Simulator | Hardware | Notes |
 |-----------|-----------|----------|-------|
-| LCD Display | Works | Works | BCM2722 verified on real iPod |
-| Click Wheel | Works | Works | All 5 buttons verified |
-| Menu UI | Works | Works | Navigation functional |
-| Storage (ATA) | Works | Partial | Reads data, MBR parsing in progress |
-| Audio Playback | Works | Not tested | DMA pipeline not wired to hardware |
-| Interrupts | Simulated | Not wired | Needed for audio |
+| LCD Display | Works | Untested | BCM2722 driver written |
+| Click Wheel | Works | Untested | Input handling works in sim |
+| Menu UI | Works | Untested | Navigation functional in sim |
+| Storage (ATA) | Partial | Untested | MBR parsing in progress |
+| Audio Playback | Partial | Untested | DMA pipeline not wired |
+| Boot on Hardware | N/A | ❌ Not Working | Not yet bootable |
 
-**Current blocker**: Storage reads 512 bytes successfully but MBR signature bytes need debugging.
+**Current blocker**: ZigPod OS is not bootable on real hardware. Development is focused on the emulator.
 
 ## Quick Start
 
@@ -71,19 +119,36 @@ A custom operating system for the Apple iPod Video (5th Generation), written ent
 
 - [Zig 0.15.2](https://ziglang.org/download/) or later
 - Git
-- SDL2 (optional, for GUI simulator)
+- SDL2 (for GUI display)
 
-### Build and Test
+### Build and Run the Emulator
 
 ```bash
 # Clone the repository
 git clone https://github.com/Davidslv/zigpod.git
 cd zigpod
 
+# Build with SDL2 GUI support
+zig build -Dsdl2=true
+
+# Run the emulator with Rockbox firmware
+./zig-out/bin/zigpod-emulator \
+  --firmware firmware/rockbox/bootloader-ipodvideo.ipod \
+  firmware/rockbox/rockbox_disk.img
+
+# Or run headless (no GUI, outputs to PPM file)
+./zig-out/bin/zigpod-emulator --headless --cycles 100000000 \
+  --firmware firmware/rockbox/bootloader-ipodvideo.ipod \
+  firmware/rockbox/rockbox_disk.img
+```
+
+### Build and Test ZigPod OS (Simulator)
+
+```bash
 # Run all tests
 zig build test
 
-# Run the simulator
+# Run the ZigPod OS simulator
 zig build sim
 
 # Run simulator with GUI (requires SDL2)
@@ -126,6 +191,11 @@ See [Simulator Guide](docs/008-simulator-guide.md) for complete documentation.
 
 ## Installing on Hardware
 
+> **⚠️ WARNING: Hardware installation is NOT recommended at this time.**
+>
+> ZigPod OS is not bootable on real hardware. The instructions below are for **future reference only**.
+> Attempting to flash may brick your device. Always have a full backup and recovery plan.
+>
 > **Note**: ZigPod uses a dual-boot approach that preserves your original Apple firmware. You can always boot back to the original OS by holding Menu during startup.
 
 ### Prerequisites
@@ -357,13 +427,25 @@ Before deploying to real hardware:
 
 ## Contributing
 
-Contributions welcome! Please:
+Contributions welcome! The main areas needing work are:
 
+### High Priority
+- **COP Emulation** - The #1 blocker for full Rockbox support. Requires implementing the second ARM7TDMI core with mailbox communication.
+- **Thread Context Synthesis** - Alternative to COP: manually create valid thread contexts so scheduler can run.
+
+### Medium Priority
+- **Audio Output** - Wire I2S controller to SDL2 audio
+- **Additional Firmware** - Test with Apple's original firmware
+- **Performance** - Optimize hot paths in CPU emulation
+
+### How to Contribute
 1. Fork the repository
 2. Create a feature branch
 3. Write tests for new functionality
 4. Ensure all tests pass (`zig build test`)
 5. Submit a pull request
+
+Read [JOURNEY.md](JOURNEY.md) for technical context on the architecture and challenges.
 
 ## Research Sources
 
